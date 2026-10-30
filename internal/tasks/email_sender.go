@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -15,15 +16,17 @@ import (
 
 // EmailMessage represents an email to be sent
 type EmailMessage struct {
-	From      string
-	To        []string
-	CC        []string
-	BCC       []string
-	Subject   string
-	BodyHTML  string
-	BodyPlain string
-	InReplyTo string
-	MessageID string
+	From          string
+	To            []string
+	CC            []string
+	BCC           []string
+	Subject       string
+	BodyHTML      string
+	BodyPlain     string
+	InReplyTo     string
+	References    []string
+	DispatchNonce string
+	MessageID     string
 	// ThreadID is the provider-side conversation handle. Gmail only appends to
 	// an existing thread when it is set on the outbound message; a matching
 	// Subject and In-Reply-To are not enough.
@@ -36,6 +39,9 @@ type EmailMessage struct {
 	// bytes from object storage at send time. Refs travel inside the S3 body
 	// blob, never the Avro Kafka event.
 	Attachments []models.AttachmentRef
+	// ManualPlanAllowance is the workspace's plan-based unibox recipients in
+	// 24 hours; 0 means no plan bound.
+	ManualPlanAllowance int
 }
 
 // EmailSender interface for sending emails via workers
@@ -49,12 +55,17 @@ type WorkerLiveness interface {
 	IsWorkerLive(ctx context.Context, workerID uuid.UUID) (bool, error)
 }
 
-// ErrWorkerOffline is returned by Send when the mailbox's worker has stopped
-// heartbeating. The send is not published: a command queued for a worker that
-// is gone is never executed and never answered, which would leave the step
-// looking sent forever. The worker reconciler moves the mailbox to a live
-// worker and the dead-letter retry replays the task.
+// ErrWorkerOffline is returned by Send when no heartbeating worker holds the
+// mailbox: none is assigned, or the one assigned stopped heartbeating. The send
+// is not published: a command queued for a worker that is gone is never
+// executed and never answered, which would leave the step looking sent
+// forever. The worker reconciler places the mailbox on a live worker, and the
+// scheduler passes the mailbox over until it has.
 var ErrWorkerOffline = errors.New("the mailbox's sending worker is offline")
+
+// ErrWorkerUnconfirmed is returned by Send when the worker's liveness could not
+// be read. Nothing is published, and it says nothing about the recipient.
+var ErrWorkerUnconfirmed = errors.New("the mailbox's sending worker could not be confirmed live")
 
 // ErrSendDispatchUnknown wraps a failure of the publish call itself. Every
 // other Send failure happens before anything is published and is safe to retry
@@ -64,10 +75,31 @@ var ErrWorkerOffline = errors.New("the mailbox's sending worker is offline")
 // being offered again.
 var ErrSendDispatchUnknown = errors.New("the send was not confirmed as queued and may already be on its way to a worker")
 
+var ErrWarmupDispatchDeferred = errors.New("the warmup send was not published and has already been rescheduled")
+
 type emailSender struct {
 	emailRepo repository.EmailRepository
 	publisher events.Publisher
 	liveness  WorkerLiveness
+	admission repository.OutboundAdmissionRepository
+	selfExec  SelfExecution
+}
+
+// SelfExecution says whether a linked instance, not a worker, runs a mailbox's
+// warmup, and whether that instance is live and still granted to.
+type SelfExecution interface {
+	SelfExecutionReady(ctx context.Context, accountID uuid.UUID) (executed, ready bool, err error)
+}
+
+// WireSelfExecution lets warmup run on mailboxes a linked instance executes.
+func (s *emailSender) WireSelfExecution(x SelfExecution) { s.selfExec = x }
+
+// SelfExecutionReady is the instance-executed half of WarmupWorkerReady; the executor outranks any worker assignment.
+func (s *emailSender) SelfExecutionReady(ctx context.Context, account models.Email) (executed, ready bool, err error) {
+	if s.selfExec == nil {
+		return false, false, nil
+	}
+	return s.selfExec.SelfExecutionReady(ctx, account.ID)
 }
 
 // NewEmailSender creates a new email sender
@@ -84,17 +116,43 @@ func (s *emailSender) WireWorkerLiveness(l WorkerLiveness) {
 	s.liveness = l
 }
 
+func (s *emailSender) WarmupWorkerReady(ctx context.Context, account models.Email) (bool, error) {
+	if executed, ready, err := s.SelfExecutionReady(ctx, account); err != nil || executed {
+		return ready, err
+	}
+	capable, ok := s.liveness.(interface {
+		SupportsWarmupSendProtocol(context.Context, uuid.UUID) (bool, error)
+	})
+	if !ok || account.WorkerID == nil {
+		return false, errors.New("warmup worker capability unavailable")
+	}
+	return capable.SupportsWarmupSendProtocol(ctx, *account.WorkerID)
+}
+
+func (s *emailSender) WireSendAdmission(r repository.OutboundAdmissionRepository) { s.admission = r }
+
 // Send publishes an email to the worker service for sending
 func (s *emailSender) Send(ctx context.Context, taskID uuid.UUID, msg EmailMessage, account models.Email) error {
 	// Get worker ID for this email account
 	workerID := account.WorkerID
-	if workerID == nil {
-		return fmt.Errorf("no worker assigned to email account %s", account.ID)
+	if msg.IsWarmup {
+		// An instance-executed mailbox's warmup is queued for its linked instance under the nil worker.
+		if executed, ready, err := s.SelfExecutionReady(ctx, account); err != nil {
+			return fmt.Errorf("%w: mailbox %s: %w", ErrWorkerUnconfirmed, account.Email, err)
+		} else if executed && !ready {
+			return fmt.Errorf("%w: the linked instance running mailbox %s is not live", ErrWorkerOffline, account.Email)
+		} else if executed {
+			queued := uuid.Nil
+			workerID = &queued
+		}
 	}
-	if s.liveness != nil {
+	if workerID == nil {
+		return fmt.Errorf("%w: no worker holds mailbox %s", ErrWorkerOffline, account.Email)
+	}
+	if s.liveness != nil && *workerID != uuid.Nil {
 		live, err := s.liveness.IsWorkerLive(ctx, *workerID)
 		if err != nil {
-			return fmt.Errorf("check worker %s liveness: %w", workerID, err)
+			return fmt.Errorf("%w: worker %s: %w", ErrWorkerUnconfirmed, workerID, err)
 		}
 		if !live {
 			return fmt.Errorf("%w (worker %s, mailbox %s)", ErrWorkerOffline, workerID, account.Email)
@@ -122,6 +180,8 @@ func (s *emailSender) Send(ctx context.Context, taskID uuid.UUID, msg EmailMessa
 		CC:             msg.CC,
 		BCC:            msg.BCC,
 		InReplyTo:      msg.InReplyTo,
+		References:     msg.References,
+		DispatchNonce:  msg.DispatchNonce,
 		ThreadID:       msg.ThreadID,
 		Subject:        msg.Subject,
 		MessageID:      msg.MessageID,
@@ -132,7 +192,52 @@ func (s *emailSender) Send(ctx context.Context, taskID uuid.UUID, msg EmailMessa
 		WarmupToken:    msg.WarmupToken,
 		UnsubscribeURL: msg.UnsubscribeURL,
 		Attachments:    msg.Attachments,
+		// The name as saved now, so a rename applies to the very next send
+		// instead of waiting for the worker's cached identity to be rebuilt.
+		FromName: strings.TrimSpace(account.Name),
 	}
+
+	// A chosen send-as alias applies to campaign and unibox mail only. Warmup
+	// pairs mailboxes by their own addresses and verifies its token against
+	// them, so sending warmup as an alias would break the pairing it is
+	// meant to prove.
+	if msg.IsWarmup {
+		params.FromName = account.Name
+		if strings.ContainsAny(params.FromName, "\r\n\x00") {
+			return errors.New("invalid sender identity")
+		}
+		if params.FromName == "" {
+			params.FromName = account.Email
+		}
+	} else {
+		params.FromEmail = strings.TrimSpace(account.SendAsEmail)
+		// Warmup replies are read back in the sending mailbox, so only
+		// campaign and unibox mail points replies elsewhere.
+		params.ReplyTo = account.ReplyToHeader()
+	}
+
+	if s.admission == nil {
+		return repository.ErrSendAdmissionDenied
+	}
+	recipients := append(append(append([]string{}, msg.To...), msg.CC...), msg.BCC...)
+	nonce, err := s.admission.ReserveOutbound(ctx, repository.OutboundReservation{
+		TaskID: taskID, MailboxID: account.ID, OrganizationID: *account.OrganizationID, WorkerID: *workerID,
+		Provider: models.InboxProvider(account.Provider), Recipients: recipients, ManualPlanAllowance: msg.ManualPlanAllowance,
+	})
+	if err != nil {
+		if msg.IsWarmup && msg.DispatchNonce != "" {
+			if r, ok := s.admission.(repository.WarmupDispatchRepository); ok {
+				if n, nerr := uuid.Parse(msg.DispatchNonce); nerr == nil {
+					if derr := r.DeferWarmupDispatch(ctx, taskID, account.ID, *workerID, n, time.Now().Add(5*time.Minute)); derr != nil {
+						return fmt.Errorf("%w: defer warmup: %v", ErrSendDispatchUnknown, derr)
+					}
+					return fmt.Errorf("%w: %v", ErrWarmupDispatchDeferred, err)
+				}
+			}
+		}
+		return err
+	}
+	params.DispatchNonce = nonce.String()
 
 	// Publish send email event to worker
 	if err := s.publisher.PublishSendEmail(ctx, *workerID, params); err != nil {
@@ -171,6 +276,16 @@ type workerLiveness struct {
 	heartbeat HeartbeatChecker
 }
 
+func (w *workerLiveness) SupportsWarmupSendProtocol(ctx context.Context, id uuid.UUID) (bool, error) {
+	repo, ok := w.repo.(interface {
+		SupportsWarmupSendProtocol(context.Context, uuid.UUID) (bool, error)
+	})
+	if !ok {
+		return false, errors.New("worker capability unavailable")
+	}
+	return repo.SupportsWarmupSendProtocol(ctx, id)
+}
+
 // NewWorkerLiveness builds the liveness check Send uses. heartbeat may be nil.
 func NewWorkerLiveness(repo WorkerLiveness, heartbeat HeartbeatChecker) WorkerLiveness {
 	return &workerLiveness{repo: repo, heartbeat: heartbeat}
@@ -189,4 +304,15 @@ func (l *workerLiveness) IsWorkerLive(ctx context.Context, workerID uuid.UUID) (
 		return true, nil
 	}
 	return n > 0, nil
+}
+
+// selfExecutionReady reports whether a linked instance runs the mailbox's warmup and is ready to.
+func (s *tasksService) selfExecutionReady(ctx context.Context, account *Email) (executed, ready bool, err error) {
+	x, ok := s.emailSender.(interface {
+		SelfExecutionReady(context.Context, models.Email) (bool, bool, error)
+	})
+	if !ok || account == nil {
+		return false, false, nil
+	}
+	return x.SelfExecutionReady(ctx, *account)
 }

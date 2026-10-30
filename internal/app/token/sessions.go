@@ -21,6 +21,7 @@ type SessionView struct {
 	Country      string    `json:"location_country"`
 	CountryCode  string    `json:"country_code"`
 	AuthProvider string    `json:"auth_provider"`
+	MFAVerified  bool      `json:"mfa_verified"`
 	CreatedAt    time.Time `json:"created_at"`
 	LastActiveAt time.Time `json:"last_active_at"`
 }
@@ -40,6 +41,7 @@ func toSessionView(sess *models.Session, currentID uuid.UUID) SessionView {
 		Country:      sess.LocationCountry,
 		CountryCode:  sess.LocationCountryCode,
 		AuthProvider: sess.AuthProvider,
+		MFAVerified:  sess.MFAVerified,
 		CreatedAt:    sess.CreatedAt,
 		LastActiveAt: lastActive,
 	}
@@ -82,32 +84,56 @@ func (s *tokenService) RevokeSessionByID(ctx context.Context, userID, sessionID,
 		return errx.ErrSessionNotFound
 	}
 
-	// Bust the cache so ValidateAccessToken re-reads the now-revoked row and the
-	// session stops working immediately rather than after the cache TTL.
-	if err := s.deleteSession(ctx, sessionID); err != nil {
-		return err
-	}
-
-	return nil
+	err = s.evictRevoked(ctx, sessionID, userID, time.Now())
+	s.notifyRevoked(ctx, userID)
+	return err
 }
 
 // RevokeOtherSessions ends every active session except the caller's current
-// one ("sign out everywhere else").
+// one ("sign out everywhere else"). uuid.Nil ends all of them.
 func (s *tokenService) RevokeOtherSessions(ctx context.Context, userID, currentSessionID uuid.UUID) *errx.Error {
+	err := s.revokeOthers(ctx, userID, currentSessionID)
+	s.notifyRevoked(ctx, userID)
+	return err
+}
+
+// notifyRevoked closes the user's open websockets; each reconnects only with a
+// ticket minted from a session that is still live.
+func (s *tokenService) notifyRevoked(ctx context.Context, userID uuid.UUID) {
+	if s.revocations != nil {
+		s.revocations.PublishSessionsRevoked(ctx, userID)
+	}
+}
+
+func (s *tokenService) revokeOthers(ctx context.Context, userID, currentSessionID uuid.UUID) *errx.Error {
 	ids, err := s.tokenRepository.ListOtherActiveSessionIDs(ctx, userID, currentSessionID)
 	if err != nil {
 		return err
 	}
 
+	now := time.Now()
 	if err := s.tokenRepository.RevokeOtherSessions(ctx, userID, currentSessionID); err != nil {
 		return err
 	}
 
+	// Every id is evicted even when one fails, and a failed eviction is
+	// overwritten with a revoked tombstone, so no cached copy outlives the row.
+	var first *errx.Error
 	for _, id := range ids {
-		if err := s.deleteSession(ctx, id); err != nil {
-			return err
+		if err := s.evictRevoked(ctx, id, userID, now); err != nil && first == nil {
+			first = err
 		}
 	}
 
-	return nil
+	return first
+}
+
+// evictRevoked overwrites a revoked session's cache entry with a tombstone that
+// outlives any cached copy; only when that write is refused does it delete.
+func (s *tokenService) evictRevoked(ctx context.Context, id, userID uuid.UUID, revokedAt time.Time) *errx.Error {
+	tomb := &models.Session{ID: id, UserID: userID, RevokedAt: &revokedAt}
+	if err := s.saveSession(ctx, tomb, revokedTombstoneTTL); err == nil {
+		return nil
+	}
+	return s.deleteSession(ctx, id)
 }

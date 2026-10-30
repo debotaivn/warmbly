@@ -7,7 +7,7 @@ package warmupcontent
 import (
 	"context"
 	"errors"
-	"hash/fnv"
+	"fmt"
 	"strings"
 	"time"
 
@@ -15,7 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/warmbly/warmbly/internal/pkg/generation"
-	"github.com/warmbly/warmbly/internal/pkg/humanlint"
+	"github.com/warmbly/warmbly/internal/pkg/typesafe"
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
@@ -23,12 +23,19 @@ import (
 // wired (the provider is not OpenAI or AI_API_KEY is unset).
 var ErrNotConfigured = errors.New("warmup AI generation is not configured")
 
+var ErrGenerationStopped = errors.New("warmup content generation is stopped")
+
 // defaultThemes seed topic variety when a generation run doesn't pin a theme.
 var defaultThemes = []string{
-	"productivity", "learning", "collaboration", "industry trends", "tools",
-	"networking", "feedback", "planning", "reading", "wellness", "events",
-	"career growth", "remote work", "meetings", "automation", "team culture",
-	"customer success", "writing", "travel", "community",
+	"productivity", "learning a new skill", "collaboration", "industry trends", "tools and workflow",
+	"networking", "giving feedback", "quarterly planning", "book recommendations", "wellness",
+	"conferences and meetups", "career growth", "remote work setups", "meetings", "team culture",
+	"customer support", "writing clearly", "travel tips", "local community", "hiring and interviews",
+	"mentoring", "documentation", "podcasts", "cooking", "weekend hobbies", "running and cycling",
+	"home office", "coffee and tea", "language learning", "photography", "gardening", "moving house",
+	"volunteering", "presentations", "note-taking", "project handoffs", "freelancing", "small business seasons",
+	"design and layout", "spreadsheets", "naming things", "backing up files", "onboarding new teammates",
+	"retrospectives", "saying no to extra scope", "time off and rest", "music practice", "board games",
 }
 
 // maxPerBatch bounds a single Batch API submission. Batch is async and cheap so
@@ -39,19 +46,17 @@ const maxPerBatch = 2000
 const (
 	minimumAdaptiveThreads = 200
 	maximumAdaptiveThreads = 5000
-	usesPerThreadPerDay    = 20
 	scheduledBatchMax      = 250
 )
 
 // AdaptiveThreadTarget sizes the bank from recent demand while bounding model
 // spend. The configured target is a floor, not an ongoing tuning obligation.
-func AdaptiveThreadTarget(sevenDaySends, aiSelectionShare, configuredFloor int) int {
-	if configuredFloor < minimumAdaptiveThreads {
+func AdaptiveThreadTarget(sevenDaySends, configuredFloor int) int {
+	if configuredFloor <= 0 {
 		configuredFloor = minimumAdaptiveThreads
 	}
 	averageDaily := (sevenDaySends + 6) / 7
-	aiDaily := (averageDaily*aiSelectionShare + 99) / 100
-	target := (aiDaily + usesPerThreadPerDay - 1) / usesPerThreadPerDay
+	target := averageDaily
 	if target < configuredFloor {
 		target = configuredFloor
 	}
@@ -84,28 +89,50 @@ type Service interface {
 	// returns the job ID immediately. Results are ingested later by PollBatches.
 	GenerateBatch(ctx context.Context, req GenerateRequest) (uuid.UUID, error)
 	// PollBatches reconciles in-flight batch jobs against OpenAI: it ingests
-	// completed batches and marks failed/expired/cancelled ones.
+	// what a finished, expired or cancelled batch produced and marks the
+	// job failed only when it produced nothing.
 	PollBatches(ctx context.Context) error
-	// CancelBatch cancels an in-flight batch job (OpenAI + local job row).
+	// CancelBatch asks OpenAI to cancel an in-flight batch; the job stays
+	// running until PollBatches ingests what finished before the cancel.
 	CancelBatch(ctx context.Context, jobID uuid.UUID) error
 	// RunScheduled tops every enabled pool/segment up toward its target.
 	RunScheduled(ctx context.Context) error
 	// Enabled reports whether an AI client is configured.
 	Enabled() bool
+	// WireJudge selects TypeSafe review; nil uses a separate OpenAI review.
+	WireJudge(asker typesafe.Asker)
 }
 
 type service struct {
 	repo repository.WarmupContentRepository
-	gen  *generation.GenerationClient
+	gen  generationBackend
+	// judge rejects generated threads that carry a pitch or read as filler.
+	// Without TypeSafe, the configured generator performs a separate review.
+	judge typesafe.Asker
+}
+
+type generationBackend interface {
+	CheckModel(context.Context, string) error
+	SubmitBatch(context.Context, []generation.BatchRequest, string) (string, string, error)
+	GetBatch(context.Context, string) (generation.BatchState, error)
+	CancelBatch(context.Context, string) error
+	FetchBatchResults(context.Context, string) ([]generation.BatchResult, error)
+	ReviewConversation(context.Context, generation.Conversation, string) (*generation.WarmupReview, error)
 }
 
 // NewService creates the generation service. gen may be nil (provider not OpenAI),
 // in which case generation requests return ErrNotConfigured.
 func NewService(repo repository.WarmupContentRepository, gen *generation.GenerationClient) Service {
-	return &service{repo: repo, gen: gen}
+	svc := &service{repo: repo}
+	if gen != nil {
+		svc.gen = gen
+	}
+	return svc
 }
 
 func (s *service) Enabled() bool { return s.gen != nil }
+
+func (s *service) WireJudge(asker typesafe.Asker) { s.judge = asker }
 
 func (s *service) RunScheduled(ctx context.Context) error {
 	if s.gen == nil {
@@ -115,7 +142,7 @@ func (s *service) RunScheduled(ctx context.Context) error {
 	if err != nil || settings == nil {
 		return err
 	}
-	if !settings.ScheduleEnabled {
+	if !settings.GenerationEnabled || !settings.ScheduleEnabled {
 		return nil
 	}
 
@@ -136,11 +163,12 @@ func (s *service) RunScheduled(ctx context.Context) error {
 		return nil
 	}
 
-	totalDemand, err := s.repo.WarmupSendsSince(ctx, time.Now().AddDate(0, 0, -7))
+	mailboxDemand, err := s.repo.WarmupMailboxDemandSince(ctx, time.Now().AddDate(0, 0, -7))
 	if err != nil {
 		return err
 	}
 
+	var scheduleErr error
 	for _, pool := range settings.Pools {
 		if !pool.Enabled {
 			continue
@@ -150,13 +178,13 @@ func (s *service) RunScheduled(ctx context.Context) error {
 			segmentSet[segment] = struct{}{}
 		}
 		for segment := range segmentSet {
-			active, _ := s.repo.CountActiveConversations(ctx, pool.PoolType, segment)
-			target := AdaptiveThreadTarget(totalDemand, settings.AISelectionShare, pool.TargetActiveThreads)
+			active, err := s.repo.CountAvailableConversations(ctx, pool.PoolType, segment)
+			if err != nil {
+				return err
+			}
+			target := AdaptiveThreadTarget(mailboxDemand, pool.TargetActiveThreads)
 
-			// Continuous refresh: once the library is at target, retire the
-			// most-used AI threads so the top-up below mints fresh replacements.
-			// Retire only what today's budget can regenerate, so the library
-			// never shrinks without being refilled.
+			// Refresh unused stock within the replacement budget; preserve ongoing threads.
 			if settings.RefreshEnabled && active >= target {
 				recycle := settings.RefreshPerRun
 				if recycle > 25 {
@@ -166,12 +194,12 @@ func (s *service) RunScheduled(ctx context.Context) error {
 					recycle = remaining
 				}
 				if recycle > 0 {
-					retired, err := s.repo.RetireMostUsedConversations(ctx, pool.PoolType, segment, recycle)
+					retired, err := s.repo.RefreshUnusedConversations(ctx, pool.PoolType, segment, recycle)
 					if err != nil {
 						log.Warn().Err(err).Str("segment", segment).Msg("warmup generation: refresh retirement failed")
 					} else if retired > 0 {
 						active -= retired
-						log.Info().Int("retired", retired).Str("segment", segment).Msg("warmup generation: recycled most-used threads for refresh")
+						log.Info().Int("retired", retired).Str("segment", segment).Msg("warmup generation: recycled unused threads for refresh")
 					}
 				}
 			}
@@ -194,7 +222,7 @@ func (s *service) RunScheduled(ctx context.Context) error {
 			// Scheduled work is asynchronous and discounted. It never holds the
 			// scheduler loop open on model latency, and the durable job is picked up
 			// by the batch poller after restarts.
-			_, err := s.GenerateBatch(ctx, GenerateRequest{
+			_, err = s.GenerateBatch(ctx, GenerateRequest{
 				Trigger:  "schedule",
 				PoolType: pool.PoolType,
 				Segment:  segment,
@@ -202,46 +230,33 @@ func (s *service) RunScheduled(ctx context.Context) error {
 				Count:    count,
 			})
 			if err != nil {
-				log.Debug().Err(err).Str("segment", segment).Msg("warmup generation: scheduled batch not submitted")
+				log.Warn().Err(err).Str("segment", segment).Msg("warmup generation: scheduled batch not submitted")
+				scheduleErr = errors.Join(scheduleErr, fmt.Errorf("warmup batch submission failed for segment %q", segment))
 				continue
 			}
 			if settings.DailyGenerationCap > 0 {
 				remaining -= count
 				if remaining <= 0 {
-					return nil
+					return scheduleErr
 				}
 			}
 		}
 	}
-	return nil
+	return scheduleErr
 }
 
 func cleanMessages(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, m := range in {
 		m = strings.TrimSpace(m)
-		if m != "" {
-			out = append(out, m)
-		}
+		out = append(out, m)
 	}
 	return out
 }
 
-// humanizeThread runs the deterministic humanizer over a generated thread's
-// subject, opening line, and follow-ups, seeded by content so the same thread
-// humanizes identically (reproducible) while differing across threads. Shared
-// by the batch ingest path.
-func humanizeThread(subject, description string, messages []string) (string, string, []string) {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(subject + "|" + description))
-	seed := int64(h.Sum64())
-
-	subject = humanlint.HumanizeSubject(subject, seed)
-	description = humanlint.Humanize(description, seed+1)
-	for i := range messages {
-		messages[i] = humanlint.Humanize(messages[i], seed+int64(i)+2)
-	}
-	return subject, description, messages
+// Only surrounding whitespace may change; reply positions and facts are fixed.
+func preserveCanonicalThread(subject, description string, messages []string) (string, string, []string) {
+	return strings.TrimSpace(subject), strings.TrimSpace(description), cleanMessages(messages)
 }
 
 func dailyRemaining(ctx context.Context, repo repository.WarmupContentRepository, dailyCap int) int {
@@ -249,9 +264,9 @@ func dailyRemaining(ctx context.Context, repo repository.WarmupContentRepository
 		return 1 << 30 // effectively unlimited
 	}
 	since := time.Now().Truncate(24 * time.Hour)
-	used, err := repo.GeneratedCountSince(ctx, since)
+	used, err := repo.ReservedGenerationCountSince(ctx, since)
 	if err != nil {
-		return dailyCap
+		return 0
 	}
 	return dailyCap - used
 }

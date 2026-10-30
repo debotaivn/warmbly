@@ -3,6 +3,7 @@ package aitools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/pkg/generation"
@@ -30,6 +31,7 @@ func (d Deps) registerAPIKeyTools(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "create_api_key",
+		FreshAuth:   true,
 		Description: "Create a new API key with a scope preset. The secret is returned once and cannot be retrieved again. Requires user approval.",
 		InputSchema: objectSchema(map[string]any{
 			"name":        strProp("A label for the key (required)."),
@@ -37,6 +39,7 @@ func (d Deps) registerAPIKeyTools(r *Registry) {
 			"preset":      enumProp("Scope preset.", "read_only", "full_access"),
 		}, "name"),
 		Risk:            generation.RiskWrite,
+		AlwaysAsk:       true,
 		RequiredOrgPerm: models.PermManageAPIKeys,
 		RequiredAPIPerm: models.APIPermAPIKeys,
 		Handler:         d.createAPIKey,
@@ -44,6 +47,7 @@ func (d Deps) registerAPIKeyTools(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "update_api_key",
+		FreshAuth:   true,
 		Description: "Update an API key's name or description.",
 		InputSchema: objectSchema(map[string]any{
 			"key_id":      strProp("The key's UUID."),
@@ -51,6 +55,7 @@ func (d Deps) registerAPIKeyTools(r *Registry) {
 			"description": strProp("New description."),
 		}, "key_id"),
 		Risk:            generation.RiskWrite,
+		AlwaysAsk:       true,
 		RequiredOrgPerm: models.PermManageAPIKeys,
 		RequiredAPIPerm: models.APIPermAPIKeys,
 		Handler:         d.updateAPIKey,
@@ -88,32 +93,20 @@ func (d Deps) listAPIKeys(ctx context.Context, inv Invocation, args json.RawMess
 	return jsonResult(res)
 }
 
-func (d Deps) createAPIKey(ctx context.Context, inv Invocation, args json.RawMessage) (string, error) {
-	in, err := decodeArgs[struct {
-		Name        string  `json:"name"`
-		Description *string `json:"description"`
-		Preset      string  `json:"preset"`
-	}](args)
-	if err != nil {
-		return "", err
-	}
-	if in.Name == "" {
-		return "", ErrInvalidArgs
-	}
-	perms := models.APIPermReadOnly
-	if in.Preset == "full_access" {
-		perms = models.APIPermFullAccess
-	}
-	key, xerr := d.APIKeys.Create(ctx, inv.OrgID, inv.UserID, &models.CreateAPIKey{
-		Name:        in.Name,
-		Description: in.Description,
-		Permissions: perms,
-	})
-	if xerr != nil {
-		return "", fromErrx(xerr)
-	}
-	d.logAudit(ctx, inv, models.AuditActionCreate, models.AuditEntityAPIKey, &key.ID, map[string]string{"name": in.Name})
-	return jsonResult(key)
+// createAPIKey refuses, deliberately.
+//
+// Creating a key through the API requires a confirmation newer than the session
+// (RequireFreshAuth on POST /api-keys), because a key outlives the session that
+// made it and a stolen token must not be able to leave a durable credential
+// behind. This tool reaches the service directly, so honouring it would be a
+// way around that gate.
+//
+// It stays registered rather than being removed so the assistant can say what
+// to do instead of reporting an unknown tool.
+func (d Deps) createAPIKey(_ context.Context, _ Invocation, _ json.RawMessage) (string, error) {
+	return "", errors.New(
+		"creating an API key needs you to confirm it is you, and that cannot be collected in a chat. " +
+			"Open Settings > API keys in the dashboard and create it there")
 }
 
 func (d Deps) updateAPIKey(ctx context.Context, inv Invocation, args json.RawMessage) (string, error) {

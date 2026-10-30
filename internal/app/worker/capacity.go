@@ -1,15 +1,4 @@
-// Capacity is the math layer that turns a row from worker_capacity_view
-// into a placement decision. Kept as plain functions so tests can drive
-// every edge case without touching the database.
-//
-// Why compute Effective in Go instead of pushing it into the view? Two
-// reasons:
-//
-//   1. Tests can override Base/HealthMul/AgeMul independently and verify
-//      the floor/ceiling behavior without spinning up Postgres.
-//   2. The view exposes the raw inputs (sends_attempted_1h, bounces, etc.)
-//      so an operator or future feature can compute a different
-//      effective-capacity formula without a migration.
+// Capacity turns worker_capacity_view rows into placement inputs.
 
 package worker
 
@@ -24,9 +13,7 @@ import (
 // worker_capacity_view. Loaded by the repository; fed into ComputeCapacity.
 type WorkerCapacityRow struct {
 	WorkerID         uuid.UUID
-	WorkerType       models.WorkerType
-	FreeTier         bool
-	EgressKind       models.WorkerEgressKind
+	Region           string
 	HealthState      models.WorkerHealthState
 	LoadScore        float64
 	BaseCapacity     float64
@@ -40,23 +27,17 @@ type WorkerCapacityRow struct {
 	AuthErrors1h     int64
 }
 
-// Capacity is the derived placement view of a worker. All fields are
-// dimensionless except Effective (mailbox-equivalents) and Load (sum of
-// mailbox weights). Utilization is Load/Effective and is the value the
-// scheduler sorts on when picking the next worker.
+// Capacity is the worker's assigned-mailbox load against its local target.
 type Capacity struct {
 	Base        float64
 	HealthMul   float64
 	AgeMul      float64
-	Effective   float64
 	Load        float64
 	Utilization float64
+	Target      float64
 }
 
-// ComputeCapacity is the placement math: Base * Health * Age, floored at
-// 1, then load is divided through to give a utilization ratio. The floor
-// matters because a brand-new worker with zero history would otherwise
-// have Effective=0 and never get probed.
+// ComputeCapacity keeps node age in placement scoring without shrinking its target.
 func ComputeCapacity(row WorkerCapacityRow) Capacity {
 	c := Capacity{
 		Base:      row.BaseCapacity,
@@ -64,13 +45,7 @@ func ComputeCapacity(row WorkerCapacityRow) Capacity {
 		AgeMul:    clampUnit(row.AgeMultiplier),
 		Load:      row.LoadScore,
 	}
-	c.Effective = math.Floor(c.Base * c.HealthMul * c.AgeMul)
-	if c.Effective <= 0 {
-		c.Effective = 1
-	}
-	if c.Effective > 0 {
-		c.Utilization = c.Load / c.Effective
-	}
+	c.Target, c.Utilization = models.WorkerOperationalCapacity(c.Load, c.Base, c.HealthMul)
 	return c
 }
 
@@ -87,31 +62,7 @@ func clampUnit(x float64) float64 {
 	return x
 }
 
-// MailboxWeight is the per-mailbox load contribution. The numbers are
-// deliberately on different scales:
-//
-//   - Cold SMTP mailboxes are the bottleneck (one inbox, one IP-facing
-//     conversation, a hard ~50/day ceiling per CLAUDE.md sending policy).
-//     Weight = 1.0 so a cold_smtp worker with Base=16 caps at ~16 cold
-//     mailboxes.
-//
-//   - OAuth API mailboxes (Gmail API, Microsoft Graph) push through the
-//     provider's own infrastructure and don't bottleneck on a single
-//     IMAP/SMTP conversation. Weight = 0.05 so an oauth_api worker with
-//     Base=400 can carry hundreds of API mailboxes.
-//
-//   - Warmup-only assignments are the cheapest because warmup volume is
-//     small and bursty by design. Weight = 0.4 regardless of provider so
-//     warmup-only workers don't get crowded out by their own cold-style
-//     mailbox accounting.
-func MailboxWeight(provider string, isWarmup bool) float64 {
-	if isWarmup {
-		return 0.4
-	}
-	switch provider {
-	case "gmail-api", "graph-api":
-		return 0.05
-	default:
-		return 1.0
-	}
+// MailboxWeight counts every assigned mailbox equally.
+func MailboxWeight(_ string, _ bool) float64 {
+	return 1
 }

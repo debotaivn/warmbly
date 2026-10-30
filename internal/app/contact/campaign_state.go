@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,22 +29,19 @@ func (s *contactService) CampaignStates(ctx context.Context, orgID, contactID uu
 	return states, nil
 }
 
+// endedCopy says why a flow is over, keyed by lead status or route exclusion (they share values).
+var endedCopy = map[string]string{
+	models.LeadStatusUnsubscribed:  "Unsubscribed, sending stopped",
+	models.LeadStatusBounced:       "Bounced, sending stopped",
+	models.LeadStatusFailed:        "Dropped after every send attempt failed",
+	models.LeadStatusUndeliverable: "Address failed verification, so the campaign skips it",
+	"suppressed":                   "Suppressed, sending stopped",
+}
+
 func (s *contactService) fillNextAction(ctx context.Context, st *models.ContactCampaignState, contactID uuid.UUID) {
-	switch st.LeadStatus {
-	case models.LeadStatusUnsubscribed:
-		st.EndedReason = "Unsubscribed, sending stopped"
-		return
-	case models.LeadStatusBounced:
-		st.EndedReason = "Bounced, sending stopped"
-		return
-	case models.LeadStatusReplied:
-		st.EndedReason = "Replied, sending stopped"
-		return
-	case models.LeadStatusFailed:
-		st.EndedReason = "Dropped after every send attempt failed"
-		return
-	case models.LeadStatusUndeliverable:
-		st.EndedReason = "Address failed verification, so the campaign skips it"
+	// Replied and paused are not endings: the router decides both, below.
+	if reason, ok := endedCopy[st.LeadStatus]; ok {
+		st.EndedReason = reason
 		return
 	}
 	if s.previewer == nil {
@@ -56,8 +54,9 @@ func (s *contactService) fillNextAction(ctx context.Context, st *models.ContactC
 		return
 	}
 	route := pv.Route
-	if route.Excluded == "suppressed" {
-		st.EndedReason = "Suppressed, sending stopped"
+	// Replied outranks failed and undeliverable in the status, so the exclusion ends those.
+	if reason, ok := endedCopy[route.Excluded]; ok {
+		st.EndedReason = reason
 		return
 	}
 	current := "the current step"
@@ -74,11 +73,14 @@ func (s *contactService) fillNextAction(ctx context.Context, st *models.ContactC
 			}
 			return
 		}
-		if st.LeadStatus == models.LeadStatusCompleted {
+		switch {
+		case st.LeadStatus == models.LeadStatusReplied:
+			st.EndedReason = "Replied, sending stopped"
+		case st.LeadStatus == models.LeadStatusCompleted:
 			st.EndedReason = "Every step has been sent"
-		} else if st.CurrentStep != nil {
+		case st.CurrentStep != nil:
 			st.EndedReason = "Reached the end of the flow"
-		} else {
+		default:
 			st.EndedReason = "The campaign has no steps"
 		}
 		return
@@ -98,7 +100,74 @@ func (s *contactService) fillNextAction(ctx context.Context, st *models.ContactC
 		}
 	}
 	next.Constraint = constraintCopy(pv.Constraint, st, route.DueAt, current)
+	if pv.Constraint == scheduler.ConstraintLeadHold {
+		next.Constraint = holdCopy(st.Hold)
+	}
 	st.Next = next
+}
+
+// holdCopy words a per-lead hold for the drawer: why the flow is parked and,
+// when the hold has an end, when it lifts. A reason the auto-reply gave (its
+// subject line) is the most useful thing on screen, so it leads.
+func holdCopy(hold *models.LeadHold) string {
+	if hold == nil {
+		return "Paused for this contact"
+	}
+	what := "Paused for this contact"
+	switch hold.Source {
+	case models.LeadHoldSourceOutOfOffice:
+		what = "Out of office"
+	case models.LeadHoldSourceCC:
+		// The reason is the lead they are copied on; no end is expected.
+		if r := strings.TrimSpace(hold.Reason); r != "" {
+			return "Copied on the emails to " + r + ", so none of their own are sent"
+		}
+		return "Copied on another lead's emails, so none of their own are sent"
+	case models.LeadHoldSourceCRM:
+		// The reason already reads "Salesforce: ...", naming the rule that held it.
+		if r := strings.TrimSpace(hold.Reason); r != "" {
+			return "Paused by " + r + ", until someone resumes it"
+		}
+		return "Paused by a CRM rule, until someone resumes it"
+	}
+	if r := strings.TrimSpace(hold.Reason); r != "" {
+		what += ": " + r
+	}
+	if hold.Until == nil {
+		return what + ", until someone resumes it"
+	}
+	return what + ", resuming in " + humanizeUntil(*hold.Until)
+}
+
+// humanizeUntil renders how long is left until t as the drawer's short phrase
+// ("2 days", "4 hours", "a moment"), rounding to the largest whole unit.
+func humanizeUntil(t time.Time) string {
+	d := time.Until(t)
+	if d < time.Minute {
+		return "a moment"
+	}
+	plural := func(n int, unit string) string {
+		if n == 1 {
+			return fmt.Sprintf("1 %s", unit)
+		}
+		return fmt.Sprintf("%d %ss", n, unit)
+	}
+	// Rounding can carry into the next unit (59m40s rounds to 60 minutes), so
+	// promote rather than print a value the unit cannot hold.
+	switch {
+	case d < time.Hour:
+		if minutes := int(math.Round(d.Minutes())); minutes < 60 {
+			return plural(minutes, "minute")
+		}
+		return plural(1, "hour")
+	case d < 24*time.Hour:
+		if hours := int(math.Round(d.Hours())); hours < 24 {
+			return plural(hours, "hour")
+		}
+		return plural(1, "day")
+	default:
+		return plural(int(math.Round(d.Hours()/24)), "day")
+	}
 }
 
 // constraintCopy turns the scheduler's gate into the sentence the drawer shows.
@@ -116,6 +185,11 @@ func constraintCopy(c scheduler.ContactSendConstraint, st *models.ContactCampaig
 			}
 		}
 		return "Waiting for the step's delay after " + current
+	case scheduler.ConstraintEntryDelay:
+		if dueAt != nil {
+			return "Waiting " + humanizeUntil(*dueAt) + " before the first email"
+		}
+		return "Waiting the campaign's delay before the first email"
 	case scheduler.ConstraintConditionWindow:
 		return "Waiting to see how they respond to " + current
 	case scheduler.ConstraintStartDate:
@@ -126,6 +200,13 @@ func constraintCopy(c scheduler.ContactSendConstraint, st *models.ContactCampaig
 		return "Today's new-lead limit is reached"
 	case scheduler.ConstraintCapacity:
 		return "No mailbox can take it right now (daily cap, spacing, or health)"
+	case scheduler.ConstraintSenderBusy:
+		// One mailbox is the gate, not the pool: this contact's whole sequence
+		// sends from the address they first heard from.
+		if st.SenderEmail != "" {
+			return "Waiting for " + st.SenderEmail + ", which sends the rest of this sequence"
+		}
+		return "Waiting for the mailbox that sends this contact's sequence"
 	case scheduler.ConstraintCampaignInactive:
 		switch st.CampaignStatus {
 		case "draft":

@@ -13,9 +13,14 @@ const Version = 1
 
 // Bitmask flags for sections
 const (
-	FlagPlainText   uint32 = 1 << 0
-	FlagHTMLBody    uint32 = 1 << 1
-	FlagAttachments uint32 = 1 << 2
+	FlagPlainText     uint32 = 1 << 0
+	FlagHTMLBody      uint32 = 1 << 1
+	FlagAttachments   uint32 = 1 << 2
+	FlagFromName      uint32 = 1 << 3
+	FlagFromEmail     uint32 = 1 << 4
+	FlagReplyTo       uint32 = 1 << 5
+	FlagReferences    uint32 = 1 << 6
+	FlagDispatchNonce uint32 = 1 << 7
 )
 
 // Attachment is a single attachment reference carried inside the S3 body blob.
@@ -33,17 +38,34 @@ type EmailBlob struct {
 	PlainText   []byte
 	HTMLBody    []byte
 	Attachments []Attachment
+	// FromName is the sender display name at publish time. It rides in the
+	// blob so a renamed mailbox sends under its new name without the worker's
+	// cached ADD_EMAIL identity having to be refreshed. Empty means "use the
+	// worker's cached name".
+	FromName string
+	// FromEmail is the verified provider alias the mailbox was told to send
+	// as, resolved at publish time. Empty, which is almost every send, means
+	// the mailbox's own address.
+	FromEmail string
+	// ReplyTo is the address the send's Reply-To header names. Empty means
+	// no header, so replies go to the From address.
+	ReplyTo       string
+	References    string
+	DispatchNonce string
 }
 
 // EncodeBinary serializes the blob into binary format. Layout:
 //
-//	"EMSG" | version(1) | flags(4) | [plain] | [html] | [attachments]
+//	"EMSG" | version(1) | flags(4) | [plain] | [html] | [attachments] | [from] | [from-email] | [reply-to]
 //
 // where each body section is uint32-length-prefixed and only present when its
 // flag bit is set. The attachments section, when present, is a uint32 count
 // followed by that many (s3key, filename, mimetype) triples of length-prefixed
 // strings. Attachment metadata travels here (inside the S3 body blob), not in
 // the Avro Kafka event, so the published worker event contract is unchanged.
+// The identity sections sit last, in flag order, so a worker that predates
+// any of them decodes the rest of the blob untouched and simply never reads the
+// trailing bytes.
 func (b *EmailBlob) EncodeBinary() ([]byte, error) {
 	var flags uint32
 	parts := make([][]byte, 0, 2)
@@ -58,6 +80,21 @@ func (b *EmailBlob) EncodeBinary() ([]byte, error) {
 	}
 	if len(b.Attachments) > 0 {
 		flags |= FlagAttachments
+	}
+	if b.FromName != "" {
+		flags |= FlagFromName
+	}
+	if b.FromEmail != "" {
+		flags |= FlagFromEmail
+	}
+	if b.ReplyTo != "" {
+		flags |= FlagReplyTo
+	}
+	if b.References != "" {
+		flags |= FlagReferences
+	}
+	if b.DispatchNonce != "" {
+		flags |= FlagDispatchNonce
 	}
 
 	buf := new(bytes.Buffer)
@@ -85,6 +122,29 @@ func (b *EmailBlob) EncodeBinary() ([]byte, error) {
 			writeStr(a.Filename)
 			writeStr(a.MimeType)
 		}
+	}
+
+	if flags&FlagFromName != 0 {
+		binary.Write(buf, binary.BigEndian, uint32(len(b.FromName)))
+		buf.WriteString(b.FromName)
+	}
+
+	if flags&FlagFromEmail != 0 {
+		binary.Write(buf, binary.BigEndian, uint32(len(b.FromEmail)))
+		buf.WriteString(b.FromEmail)
+	}
+
+	if flags&FlagReplyTo != 0 {
+		binary.Write(buf, binary.BigEndian, uint32(len(b.ReplyTo)))
+		buf.WriteString(b.ReplyTo)
+	}
+	if flags&FlagReferences != 0 {
+		binary.Write(buf, binary.BigEndian, uint32(len(b.References)))
+		buf.WriteString(b.References)
+	}
+	if flags&FlagDispatchNonce != 0 {
+		binary.Write(buf, binary.BigEndian, uint32(len(b.DispatchNonce)))
+		buf.WriteString(b.DispatchNonce)
 	}
 
 	return buf.Bytes(), nil
@@ -160,6 +220,44 @@ func DecodeBinary(r io.Reader) (*EmailBlob, error) {
 				MimeType: mimeType,
 			})
 		}
+	}
+
+	if flags&FlagFromName != 0 {
+		name, err := readSection()
+		if err != nil {
+			return nil, err
+		}
+		b.FromName = string(name)
+	}
+
+	if flags&FlagFromEmail != 0 {
+		addr, err := readSection()
+		if err != nil {
+			return nil, err
+		}
+		b.FromEmail = string(addr)
+	}
+
+	if flags&FlagReplyTo != 0 {
+		addr, err := readSection()
+		if err != nil {
+			return nil, err
+		}
+		b.ReplyTo = string(addr)
+	}
+	if flags&FlagReferences != 0 {
+		refs, err := readSection()
+		if err != nil {
+			return nil, err
+		}
+		b.References = string(refs)
+	}
+	if flags&FlagDispatchNonce != 0 {
+		nonce, err := readSection()
+		if err != nil {
+			return nil, err
+		}
+		b.DispatchNonce = string(nonce)
 	}
 
 	return b, nil

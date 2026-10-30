@@ -1,38 +1,40 @@
-// Single worker detail — overview header + the SSH lifecycle actions wired to
-// the admin endpoints. Routine actions (test, install, restart, pull latest,
-// apply config) sit in the header; the destructive and rarely-used ones (rotate
-// keys, OS update, reboot, uninstall, delete) are grouped in a Maintenance card
-// so they can't be hit by accident. Logs panel tails journald with a selectable
-// line count and an optional follow mode.
+// One machine in the fleet.
+//
+// Everything shown here is reported BY the node or resolved FOR it. There is
+// no install, restart or reboot button, because nothing reaches into a
+// machine any more: a node enrols with a token, heartbeats, and pulls the
+// version it should run. What an operator can actually do is rename it, hold
+// it at a version, and forget it.
 
-import { useEffect, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import {
-    ArrowLeft,
-    ArrowUpCircle,
-    Copy,
-    Download,
-    Hammer,
-    KeyRound,
-    PackageOpen,
-    PlayCircle,
-    PowerOff,
-    RefreshCw,
-    RotateCcw,
-    ShieldAlert,
-    SlidersHorizontal,
-    StopCircle,
-    Trash2,
-} from "lucide-react";
+import { AlertTriangle, ArrowRightLeft, Inbox, Pin, PinOff, RefreshCw, ServerOff, Trash2 } from "lucide-react";
 import { PageHeader } from "@/components/layout/PageHeader";
-import { StateLegend } from "@/components/StateLegend";
-import { WORKER_HEALTH_LEGEND } from "@/lib/legends";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+    Callout,
+    EmptyState,
+    Panel,
+    Property,
+    PropertyList,
+    Section,
+    Stat,
+    StatGrid,
+    StatusBadge,
+} from "@/components/ui/kit";
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from "@/components/ui/dialog";
 import {
     Select,
     SelectContent,
@@ -40,741 +42,482 @@ import {
     SelectTrigger,
     SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
+import { getWorkerEmails, getWorkerStats, reassignWorkerEmails } from "@/lib/api/client/admin/workers";
 import {
-    applyWorkerConfig,
-    deleteWorker,
-    getManagedWorker,
-    getWorkerEmails,
-    getWorkerLogs,
-    getWorkerLiveStatus,
-    installWorker,
-    rebootWorker,
-    restartWorker,
-    rotateWorkerKeys,
-    systemUpdateWorker,
-    testWorker,
-    uninstallWorker,
-    upgradeWorker,
-} from "@/lib/api/client/admin/workers";
+    deleteFleetNode,
+    listFleetNodes,
+    nodeNeedsUpdate,
+    nodeState,
+    patchFleetNode,
+    type FleetNode,
+} from "@/lib/api/client/admin/fleetNodes";
+import type { AdminWorkerEmail } from "@/lib/api/models/admin";
+import { TONE_PANEL, TONE_TEXT } from "@/lib/tones";
+import { cn } from "@/lib/utils";
+import { NodeStatePill } from "./fleet/tones";
+import { ResourceUsage } from "./fleet/ResourceUsage";
+import { NodeDiagnostics } from "./fleet/NodeDiagnostics";
+import { ErrorState } from "@/components/ErrorState";
 
-// Risk band (mailbox reputation tier) + health state (warmup/worker) tones.
-const RISK_TONE: Record<string, string> = {
-    clean: "border-emerald-300 bg-emerald-50 text-emerald-700",
-    risky: "border-amber-300 bg-amber-50 text-amber-700",
-    quarantine: "border-red-300 bg-red-50 text-red-700",
-};
+const CRUMBS = [{ label: "Workers", to: "/workers" }];
 
-const HEALTH_TONE: Record<string, string> = {
-    healthy: "border-emerald-300 bg-emerald-50 text-emerald-700",
-    watch: "border-amber-300 bg-amber-50 text-amber-700",
-    throttled: "border-orange-300 bg-orange-50 text-orange-700",
-    quarantined: "border-red-300 bg-red-50 text-red-700",
-    blocked: "border-red-300 bg-red-50 text-red-700",
-};
+function Mono({ children }: { children: React.ReactNode }) {
+    return <span className="font-mono text-xs">{children}</span>;
+}
+
+function uptime(seconds?: number): string {
+    if (seconds === undefined) return "—";
+    const h = Math.floor(seconds / 3600);
+    if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+    if (h >= 1) return `${h}h ${Math.floor((seconds % 3600) / 60)}m`;
+    return `${Math.floor(seconds / 60)}m`;
+}
 
 export default function WorkerDetailPage() {
-    const { id = "" } = useParams<{ id: string }>();
+    const { id = "" } = useParams();
+    const nav = useNavigate();
     const qc = useQueryClient();
-    const navigate = useNavigate();
 
-    const workerQ = useQuery({
-        queryKey: ["admin", "worker", id],
-        queryFn: () => getManagedWorker(id),
-        enabled: !!id,
-        refetchInterval: 15_000,
+    const [pinDraft, setPinDraft] = useState("");
+    const [selected, setSelected] = useState<Set<string>>(new Set());
+    const [reassignOpen, setReassignOpen] = useState(false);
+
+    const nodeQ = useQuery({
+        queryKey: ["admin", "fleet", "nodes"],
+        queryFn: () => listFleetNodes(),
+        refetchInterval: 30_000,
+    });
+    const node = (nodeQ.data?.data ?? []).find((n) => n.id === id) ?? null;
+
+    const statsQ = useQuery({
+        queryKey: ["admin", "workers", id, "stats"],
+        queryFn: () => getWorkerStats(id),
+        enabled: !!node && node.role === "worker",
     });
 
-    const liveQ = useQuery({
-        queryKey: ["admin", "worker", id, "live"],
-        queryFn: () => getWorkerLiveStatus(id),
-        enabled: !!id,
-        refetchInterval: 10_000,
-        retry: false,
+    const emailsQ = useInfiniteQuery({
+        queryKey: ["admin", "workers", id, "emails"],
+        queryFn: ({ pageParam }) => getWorkerEmails(id, pageParam),
+        initialPageParam: undefined as string | undefined,
+        getNextPageParam: (lastPage) =>
+            lastPage.pagination.has_more ? lastPage.pagination.next_cursor ?? undefined : undefined,
+        enabled: !!node && node.role === "worker",
     });
 
-    const [logLines, setLogLines] = useState(200);
-    const [followLogs, setFollowLogs] = useState(false);
-    const logScrollRef = useRef<HTMLDivElement>(null);
-
-    const logsQ = useQuery({
-        queryKey: ["admin", "worker", id, "logs", logLines],
-        queryFn: () => getWorkerLogs(id, logLines),
-        enabled: !!id,
-        retry: false,
-        refetchInterval: followLogs ? 5_000 : false,
+    const patch = useMutation({
+        mutationFn: (body: { name?: string; pinned_version?: string }) => patchFleetNode(id, body),
+        onSuccess: () => {
+            qc.invalidateQueries({ queryKey: ["admin", "fleet"] });
+            toast.success("Node updated");
+        },
+        onError: (e: Error) => toast.error(e.message || "Update failed"),
     });
 
-    // Follow mode pins the viewport to the newest lines on every refetch.
-    useEffect(() => {
-        if (!followLogs) return;
-        const el = logScrollRef.current;
-        if (el) el.scrollTop = el.scrollHeight;
-    }, [followLogs, logsQ.data]);
-
-    const copyLogs = async () => {
-        if (!logsQ.data?.logs) return;
-        try {
-            await navigator.clipboard.writeText(logsQ.data.logs);
-            toast.success("Logs copied to clipboard");
-        } catch {
-            toast.error("Could not copy logs");
-        }
-    };
-
-    const emailsQ = useQuery({
-        queryKey: ["admin", "worker", id, "emails"],
-        queryFn: () => getWorkerEmails(id),
-        enabled: !!id,
-        staleTime: 30_000,
-    });
-
-    const invalidate = () => {
-        qc.invalidateQueries({ queryKey: ["admin", "worker", id] });
-        qc.invalidateQueries({ queryKey: ["admin", "workers", "managed"] });
-    };
-
-    const testMut = useMutation({
-        mutationFn: () => testWorker(id),
+    const remove = useMutation({
+        mutationFn: () => deleteFleetNode(id),
         onSuccess: (res) => {
-            toast.success(res.ok ? "SSH reachable" : res.error || "SSH unreachable");
-            invalidate();
+            toast.success(res.note || "Node removed");
+            nav("/workers");
         },
-        onError: (e: Error) => toast.error(e.message),
+        onError: (e: Error) => toast.error(e.message || "Remove failed"),
     });
 
-    const installMut = useMutation({
-        mutationFn: () => installWorker(id),
-        onSuccess: () => {
-            toast.success("Install kicked off");
-            invalidate();
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    const restartMut = useMutation({
-        mutationFn: () => restartWorker(id),
-        onSuccess: () => {
-            toast.success("Worker restarting");
-            invalidate();
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    const upgradeMut = useMutation({
-        mutationFn: () => upgradeWorker(id),
-        onSuccess: () => {
-            toast.success("Pulling the latest image and restarting");
-            invalidate();
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    const applyMut = useMutation({
-        mutationFn: () => applyWorkerConfig(id),
-        onSuccess: () => {
-            toast.success("Config rewritten and worker restarted");
-            invalidate();
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    // The rotated public key is shown once here; it has to reach the VPS's
-    // authorized_keys or every later SSH action fails.
-    const [rotatedKey, setRotatedKey] = useState<string | null>(null);
-    const rotateMut = useMutation({
-        mutationFn: () => rotateWorkerKeys(id),
-        onSuccess: (res) => {
-            setRotatedKey(res.ssh_public_key);
-            toast.success("New keypair generated");
-            invalidate();
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    const [systemUpdateOutput, setSystemUpdateOutput] = useState<string | null>(null);
-    const systemUpdateMut = useMutation({
-        mutationFn: () => systemUpdateWorker(id),
-        onSuccess: (res) => {
-            setSystemUpdateOutput(res.output);
-            toast.success(
-                res.reboot_required
-                    ? "OS packages updated. A reboot is required."
-                    : "OS packages updated",
-            );
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    const [confirmReboot, setConfirmReboot] = useState(false);
-    const rebootMut = useMutation({
-        mutationFn: () => rebootWorker(id),
-        onSuccess: () => {
-            toast.success("Reboot issued");
-            setConfirmReboot(false);
-            invalidate();
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    const [confirmUninstall, setConfirmUninstall] = useState(false);
-    const uninstallMut = useMutation({
-        mutationFn: () => uninstallWorker(id),
-        onSuccess: () => {
-            toast.success("Uninstall scheduled");
-            setConfirmUninstall(false);
-            invalidate();
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    const [confirmDelete, setConfirmDelete] = useState(false);
-    const deleteMut = useMutation({
-        mutationFn: () => deleteWorker(id),
-        onSuccess: () => {
-            toast.success("Worker deleted");
-            qc.invalidateQueries({ queryKey: ["admin", "workers", "managed"] });
-            navigate("/workers");
-        },
-        onError: (e: Error) => toast.error(e.message),
-    });
-
-    if (workerQ.isLoading) {
+    if (nodeQ.isLoading) {
         return (
             <div>
-                <Skeleton className="h-8 w-1/3 mb-4" />
-                <Skeleton className="h-40 w-full" />
+                <PageHeader breadcrumbs={CRUMBS} title={<Skeleton className="h-4 w-32" />} />
+                <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_300px]">
+                    <div className="space-y-4">
+                        <Skeleton className="h-24 w-full" />
+                        <Skeleton className="h-48 w-full" />
+                    </div>
+                    <Skeleton className="h-72 w-full" />
+                </div>
+            </div>
+        );
+    }
+    if (nodeQ.isError) return <div><PageHeader breadcrumbs={CRUMBS} title="Node unavailable" /><ErrorState error={nodeQ.error} onRetry={() => void nodeQ.refetch()} /></div>;
+    if (!node) {
+        return (
+            <div>
+                <PageHeader breadcrumbs={CRUMBS} title="Node not found" />
+                <EmptyState
+                    icon={ServerOff}
+                    title="Node not found"
+                    hint="It may have been removed."
+                    action={
+                        <Button size="sm" variant="outline" onClick={() => nav("/workers")}>
+                            Back to workers
+                        </Button>
+                    }
+                />
             </div>
         );
     }
 
-    if (workerQ.isError || !workerQ.data) {
-        return (
-            <div>
-                <PageHeader title="Worker not found" />
-                <p className="text-sm text-muted-foreground">
-                    Worker <code>{id}</code> isn't in the managed-worker registry. It may have been
-                    deleted, or you may not have permission to view it.
-                </p>
-                <Link to="/workers" className="text-sm underline mt-3 inline-block">
-                    Back to workers
-                </Link>
-            </div>
-        );
-    }
-
-    const w = workerQ.data;
+    const state = nodeState(node);
+    const mailboxes = emailsQ.data?.pages.flatMap((page) => page.data) ?? [];
+    const mailboxTotal = Math.max(node.mailbox_count ?? 0, mailboxes.length);
 
     return (
         <div>
-            <Link
-                to="/workers"
-                className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground mb-2"
-            >
-                <ArrowLeft className="size-3" />
-                All workers
-            </Link>
             <PageHeader
-                title={w.name || w.id.slice(0, 12)}
-                description={`Managed worker · install state: ${w.install_state}`}
+                breadcrumbs={CRUMBS}
+                title={node.name || node.id.slice(0, 8)}
+                meta={
+                    <>
+                        <NodeStatePill state={state} />
+                        <StatusBadge tone={node.role === "worker" ? "accent" : "strong"}>{node.role}</StatusBadge>
+                    </>
+                }
             >
-                <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => testMut.mutate()}
-                    disabled={testMut.isPending}
-                >
-                    <PlayCircle className="size-4" />
-                    {testMut.isPending ? "Testing…" : "Test SSH"}
-                </Button>
-                <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => installMut.mutate()}
-                    disabled={installMut.isPending}
-                >
-                    <Hammer className="size-4" />
-                    {installMut.isPending ? "Installing…" : "Install"}
-                </Button>
-                <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => restartMut.mutate()}
-                    disabled={restartMut.isPending}
-                >
-                    <RefreshCw className="size-4" />
-                    {restartMut.isPending ? "Restarting…" : "Restart"}
-                </Button>
-                <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => upgradeMut.mutate()}
-                    disabled={upgradeMut.isPending}
-                >
-                    <ArrowUpCircle className="size-4" />
-                    {upgradeMut.isPending ? "Pulling…" : "Pull latest"}
-                </Button>
-                <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => applyMut.mutate()}
-                    disabled={applyMut.isPending}
-                >
-                    <SlidersHorizontal className="size-4" />
-                    {applyMut.isPending ? "Applying…" : "Apply config"}
+                <Button size="sm" variant="ghost" onClick={() => { void nodeQ.refetch(); void qc.invalidateQueries({ queryKey: ["admin", "node-diagnostics", id] }); }}>
+                    <RefreshCw className={cn("size-3.5", nodeQ.isFetching && "animate-spin")} />
+                    Refresh
                 </Button>
             </PageHeader>
 
-            {rotatedKey && (
-                <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-                    <div className="flex items-start gap-2">
-                        <KeyRound className="size-4 mt-0.5 shrink-0" />
-                        <div className="min-w-0 flex-1">
-                            <p className="font-medium">
-                                New public key. Add it to the VPS before the next action.
-                            </p>
-                            <p className="mt-1">
-                                Until this lands in <code>~/.ssh/authorized_keys</code> on the
-                                machine, every SSH action here will fail.
-                            </p>
-                            <pre className="mt-2 overflow-x-auto rounded bg-white/70 p-2 text-xs">
-                                {rotatedKey}
-                            </pre>
-                            <div className="mt-2 flex gap-3">
-                                <button
-                                    className="underline"
-                                    onClick={() => {
-                                        navigator.clipboard.writeText(rotatedKey);
-                                        toast.success("Public key copied");
-                                    }}
-                                >
-                                    copy
-                                </button>
-                                <button className="underline" onClick={() => setRotatedKey(null)}>
-                                    dismiss
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {systemUpdateOutput && (
-                <div className="mb-4 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
-                    <div className="flex items-center justify-between">
-                        <span className="font-medium">Package manager output</span>
-                        <button className="underline" onClick={() => setSystemUpdateOutput(null)}>
-                            dismiss
-                        </button>
-                    </div>
-                    <pre className="mt-2 max-h-64 overflow-auto rounded bg-white p-2 text-xs">
-                        {systemUpdateOutput}
-                    </pre>
-                </div>
-            )}
-
-            {confirmUninstall && (
-                <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700 flex items-start gap-2">
-                    <ShieldAlert className="size-4 mt-0.5" />
-                    <div>
-                        Uninstalling will stop the worker process, drop the systemd unit, and detach
-                        the machine from the fleet. Existing mailbox assignments will need to be
-                        re-routed manually before you do this.
-                        <button
-                            onClick={() => setConfirmUninstall(false)}
-                            className="ml-3 underline"
-                        >
-                            cancel
-                        </button>
-                    </div>
-                </div>
-            )}
-
-            {confirmDelete && (
-                <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700 flex items-start gap-2">
-                    <ShieldAlert className="size-4 mt-0.5" />
-                    <div>
-                        Deleting removes the worker row and its stored SSH key. It does not stop
-                        anything still running on the machine, so uninstall first unless the box is
-                        already gone.
-                        <button onClick={() => setConfirmDelete(false)} className="ml-3 underline">
-                            cancel
-                        </button>
-                    </div>
-                </div>
-            )}
-
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
-                <Card>
-                    <CardHeader>
-                        <CardTitle>SSH target</CardTitle>
-                        <CardDescription>How the control plane reaches this worker.</CardDescription>
-                    </CardHeader>
-                    <CardContent className="pt-0 text-sm space-y-2">
-                        <KV label="Host" value={w.ssh_host || w.ip_addr} mono />
-                        <KV label="Port" value={String(w.ssh_port ?? "22")} mono />
-                        <KV label="User" value={w.ssh_user || "—"} mono />
-                        <KV label="IP" value={w.ip_addr} mono />
-                        {w.ssh_host_fingerprint && (
-                            <KV label="Fingerprint" value={w.ssh_host_fingerprint} mono />
-                        )}
-                    </CardContent>
-                </Card>
-
-                <Card>
-                    <CardHeader>
-                        <CardTitle>Runtime</CardTitle>
-                        <CardDescription>Live status from the worker daemon.</CardDescription>
-                    </CardHeader>
-                    <CardContent className="pt-0 text-sm space-y-2">
-                        {liveQ.isLoading && <Skeleton className="h-4 w-2/3" />}
-                        {liveQ.isError && (
-                            <div className="text-xs text-muted-foreground">
-                                Live status unavailable (worker offline or SSH unreachable).
-                            </div>
-                        )}
-                        {liveQ.data && (
-                            <>
-                                <KV
-                                    label="Service"
-                                    value={
-                                        <Badge
-                                            variant={liveQ.data.service_active ? "default" : "secondary"}
-                                            className={liveQ.data.service_active ? "bg-emerald-600" : ""}
-                                        >
-                                            {liveQ.data.service_active ? "active" : "inactive"}
-                                        </Badge>
-                                    }
-                                />
-                                <KV
-                                    label="Container"
-                                    value={
-                                        <Badge
-                                            variant={liveQ.data.container_up ? "default" : "secondary"}
-                                            className={liveQ.data.container_up ? "bg-emerald-600" : ""}
-                                        >
-                                            {liveQ.data.container_up ? "up" : "down"}
-                                        </Badge>
-                                    }
-                                />
-                                <KV label="Image" value={liveQ.data.container_image || "—"} mono />
-                                <KV label="Uptime" value={liveQ.data.uptime || "—"} />
-                            </>
-                        )}
-                    </CardContent>
-                </Card>
-
-                <Card>
-                    <CardHeader>
-                        <CardTitle>Fleet position</CardTitle>
-                        <CardDescription>How this worker is being used today.</CardDescription>
-                        <div className="flex flex-wrap gap-3 pt-1">
-                            <StateLegend label="Health states" entries={WORKER_HEALTH_LEGEND} />
-                        </div>
-                    </CardHeader>
-                    <CardContent className="pt-0 text-sm space-y-2">
-                        <KV
-                            label="Health"
-                            value={
-                                <Badge
-                                    variant="outline"
-                                    className={`text-[10px] ${HEALTH_TONE[w.health_state] ?? "border-zinc-300 text-zinc-600"}`}
-                                >
-                                    {w.health_state}
-                                </Badge>
-                            }
-                        />
-                        <KV label="Load score" value={w.load_score.toFixed(2)} />
-                        <KV label="Mailboxes" value={String(w.account_count)} />
-                        <KV label="Image" value={w.image_version || "—"} mono />
-                        {w.tags && w.tags.length > 0 && (
-                            <div className="pt-1 flex flex-wrap gap-1">
-                                {w.tags.map((t) => (
-                                    <Badge key={t} variant="outline" className="text-[10px]">
-                                        {t}
-                                    </Badge>
-                                ))}
-                            </div>
-                        )}
-                    </CardContent>
-                </Card>
-            </div>
-
-            <Card className="mt-4">
-                <CardHeader>
-                    <CardTitle>Mailboxes</CardTitle>
-                    <CardDescription>
-                        Inboxes assigned to this worker and their health. Risk band drives which
-                        workers a mailbox may share — low-health inboxes are kept off trusted workers.
-                    </CardDescription>
-                </CardHeader>
-                <CardContent className="pt-0">
-                    {emailsQ.isLoading && <Skeleton className="h-32 w-full" />}
-                    {emailsQ.isError && (
-                        <div className="text-xs text-muted-foreground">Could not load mailboxes.</div>
+            <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_300px]">
+                <div className="min-w-0">
+                    {node.last_error && (
+                        <Callout tone="danger" icon={AlertTriangle} title="Last error" className="mb-8">
+                            <span>The node reported an error on its last heartbeat. Inspect redacted evidence below; raw node error text is not displayed.</span>
+                        </Callout>
                     )}
-                    {emailsQ.data &&
-                        ((emailsQ.data.data ?? []).length === 0 ? (
-                            <div className="text-sm text-muted-foreground">
-                                No mailboxes assigned to this worker.
-                            </div>
-                        ) : (
-                            <>
-                                <div className="overflow-x-auto">
-                                    <table className="w-full text-sm">
-                                        <thead className="text-muted-foreground text-xs uppercase">
-                                            <tr>
-                                                <th className="text-left px-2 py-1.5 font-medium">Mailbox</th>
-                                                <th className="text-left px-2 py-1.5 font-medium">Provider</th>
-                                                <th className="text-left px-2 py-1.5 font-medium">Status</th>
-                                                <th className="text-left px-2 py-1.5 font-medium">Risk band</th>
-                                                <th className="text-left px-2 py-1.5 font-medium">Warmup health</th>
-                                                <th className="text-right px-2 py-1.5 font-medium">Spam</th>
-                                                <th className="text-left px-2 py-1.5 font-medium">Synced</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {(emailsQ.data.data ?? []).map((m) => (
-                                                <tr key={m.id} className="border-t border-border">
-                                                    <td className="px-2 py-1.5 font-mono text-xs">{m.email}</td>
-                                                    <td className="px-2 py-1.5 text-xs">
-                                                        {m.provider}
-                                                        {m.warmup_enabled && (
-                                                            <span className="ml-1 text-[10px] text-sky-600">warming</span>
-                                                        )}
-                                                    </td>
-                                                    <td className="px-2 py-1.5 text-xs">{m.status}</td>
-                                                    <td className="px-2 py-1.5">
-                                                        <Badge
-                                                            variant="outline"
-                                                            className={`text-[10px] ${RISK_TONE[m.risk_band] ?? "border-zinc-300 text-zinc-600"}`}
-                                                        >
-                                                            {m.risk_band}
-                                                        </Badge>
-                                                    </td>
-                                                    <td className="px-2 py-1.5">
-                                                        {m.warmup_health ? (
-                                                            <Badge
-                                                                variant="outline"
-                                                                className={`text-[10px] ${HEALTH_TONE[m.warmup_health] ?? "border-zinc-300 text-zinc-600"}`}
-                                                            >
-                                                                {m.warmup_health}
-                                                            </Badge>
-                                                        ) : (
-                                                            <span className="text-xs text-muted-foreground">—</span>
-                                                        )}
-                                                    </td>
-                                                    <td className="px-2 py-1.5 text-right tabular-nums text-xs">
-                                                        {m.spam_score ?? "—"}
-                                                    </td>
-                                                    <td className="px-2 py-1.5 text-xs text-muted-foreground">
-                                                        {m.last_synced_at
-                                                            ? new Date(m.last_synced_at).toLocaleDateString()
-                                                            : "—"}
-                                                    </td>
-                                                </tr>
-                                            ))}
-                                        </tbody>
-                                    </table>
-                                </div>
-                                {emailsQ.data.pagination?.has_more && (
-                                    <div className="mt-2 text-xs text-muted-foreground">
-                                        Showing the first {(emailsQ.data.data ?? []).length}
-                                        {emailsQ.data.pagination.total != null
-                                            ? ` of ${emailsQ.data.pagination.total}`
-                                            : ""}{" "}
-                                        — use the Mailboxes explorer for the full list.
+
+                    {node.role === "worker" && (
+                        <Section
+                            title="Sending"
+                            description="Placement assigns these mailboxes; you never have to. Moving one by hand is temporary: the rotation loop re-places it if it disagrees."
+                        >
+                            {(statsQ.isLoading || statsQ.data) && (
+                                <StatGrid className="mb-4">
+                                    <Stat label="Sent today" value={statsQ.data?.emails_sent_today.toLocaleString()} loading={statsQ.isLoading} />
+                                    <Stat label="Sent this week" value={statsQ.data?.emails_sent_this_week.toLocaleString()} loading={statsQ.isLoading} />
+                                    <Stat label="Sent total" value={statsQ.data?.total_emails_sent.toLocaleString()} loading={statsQ.isLoading} />
+                                    {/* Already a percentage in SQL; multiplying again gives 10000%. */}
+                                    <Stat
+                                        label="Success rate"
+                                        value={statsQ.data ? `${Math.round(statsQ.data.success_rate)}%` : undefined}
+                                        loading={statsQ.isLoading}
+                                    />
+                                </StatGrid>
+                            )}
+
+                            <Panel
+                                title={
+                                    <span className="flex items-center gap-2">
+                                        Mailboxes
+                                        {mailboxTotal > 0 && (
+                                            <span className="text-xs font-normal text-muted-foreground tabular-nums">
+                                                {mailboxes.length} of {mailboxTotal}
+                                            </span>
+                                        )}
+                                    </span>
+                                }
+                                actions={
+                                    selected.size > 0 ? (
+                                        <Button size="xs" onClick={() => setReassignOpen(true)}>
+                                            <ArrowRightLeft className="size-3" />
+                                            Move {selected.size} elsewhere
+                                        </Button>
+                                    ) : undefined
+                                }
+                                bodyClassName="p-0"
+                            >
+                                {emailsQ.isLoading ? (
+                                    <div className="space-y-2 p-4">
+                                        <Skeleton className="h-5 w-full" />
+                                        <Skeleton className="h-5 w-4/5" />
+                                        <Skeleton className="h-5 w-3/5" />
+                                    </div>
+                                ) : mailboxes.length === 0 ? (
+                                    <EmptyState icon={Inbox} title="No mailboxes on this worker yet." className="py-10" />
+                                ) : (
+                                    <div>
+                                        <div className="flex h-9 items-center gap-3 border-b border-border px-4 text-xs font-medium text-muted-foreground">
+                                            <span className="size-4 shrink-0" aria-hidden />
+                                            Mailbox
+                                            <span className="ml-auto">Provider</span>
+                                        </div>
+                                        {mailboxes.map((m: AdminWorkerEmail) => (
+                                            <label
+                                                key={m.id}
+                                                className={cn(
+                                                    "flex h-10 cursor-pointer items-center gap-3 border-b border-border/70 px-4 text-[13px] transition-colors last:border-b-0 hover:bg-accent/50",
+                                                    selected.has(m.id) && "bg-[var(--admin-accent-weak)]",
+                                                )}
+                                            >
+                                                <Checkbox
+                                                    checked={selected.has(m.id)}
+                                                    onCheckedChange={(v) => {
+                                                        const next = new Set(selected);
+                                                        if (v) next.add(m.id);
+                                                        else next.delete(m.id);
+                                                        setSelected(next);
+                                                    }}
+                                                />
+                                                <span className="min-w-0 truncate font-mono text-[12.5px]">{m.email}</span>
+                                                <StatusBadge className="ml-auto">{m.provider}</StatusBadge>
+                                            </label>
+                                        ))}
                                     </div>
                                 )}
-                            </>
-                        ))}
-                </CardContent>
-            </Card>
 
-            <Card className="mt-4">
-                <CardHeader>
-                    <CardTitle className="flex flex-wrap items-center justify-between gap-2">
-                        <span>Recent logs</span>
+                                {emailsQ.hasNextPage && (
+                                    <div className="border-t border-border px-4 py-2">
+                                        <Button
+                                            size="xs"
+                                            variant="ghost"
+                                            disabled={emailsQ.isFetchingNextPage}
+                                            onClick={() => emailsQ.fetchNextPage()}
+                                        >
+                                            {emailsQ.isFetchingNextPage ? "Loading…" : "Load more mailboxes"}
+                                        </Button>
+                                    </div>
+                                )}
+                            </Panel>
+                        </Section>
+                    )}
+
+                    <NodeDiagnostics node={node} />
+
+                    <Section
+                        title="Version"
+                        description="The node pulls whatever the fleet is set to. Pin it to hold this one machine back, or to canary a release on it before the rest follow."
+                    >
                         <div className="flex flex-wrap items-center gap-2">
-                            <Select
-                                value={String(logLines)}
-                                onValueChange={(v) => setLogLines(Number(v))}
-                            >
-                                <SelectTrigger className="h-8 w-[120px] text-xs" size="sm">
-                                    <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    <SelectItem value="100">100 lines</SelectItem>
-                                    <SelectItem value="200">200 lines</SelectItem>
-                                    <SelectItem value="500">500 lines</SelectItem>
-                                    <SelectItem value="1000">1000 lines</SelectItem>
-                                </SelectContent>
-                            </Select>
-                            <label className="flex items-center gap-1.5 text-xs font-normal text-muted-foreground">
-                                <Switch
-                                    checked={followLogs}
-                                    onCheckedChange={setFollowLogs}
-                                />
-                                Follow
-                            </label>
+                            <Input
+                                value={pinDraft}
+                                onChange={(e) => setPinDraft(e.target.value)}
+                                placeholder={node.pinned_version || "v1.4.2"}
+                                className="w-48 font-mono text-[12.5px]"
+                                aria-label="Version to pin"
+                            />
                             <Button
                                 size="sm"
-                                variant="ghost"
-                                onClick={copyLogs}
-                                disabled={!logsQ.data?.logs}
+                                disabled={!pinDraft.trim() || patch.isPending}
+                                onClick={() => {
+                                    patch.mutate({ pinned_version: pinDraft.trim() });
+                                    setPinDraft("");
+                                }}
                             >
-                                <Copy className="size-4" />
-                                Copy
+                                <Pin className="size-3.5" />
+                                Pin
                             </Button>
-                            <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => logsQ.refetch()}
-                                disabled={logsQ.isFetching}
-                            >
-                                <RefreshCw
-                                    className={`size-4 ${logsQ.isFetching ? "animate-spin" : ""}`}
-                                />
-                                {logsQ.isFetching ? "Loading…" : "Reload"}
-                            </Button>
-                        </div>
-                    </CardTitle>
-                    <CardDescription>
-                        Tail of the worker's systemd journal, last {logLines} lines pulled over
-                        SSH. Follow refetches every 5s and keeps the newest lines in view.
-                    </CardDescription>
-                </CardHeader>
-                <CardContent className="pt-0">
-                    {logsQ.isLoading && <Skeleton className="h-40 w-full" />}
-                    {logsQ.isError && (
-                        <div className="text-xs text-muted-foreground">
-                            Could not fetch logs (worker offline or SSH unreachable).
-                        </div>
-                    )}
-                    {logsQ.data && (
-                        <div
-                            ref={logScrollRef}
-                            className="rounded-md border border-zinc-800 bg-zinc-950 overflow-auto max-h-96"
-                        >
-                            <pre className="text-[11px] leading-relaxed font-mono text-zinc-100 p-3">
-                                {logsQ.data.logs || "(no log output)"}
-                            </pre>
-                        </div>
-                    )}
-                    {logsQ.data?.logs && (
-                        <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-                            <Download className="size-3" />
-                            <a
-                                href={`data:text/plain;charset=utf-8,${encodeURIComponent(logsQ.data.logs)}`}
-                                download={`worker-${w.id}-logs.txt`}
-                                className="underline"
-                            >
-                                Download as .txt
-                            </a>
-                        </div>
-                    )}
-                </CardContent>
-            </Card>
-
-            <Card className="mt-4">
-                <CardHeader>
-                    <CardTitle>Maintenance</CardTitle>
-                    <CardDescription>
-                        Host-level and destructive operations. Each one acts on the machine over
-                        SSH, so the worker must be reachable.
-                    </CardDescription>
-                </CardHeader>
-                <CardContent className="pt-0">
-                    <div className="flex flex-wrap gap-2">
-                        <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => systemUpdateMut.mutate()}
-                            disabled={systemUpdateMut.isPending}
-                        >
-                            <PackageOpen className="size-4" />
-                            {systemUpdateMut.isPending ? "Updating…" : "Update OS packages"}
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => rotateMut.mutate()}
-                            disabled={rotateMut.isPending}
-                        >
-                            <KeyRound className="size-4" />
-                            {rotateMut.isPending ? "Rotating…" : "Rotate SSH keys"}
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant={confirmReboot ? "destructive" : "outline"}
-                            onClick={() =>
-                                confirmReboot ? rebootMut.mutate() : setConfirmReboot(true)
-                            }
-                            disabled={rebootMut.isPending}
-                        >
-                            <RotateCcw className="size-4" />
-                            {rebootMut.isPending
-                                ? "Rebooting…"
-                                : confirmReboot
-                                    ? "Confirm reboot"
-                                    : "Reboot"}
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant={confirmUninstall ? "destructive" : "outline"}
-                            onClick={() =>
-                                confirmUninstall ? uninstallMut.mutate() : setConfirmUninstall(true)
-                            }
-                            disabled={uninstallMut.isPending}
-                        >
-                            {confirmUninstall ? (
-                                <StopCircle className="size-4" />
-                            ) : (
-                                <PowerOff className="size-4" />
+                            {node.pinned_version && (
+                                <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={patch.isPending}
+                                    onClick={() => patch.mutate({ pinned_version: "" })}
+                                >
+                                    <PinOff className="size-3.5" />
+                                    Clear pin ({node.pinned_version})
+                                </Button>
                             )}
-                            {uninstallMut.isPending
-                                ? "Uninstalling…"
-                                : confirmUninstall
-                                    ? "Confirm uninstall"
-                                    : "Uninstall"}
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant={confirmDelete ? "destructive" : "outline"}
-                            onClick={() =>
-                                confirmDelete ? deleteMut.mutate() : setConfirmDelete(true)
-                            }
-                            disabled={deleteMut.isPending}
+                        </div>
+                    </Section>
+
+                    <Section title="Danger zone">
+                        <div
+                            className={cn(
+                                "flex flex-col gap-3 rounded-lg border px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between",
+                                TONE_PANEL.danger,
+                            )}
                         >
-                            <Trash2 className="size-4" />
-                            {deleteMut.isPending
-                                ? "Deleting…"
-                                : confirmDelete
-                                    ? "Confirm delete"
-                                    : "Delete worker"}
-                        </Button>
+                            <div className="min-w-0">
+                                <div className="text-[13px] font-medium text-foreground">Remove from fleet</div>
+                                <p className="mt-0.5 max-w-xl text-[12.5px] leading-relaxed text-muted-foreground">
+                                    Forgets the node. Any mailboxes it carries are re-placed within a few
+                                    minutes. It does not stop the process: a machine that is still running
+                                    re-joins on its next heartbeat, so stop the service there too.
+                                </p>
+                            </div>
+                            <Button
+                                size="sm"
+                                variant="destructive"
+                                className="shrink-0 self-start sm:self-center"
+                                disabled={remove.isPending}
+                                onClick={() => remove.mutate()}
+                            >
+                                <Trash2 className="size-3.5" />
+                                {remove.isPending ? "Removing…" : "Remove from fleet"}
+                            </Button>
+                        </div>
+                    </Section>
+                </div>
+
+                <aside className="order-first min-w-0 lg:order-none lg:border-l lg:border-border lg:pl-6">
+                    <div className="lg:sticky lg:top-16">
+                        <h2 className="text-[13px] font-semibold text-foreground">Properties</h2>
+                        <p className="mt-0.5 text-xs text-muted-foreground">Reported by the node on its last heartbeat.</p>
+                        <PropertyList className="mt-2">
+                            <Property label="State">
+                                <NodeStatePill state={state} />
+                            </Property>
+                            <Property label="Version">
+                                {nodeNeedsUpdate(node) ? (
+                                    <Mono>
+                                        {node.version || "—"}
+                                        <span className="text-subtle-foreground"> → </span>
+                                        <span className={TONE_TEXT.warning}>{node.desired_version}</span>
+                                    </Mono>
+                                ) : (
+                                    <Mono>{node.version || "—"}</Mono>
+                                )}
+                            </Property>
+                            {node.pinned_version && (
+                                <Property label="Pinned">
+                                    <Mono>{node.pinned_version}</Mono>
+                                </Property>
+                            )}
+                            <Property label="Public IPv4">
+                                <Mono>{node.address || "—"}</Mono>
+                            </Property>
+                            <Property label="Region">
+                                <Mono>{node.region || "—"}</Mono>
+                            </Property>
+                            {node.role === "worker" && (
+                                <Property label="Mailbox target">
+                                    <span className="tabular-nums">{(node.capacity_target || 100).toLocaleString()}</span>
+                                </Property>
+                            )}
+                            <Property label="CPU">
+                                <ResourceUsage usage={node.usage} kind="cpu" live={state === "live"} />
+                            </Property>
+                            <Property label="RAM">
+                                <ResourceUsage usage={node.usage} kind="memory" live={state === "live"} />
+                            </Property>
+                            <Property label="Process RAM">
+                                <ResourceUsage usage={node.usage} kind="resident" live={state === "live"} />
+                            </Property>
+                            <Property label="Goroutines">
+                                <span className="tabular-nums">{node.usage?.goroutines ?? "—"}</span>
+                            </Property>
+                            <Property label="Uptime">
+                                <span className="tabular-nums">{uptime(node.usage?.uptime_seconds)}</span>
+                            </Property>
+                            <Property label="Last seen">
+                                {node.last_seen_at ? new Date(node.last_seen_at).toLocaleString() : "never"}
+                            </Property>
+                            <Property label="Enrolled">{new Date(node.enrolled_at).toLocaleString()}</Property>
+                            <Property label="Node id">
+                                <span className="break-all font-mono text-[11.5px] text-muted-foreground">{node.id}</span>
+                            </Property>
+                        </PropertyList>
                     </div>
-                </CardContent>
-            </Card>
+                </aside>
+            </div>
+
+            <ReassignDialog
+                open={reassignOpen}
+                onOpenChange={setReassignOpen}
+                source={node}
+                mailboxIds={[...selected]}
+                onDone={() => {
+                    setSelected(new Set());
+                    emailsQ.refetch();
+                    nodeQ.refetch();
+                }}
+            />
         </div>
     );
 }
 
-function KV({
-    label,
-    value,
-    mono,
+function ReassignDialog({
+    open,
+    onOpenChange,
+    source,
+    mailboxIds,
+    onDone,
 }: {
-    label: string;
-    value: React.ReactNode;
-    mono?: boolean;
+    open: boolean;
+    onOpenChange: (v: boolean) => void;
+    source: FleetNode;
+    mailboxIds: string[];
+    onDone: () => void;
 }) {
+    const [target, setTarget] = useState("");
+
+    const workersQ = useQuery({
+        queryKey: ["admin", "fleet", "nodes", "worker"],
+        queryFn: () => listFleetNodes("worker"),
+        enabled: open,
+        staleTime: 30_000,
+    });
+    const candidates = (workersQ.data?.data ?? []).filter((x) => x.id !== source.id);
+    const chosen = candidates.find((x) => x.id === target) ?? null;
+
+    const mutation = useMutation({
+        mutationFn: () => reassignWorkerEmails(target, mailboxIds),
+        onSuccess: () => {
+            toast.success(
+                `${mailboxIds.length} mailbox${mailboxIds.length === 1 ? "" : "es"} moved`,
+            );
+            setTarget("");
+            onDone();
+            onOpenChange(false);
+        },
+        onError: (e: Error) => toast.error(e.message || "Reassign failed"),
+    });
+
     return (
-        <div className="flex items-center justify-between gap-3">
-            <span className="text-xs text-muted-foreground uppercase tracking-wide">{label}</span>
-            <span className={mono ? "font-mono text-xs truncate max-w-[60%]" : "text-sm"}>
-                {value}
-            </span>
-        </div>
+        <Dialog open={open} onOpenChange={onOpenChange}>
+            <DialogContent>
+                <DialogHeader>
+                    <DialogTitle>
+                        Move {mailboxIds.length} mailbox{mailboxIds.length === 1 ? "" : "es"}
+                    </DialogTitle>
+                    <DialogDescription>
+                        Sending and sync continue from the target on its next heartbeat. Any
+                        worker can host any mailbox, so this is only worth doing when you know
+                        something placement does not.
+                    </DialogDescription>
+                </DialogHeader>
+
+                <Select value={target || undefined} onValueChange={setTarget}>
+                    <SelectTrigger className="h-8 w-full text-[13px]">
+                        <SelectValue
+                            placeholder={workersQ.isLoading ? "Loading…" : "Pick a worker"}
+                        />
+                    </SelectTrigger>
+                    <SelectContent>
+                        {candidates.length === 0 && (
+                            <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                                No other workers.
+                            </div>
+                        )}
+                        {candidates.map((x) => (
+                            <SelectItem key={x.id} value={x.id} className="text-[12.5px]">
+                                {x.name || x.id.slice(0, 8)}
+                                {x.region ? ` · ${x.region}` : ""} · {nodeState(x)} ·{" "}
+                                {x.mailbox_count ?? 0} mailbox
+                                {(x.mailbox_count ?? 0) === 1 ? "" : "es"}
+                            </SelectItem>
+                        ))}
+                    </SelectContent>
+                </Select>
+
+                {chosen && nodeState(chosen) !== "live" && (
+                    <Callout tone="warning" icon={AlertTriangle}>
+                        That node is {nodeState(chosen)}; placement would not choose it, and the
+                        rotation loop will move these mailboxes off it again.
+                    </Callout>
+                )}
+
+                <DialogFooter>
+                    <Button variant="outline" onClick={() => onOpenChange(false)}>
+                        Cancel
+                    </Button>
+                    <Button
+                        onClick={() => mutation.mutate()}
+                        disabled={!chosen || mailboxIds.length === 0 || mutation.isPending}
+                    >
+                        {mutation.isPending ? "Moving…" : "Move"}
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
     );
 }

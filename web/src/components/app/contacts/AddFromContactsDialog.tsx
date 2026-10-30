@@ -2,12 +2,15 @@
 //
 // The Leads tab could import a file, sync a sheet, or type a new contact, but
 // had no way to pull in people already in the workspace. This dialog searches
-// the contact list (query + categories), shows who is already a lead, and
+// the contact list (query + labels), shows who is already a lead, and
 // attaches the selection through the bulk contact update (add_campaigns), the
-// same path the import wizard uses. "Select all matching" pages through the
-// search up to the bulk-update cap so a whole category can be added in one go.
+// same path the import wizard uses. "Select all matching" hands the server the
+// search itself, so a whole category is one request.
 
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseText, browseIds } from "@/lib/browse-contacts-campaigns";
+import useBrowseDebouncedValue from "@/hooks/useBrowseDebouncedValue";
 import { AnimatePresence, motion } from "framer-motion";
 import {
     AlertCircleIcon,
@@ -16,23 +19,27 @@ import {
     UsersIcon,
     XIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { SearchInput } from "@/components/ui/field";
 import CategoryPicker from "./CategoryPicker";
 import useSearchContacts from "@/lib/api/hooks/app/contacts/useSearchContacts";
 import useUpdateContactsBulk from "@/lib/api/hooks/app/contacts/useUpdateContactsBulk";
 import { useSetSegmentMembers } from "@/lib/api/hooks/app/segments";
-import searchContacts from "@/lib/api/client/app/contacts/searchContacts";
 import type SearchContacts from "@/lib/api/models/app/contacts/SearchContacts";
 import type Contact from "@/lib/api/models/app/contacts/Contact";
 import type MiniCampaign from "@/lib/api/models/app/campaigns/MiniCampaign";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
-import { cn, hexToRgba } from "@/lib/utils";
+import { cn, hexToRgba, labelInk } from "@/lib/utils";
+import type ContactSelection from "@/lib/api/models/app/contacts/ContactSelection";
+import * as rowSelection from "./selection";
+import type { RowSelection } from "./selection";
 
-// Backend caps: 100 rows per search page, 1000 contacts per bulk update.
+// Backend caps: 100 rows per search page, 10,000 contacts per explicit batch.
+// "Select all matching" sends the filter instead, so it is not bound by the
+// second one.
 const PAGE = 100;
-const MAX_SELECTION = 1000;
+const MAX_SELECTION = 10_000;
 
 // The target is either a campaign (contacts become leads) or a segment
 // (contacts are pinned in as manual includes).
@@ -61,23 +68,20 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
     );
     const targetName = target.kind === "campaign" ? target.campaign.name : target.segment.name;
 
-    const [query, setQuery] = React.useState("");
-    const [categoryIds, setCategoryIds] = React.useState<string[]>([]);
-    const [selected, setSelected] = React.useState<Set<string>>(() => new Set());
-    const [selectingAll, setSelectingAll] = React.useState(false);
-    const [capped, setCapped] = React.useState(false);
+    const browseName = `contacts:add-from:${target.kind}:${target.kind === "campaign" ? target.campaign.id : target.segment.id}`;
+    const [query, setQuery] = useBrowseState(`${browseName}:query`, "", browseText);
+    const [categoryIds, setCategoryIds] = useBrowseState<string[]>(`${browseName}:labels`, [], browseIds);
+    // Ticked rows, or the search itself minus what was unticked after it; the
+    // same two shapes the contacts table uses (./selection).
+    const [rowSel, setRowSel] = React.useState<RowSelection>(rowSelection.emptySelection);
 
     // Debounce the query so a fast typist does not fire a search per keystroke.
-    const [debounced, setDebounced] = React.useState("");
-    React.useEffect(() => {
-        const t = setTimeout(() => setDebounced(query.trim()), 200);
-        return () => clearTimeout(t);
-    }, [query]);
+    const debounced = useBrowseDebouncedValue(query.trim(), browseName, 200);
 
     const options = React.useMemo<SearchContacts>(
         () => ({
             query: debounced,
-            filters: [],
+            custom_field_filters: [],
             campaign_ids: [],
             category_ids: categoryIds.length > 0 ? categoryIds : undefined,
             sort_by: "created_at",
@@ -91,85 +95,52 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
 
     React.useEffect(() => {
         if (!open) {
-            setQuery("");
-            setDebounced("");
-            setCategoryIds([]);
-            setSelected(new Set());
-            setSelectingAll(false);
-            setCapped(false);
+            setRowSel(rowSelection.emptySelection);
         }
     }, [open]);
+
+    // A changed search makes a select-all stale, so it drops back to nothing.
+    React.useEffect(() => {
+        setRowSel(rowSelection.emptySelection);
+    }, [options]);
 
     const inCampaign = React.useCallback(
         (c: Contact) => target.kind === "campaign" && (c.campaigns ?? []).some((x) => x.id === target.campaign.id),
         [target],
     );
 
-    const selectable = React.useMemo(() => contacts.filter((c) => !inCampaign(c)), [contacts, inCampaign]);
-    const allLoadedSelected = selectable.length > 0 && selectable.every((c) => selected.has(c.id));
+    // Contacts already in the campaign are shown but never selectable.
+    const selectableIDs = React.useMemo(
+        () => contacts.filter((c) => !inCampaign(c)).map((c) => c.id),
+        [contacts, inCampaign],
+    );
+    const isSelected = React.useCallback((id: string) => rowSelection.isRowSelected(rowSel, id), [rowSel]);
+    const allLoadedSelected = rowSelection.allLoadedSelected(rowSel, selectableIDs);
 
-    const toggle = (id: string) =>
-        setSelected((prev) => {
-            const next = new Set(prev);
-            if (next.has(id)) next.delete(id);
-            else if (next.size < MAX_SELECTION) next.add(id);
-            return next;
-        });
+    // A ticked list still goes to the server as ids, so it keeps the batch cap;
+    // "select all matching" does not, because it goes as the filter.
+    const capped = (s: RowSelection) => (s.ids.length > MAX_SELECTION ? { ...s, ids: s.ids.slice(0, MAX_SELECTION) } : s);
+    const toggle = (id: string) => setRowSel((s) => capped(rowSelection.toggleRow(s, id, !rowSelection.isRowSelected(s, id))));
+    const toggleLoaded = () => setRowSel((s) => capped(rowSelection.toggleLoaded(s, selectableIDs)));
 
-    const toggleLoaded = () =>
-        setSelected((prev) => {
-            const next = new Set(prev);
-            if (allLoadedSelected) selectable.forEach((c) => next.delete(c.id));
-            else for (const c of selectable) if (next.size < MAX_SELECTION) next.add(c.id);
-            return next;
-        });
-
-    // Walk every page of the current search and select what is not already a
-    // lead, stopping at the bulk cap so the request that follows cannot fail.
-    async function selectAllMatching() {
-        if (selectingAll) return;
-        setSelectingAll(true);
-        setCapped(false);
-        try {
-            const next = new Set(selected);
-            let cursor: string | null = null;
-            let hitCap = false;
-            for (;;) {
-                const page = await searchContacts(options, cursor, PAGE);
-                for (const c of page.data ?? []) {
-                    if (inCampaign(c)) continue;
-                    if (next.size >= MAX_SELECTION) {
-                        hitCap = true;
-                        break;
-                    }
-                    next.add(c.id);
-                }
-                if (hitCap || !page.pagination.has_more || !page.pagination.next_cursor) break;
-                cursor = page.pagination.next_cursor;
-            }
-            setSelected(next);
-            setCapped(hitCap);
-        } catch (err) {
-            toast.error(buildError(err as AppError));
-        } finally {
-            setSelectingAll(false);
-        }
-    }
+    // Hand the server the search rather than walking it here: one request, no
+    // cap, and the set is resolved from the same filters the list ran.
+    const selectAllMatching = () => setRowSel(rowSelection.selectAllMatching());
 
     async function submit() {
-        if (busy || selected.size === 0) return;
+        if (busy || count === 0) return;
         try {
             if (target.kind === "campaign") {
                 await bulk.mutateAsync({
-                    contacts: [...selected],
+                    ...selection,
                     add_campaigns: [target.campaign.id],
                     remove_campaigns: [],
                     fields: [],
                 });
-                toast.success(`Added ${selected.size} lead${selected.size === 1 ? "" : "s"} to ${target.campaign.name}`);
+                toast.success(`Added ${count.toLocaleString()} lead${count === 1 ? "" : "s"} to ${target.campaign.name}`);
             } else {
-                await members.mutateAsync({ id: target.segment.id, contacts: [...selected], mode: "include" });
-                toast.success(`Added ${selected.size} contact${selected.size === 1 ? "" : "s"} to ${target.segment.name}`);
+                const added = await members.mutateAsync({ id: target.segment.id, selection, mode: "include" });
+                toast.success(`Added ${added.toLocaleString()} contact${added === 1 ? "" : "s"} to ${target.segment.name}`);
             }
             onClose();
         } catch (err) {
@@ -195,6 +166,12 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
     }, [open, requestClose]);
 
     const total = search.data?.pages?.[0]?.pagination.total ?? null;
+    // What the Add button applies to, and how many contacts that is.
+    const selection = React.useMemo<ContactSelection>(
+        () => rowSelection.toRequest(rowSel, options),
+        [rowSel, options],
+    );
+    const count = rowSelection.selectionCount(rowSel, total ?? 0);
 
     return (
         <AnimatePresence>
@@ -252,9 +229,10 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
                             />
                             <div className="flex-1 min-w-0">
                                 <CategoryPicker
+                                    showMissing
                                     value={categoryIds}
                                     onChange={setCategoryIds}
-                                    placeholder="Filter by category…"
+                                    placeholder="Filter by label…"
                                     allowCreate={false}
                                 />
                             </div>
@@ -264,25 +242,23 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
                             <button
                                 type="button"
                                 onClick={toggleLoaded}
-                                disabled={selectable.length === 0}
+                                disabled={selectableIDs.length === 0}
                                 className="inline-flex items-center gap-1.5 hover:text-slate-900 disabled:opacity-50 transition-colors"
                             >
                                 <CheckSquare checked={allLoadedSelected} />
-                                {allLoadedSelected ? "Clear loaded" : `Select loaded (${selectable.length})`}
+                                {allLoadedSelected ? "Clear loaded" : `Select loaded (${selectableIDs.length})`}
                             </button>
-                            {(search.hasNextPage || contacts.length >= PAGE) && (
+                            {!rowSel.all && (search.hasNextPage || contacts.length >= PAGE) && (
                                 <button
                                     type="button"
                                     onClick={selectAllMatching}
-                                    disabled={selectingAll}
-                                    className="inline-flex items-center gap-1 hover:text-slate-900 disabled:opacity-50 transition-colors"
+                                    className="inline-flex items-center gap-1 hover:text-slate-900 transition-colors"
                                 >
-                                    {selectingAll && <Loader2Icon className="w-3 h-3 animate-spin" />}
                                     Select all matching{total != null ? ` (${total.toLocaleString()})` : ""}
                                 </button>
                             )}
                             <span className="ml-auto tabular-nums">
-                                {selected.size.toLocaleString()} selected
+                                {count.toLocaleString()} selected
                             </span>
                         </div>
 
@@ -312,7 +288,7 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
                                     </p>
                                     <p className="text-[11.5px] text-slate-400 mt-0.5">
                                         {debounced || categoryIds.length > 0
-                                            ? "Try a different search or category."
+                                            ? "Try a different search or label."
                                             : "Import a file or add contacts first."}
                                     </p>
                                 </div>
@@ -320,7 +296,7 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
                                 <ul className="divide-y divide-slate-100">
                                     {contacts.map((c) => {
                                         const already = inCampaign(c);
-                                        const on = selected.has(c.id);
+                                        const on = !already && isSelected(c.id);
                                         return (
                                             <li key={c.id}>
                                                 <button
@@ -365,7 +341,7 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
                                                                 className="inline-flex items-center gap-1 h-5 px-1.5 rounded text-[10.5px] font-medium truncate"
                                                                 style={{
                                                                     backgroundColor: hexToRgba(cat.color, 0.12),
-                                                                    color: cat.color,
+                                                                    color: labelInk(cat.color),
                                                                 }}
                                                             >
                                                                 <span className="size-1.5 rounded-full shrink-0" style={{ backgroundColor: cat.color }} />
@@ -402,11 +378,9 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
 
                         <footer className="px-3 min-h-12 py-1.5 sm:py-0 sm:h-12 border-t border-slate-200 flex items-center gap-2 shrink-0 bg-slate-50/30">
                             <span className="text-[11px] text-slate-400 min-w-0 truncate">
-                                {capped
-                                    ? `Capped at ${MAX_SELECTION.toLocaleString()} per batch. Add these, then repeat for the rest.`
-                                    : target.kind === "campaign"
-                                      ? "Contacts already in this campaign are skipped."
-                                      : "Added contacts stay in the segment whatever its conditions say."}
+                                {target.kind === "campaign"
+                                    ? "Contacts already in this campaign are skipped."
+                                    : "Added contacts stay in the segment whatever its conditions say."}
                             </span>
                             <button
                                 type="button"
@@ -419,11 +393,11 @@ export default function AddFromContactsDialog({ open, onClose, campaign: campaig
                             <button
                                 type="button"
                                 onClick={submit}
-                                disabled={busy || selected.size === 0}
+                                disabled={busy || count === 0}
                                 className="h-7 px-2.5 rounded-md bg-sky-600 hover:bg-sky-700 text-white text-[12px] font-medium inline-flex items-center gap-1.5 transition-colors disabled:opacity-50 shrink-0"
                             >
                                 {busy ? <Loader2Icon className="w-3 h-3 animate-spin" /> : <UsersIcon className="w-3 h-3" />}
-                                Add {selected.size > 0 ? selected.size.toLocaleString() : ""} {target.kind === "campaign" ? "lead" : "contact"}{selected.size === 1 ? "" : "s"}
+                                Add {count > 0 ? count.toLocaleString() : ""} {target.kind === "campaign" ? "lead" : "contact"}{count === 1 ? "" : "s"}
                             </button>
                         </footer>
                     </motion.div>

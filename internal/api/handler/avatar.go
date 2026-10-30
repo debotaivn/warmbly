@@ -8,24 +8,24 @@
 // Constants:
 //
 //   - max size: 2 MiB. Anything larger gets a 400.
-//   - accepted MIME: image/png, image/jpeg, image/webp, image/gif.
-//   - object key: avatars/{kind}/{id}-{epoch}.{ext}
+//   - accepted formats: PNG, JPEG, decided from the bytes (see avatarFormats).
+//   - object key: avatars/{kind}/{id}-{epoch_ms}-{nonce}.{ext}
 //
 // The epoch suffix forces cache busting on replacement so the
-// browser doesn't keep showing the old avatar at the same URL.
+// browser doesn't keep showing the old avatar at the same URL (the
+// objects are served immutable, so a reused key would never refresh).
+// The previous object is deleted best-effort once the row points at
+// the new one, so replacing or removing an avatar doesn't leak blobs.
 
 package handler
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"image"
-	_ "image/jpeg"
-	_ "image/png"
 	"io"
 	"net/http"
-	"path"
 	"strings"
 	"time"
 
@@ -36,12 +36,17 @@ import (
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/infrastructure/storage"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/observability/errs"
+	"github.com/warmbly/warmbly/internal/pkg/imagetype"
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
 const (
 	avatarMaxBytes     int64 = 2 * 1024 * 1024
 	avatarMaxDimension       = 1024 // px — reject anything bigger so a phone-camera dump doesn't sneak through
+
+	userAvatarKeyPrefix = "avatars/users/"
+	orgAvatarKeyPrefix  = "avatars/organizations/"
 )
 
 // Intentionally narrow allowlist: only PNG and JPEG. WebP, GIF and
@@ -56,11 +61,7 @@ const (
 //
 // The client-side resizer always re-encodes to JPEG anyway, so this
 // list constrains what survives a bypass of the JS path.
-var allowedAvatarMIME = map[string]string{
-	"image/png":  ".png",
-	"image/jpg":  ".jpg",
-	"image/jpeg": ".jpg",
-}
+var avatarFormats = []imagetype.Format{imagetype.PNG, imagetype.JPEG}
 
 // UploadUserAvatar — POST /me/avatar (multipart, field "file")
 func (h *Handler) UploadUserAvatar(c *gin.Context) {
@@ -77,17 +78,23 @@ func (h *Handler) UploadUserAvatar(c *gin.Context) {
 		return
 	}
 
-	key := fmt.Sprintf("avatars/users/%s-%d%s", userID.String(), time.Now().Unix(), ext)
-	url, xerr := putPublicObject(c.Request.Context(), h.Storage, key, bytesRead, mime)
+	ctx := c.Request.Context()
+	previous := h.currentUserAvatarURL(ctx, userID)
+
+	key := avatarObjectKey(userAvatarKeyPrefix, userID, ext)
+	url, xerr := putPublicObject(ctx, h.Storage, key, bytesRead, mime)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
 
-	if err := h.UserRepo.UpdateAvatar(c.Request.Context(), userID, &url); err != nil {
-		errx.Handle(c, errx.InternalError())
+	// Through the service, not the repo: /auth/me is served from a cached
+	// copy, and only the service drops it.
+	if xerr := h.UserService.UpdateAvatar(ctx, userID, &url); xerr != nil {
+		errx.Handle(c, xerr)
 		return
 	}
+	h.deleteAvatarObject(ctx, previous, userAvatarKeyPrefix, key)
 
 	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityUser, &userID, nil, map[string]string{"field": "avatar_url"})
 
@@ -103,10 +110,14 @@ func (h *Handler) DeleteUserAvatar(c *gin.Context) {
 		return
 	}
 
-	if err := h.UserRepo.UpdateAvatar(c.Request.Context(), userID, nil); err != nil {
-		errx.Handle(c, errx.InternalError())
+	ctx := c.Request.Context()
+	previous := h.currentUserAvatarURL(ctx, userID)
+
+	if xerr := h.UserService.UpdateAvatar(ctx, userID, nil); xerr != nil {
+		errx.Handle(c, xerr)
 		return
 	}
+	h.deleteAvatarObject(ctx, previous, userAvatarKeyPrefix, "")
 
 	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityUser, &userID, nil, map[string]string{"field": "avatar_url", "value": "cleared"})
 
@@ -140,17 +151,21 @@ func (h *Handler) UploadOrganizationAvatar(c *gin.Context) {
 		return
 	}
 
-	key := fmt.Sprintf("avatars/organizations/%s-%d%s", orgID.String(), time.Now().Unix(), ext)
-	url, xerr := putPublicObject(c.Request.Context(), h.Storage, key, bytesRead, mime)
+	ctx := c.Request.Context()
+	previous := h.currentOrgAvatarURL(ctx, *orgID)
+
+	key := avatarObjectKey(orgAvatarKeyPrefix, *orgID, ext)
+	url, xerr := putPublicObject(ctx, h.Storage, key, bytesRead, mime)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
 
-	if err := h.OrgRepo.UpdateAvatar(c.Request.Context(), *orgID, &url); err != nil {
+	if err := h.OrgRepo.UpdateAvatar(ctx, *orgID, &url); err != nil {
 		errx.Handle(c, errx.InternalError())
 		return
 	}
+	h.deleteAvatarObject(ctx, previous, orgAvatarKeyPrefix, key)
 
 	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityOrganization, orgID, nil, map[string]string{"field": "avatar_url"})
 
@@ -175,12 +190,80 @@ func (h *Handler) DeleteOrganizationAvatar(c *gin.Context) {
 		return
 	}
 
-	if err := h.OrgRepo.UpdateAvatar(c.Request.Context(), *orgID, nil); err != nil {
+	ctx := c.Request.Context()
+	previous := h.currentOrgAvatarURL(ctx, *orgID)
+
+	if err := h.OrgRepo.UpdateAvatar(ctx, *orgID, nil); err != nil {
 		errx.Handle(c, errx.InternalError())
 		return
 	}
+	h.deleteAvatarObject(ctx, previous, orgAvatarKeyPrefix, "")
+
+	// Audited like the upload so teammates' org switcher refreshes live.
+	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityOrganization, orgID, nil, map[string]string{"field": "avatar_url", "value": "cleared"})
 
 	c.Status(http.StatusNoContent)
+}
+
+// avatarObjectKey builds a key that is unique per upload: the epoch keeps keys
+// sortable, the random nonce keeps two uploads in the same millisecond from
+// sharing an immutably cached URL.
+func avatarObjectKey(prefix string, id uuid.UUID, ext string) string {
+	nonce := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	return fmt.Sprintf("%s%s-%d-%s%s", prefix, id.String(), time.Now().UnixMilli(), nonce, ext)
+}
+
+// currentUserAvatarURL returns the avatar URL stored on the user row, or ""
+// when there is none or the lookup fails (cleanup is best-effort).
+func (h *Handler) currentUserAvatarURL(ctx context.Context, userID uuid.UUID) string {
+	u, xerr := h.UserService.GetUser(ctx, userID)
+	if xerr != nil || u == nil || u.AvatarURL == nil {
+		return ""
+	}
+	return *u.AvatarURL
+}
+
+// currentOrgAvatarURL is the organization counterpart of currentUserAvatarURL.
+func (h *Handler) currentOrgAvatarURL(ctx context.Context, orgID uuid.UUID) string {
+	org, xerr := h.OrganizationService.Get(ctx, orgID)
+	if xerr != nil || org == nil || org.AvatarURL == nil {
+		return ""
+	}
+	return *org.AvatarURL
+}
+
+// deleteAvatarObject removes the object behind a previous avatar URL once the
+// row no longer points at it. Only keys under our own prefix are touched, so
+// an external URL (an OAuth profile picture, say) is left alone, and keepKey
+// guards the freshly written object. Failures are ignored: an orphaned blob
+// is harmless, a failed request after a successful update is not.
+func (h *Handler) deleteAvatarObject(ctx context.Context, previousURL, prefix, keepKey string) {
+	if h.Storage == nil || previousURL == "" {
+		return
+	}
+	key := avatarKeyFromURL(previousURL, prefix)
+	if key == "" || key == keepKey {
+		return
+	}
+	_ = h.Storage.Delete(ctx, key)
+}
+
+// avatarKeyFromURL recovers the object key from a public avatar URL. Both
+// storage backends build the URL differently, but the key always starts with
+// the known prefix, so that is what is looked for.
+func avatarKeyFromURL(url, prefix string) string {
+	idx := strings.Index(url, prefix)
+	if idx < 0 {
+		return ""
+	}
+	key := url[idx:]
+	if q := strings.IndexAny(key, "?#"); q >= 0 {
+		key = key[:q]
+	}
+	if key == prefix || strings.Contains(key, "..") {
+		return ""
+	}
+	return key
 }
 
 func (h *Handler) requireOrgOwner(c *gin.Context, orgID, userID uuid.UUID) *errx.Error {
@@ -195,8 +278,13 @@ func (h *Handler) requireOrgOwner(c *gin.Context, orgID, userID uuid.UUID) *errx
 }
 
 // readAvatarUpload pulls the "file" field out of the request, enforces
-// the size cap, sniffs the mime, and returns the bytes ready for S3.
+// the size cap, decides the format from the bytes, and returns them ready for S3.
 func readAvatarUpload(c *gin.Context) ([]byte, string, string, *errx.Error) {
+	return readImageUpload(c, avatarLimits)
+}
+
+// readImageUpload is readAvatarUpload with the refusals worded for lim.
+func readImageUpload(c *gin.Context, lim imageLimits) ([]byte, string, string, *errx.Error) {
 	// Cap the request body before parsing so a 50MB upload doesn't
 	// pin a gin worker.
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, avatarMaxBytes+1024)
@@ -206,7 +294,7 @@ func readAvatarUpload(c *gin.Context) ([]byte, string, string, *errx.Error) {
 		return nil, "", "", errx.New(errx.BadRequest, "file is required")
 	}
 	if fh.Size > avatarMaxBytes {
-		return nil, "", "", errx.New(errx.BadRequest, "avatar must be smaller than 2 MB")
+		return nil, "", "", lim.tooLarge()
 	}
 
 	src, err := fh.Open()
@@ -221,39 +309,22 @@ func readAvatarUpload(c *gin.Context) ([]byte, string, string, *errx.Error) {
 	}
 	body := buf.Bytes()
 
-	// Trust the client-declared content type only if it's on the
-	// allowlist. http.DetectContentType is a stronger signal, so
-	// prefer that if it disagrees.
-	declared := strings.ToLower(fh.Header.Get("Content-Type"))
-	sniffed := http.DetectContentType(body)
-	mime := declared
-	if _, ok := allowedAvatarMIME[sniffed]; ok {
-		mime = sniffed
+	// The declared type and the filename take no part: the sniff and the
+	// format's own decoder have to agree.
+	format, cfg, err := imagetype.Detect(body, avatarFormats...)
+	if errors.Is(err, imagetype.ErrUnreadable) {
+		return nil, "", "", lim.unreadable()
 	}
-	ext, ok := allowedAvatarMIME[mime]
-	if !ok {
-		return nil, "", "", errx.New(errx.BadRequest, "avatar must be a PNG or JPG")
+	if err != nil {
+		return nil, "", "", lim.wrongFormat()
 	}
-	// Fallback ext from the filename when mime sniff is ambiguous.
-	if ext == "" {
-		ext = strings.ToLower(path.Ext(fh.Filename))
-		if ext == "" {
-			ext = ".png"
-		}
-	}
+	mime, ext := format.MIME, format.Ext
 
 	// Dimension cap. We expect the client to resize before upload —
 	// this is a backstop against a raw camera dump or a bypass of the
 	// JS resizer.
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(body))
-	if err != nil {
-		return nil, "", "", errx.New(errx.BadRequest, "image could not be parsed")
-	}
 	if cfg.Width > avatarMaxDimension || cfg.Height > avatarMaxDimension {
-		return nil, "", "", errx.New(
-			errx.BadRequest,
-			fmt.Sprintf("avatar dimensions must be %dpx or smaller — please resize before uploading", avatarMaxDimension),
-		)
+		return nil, "", "", lim.tooWide()
 	}
 	return body, mime, ext, nil
 }
@@ -267,6 +338,10 @@ func putPublicObject(ctx context.Context, store storage.Store, key string, body 
 	// serves via /public), so callers stay backend-agnostic.
 	url, err := store.PutPublic(ctx, key, bytes.NewReader(body), mime)
 	if err != nil {
+		// Without this the object store's own refusal is dropped on the floor
+		// and the upload is a 500 with nothing behind it anywhere: no log
+		// line, no issue, and a person told only that it failed.
+		errs.CaptureException(err)
 		return "", errx.InternalError()
 	}
 	return url, nil

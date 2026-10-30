@@ -1,4 +1,5 @@
-import { keepPreviousData, useInfiniteQuery, type InfiniteData } from "@tanstack/react-query";
+import { useMemo } from "react";
+import { infiniteQueryOptions, keepPreviousData, useInfiniteQuery, type InfiniteData } from "@tanstack/react-query";
 import { DEFAULT_PAGINATION_LIMIT } from "@/lib/information";
 import type SearchContacts from "@/lib/api/models/app/contacts/SearchContacts";
 import searchContacts from "@/lib/api/client/app/contacts/searchContacts";
@@ -12,8 +13,8 @@ interface UseSearchContactsProps {
     keepPrevious?: boolean;
 }
 
-export default function useSearchContacts({ options, limit = DEFAULT_PAGINATION_LIMIT, enabled = true, keepPrevious = false }: UseSearchContactsProps) {
-    const queryResult = useInfiniteQuery<
+export const contactsSearchQuery = ({ options, limit = DEFAULT_PAGINATION_LIMIT }: Pick<UseSearchContactsProps, "options" | "limit">) =>
+    infiniteQueryOptions<
         SearchContactsResult,
         Error,
         InfiniteData<SearchContactsResult, string | null>,
@@ -32,6 +33,11 @@ export default function useSearchContacts({ options, limit = DEFAULT_PAGINATION_
         },
         staleTime: 5 * 60 * 1000,
         gcTime: 10 * 60 * 1000,
+    });
+
+export default function useSearchContacts({ options, limit = DEFAULT_PAGINATION_LIMIT, enabled = true, keepPrevious = false }: UseSearchContactsProps) {
+    const queryResult = useInfiniteQuery({
+        ...contactsSearchQuery({ options, limit }),
         placeholderData: keepPrevious ? keepPreviousData : undefined,
         enabled,
     });
@@ -39,9 +45,12 @@ export default function useSearchContacts({ options, limit = DEFAULT_PAGINATION_
     // Defensive: backend may serialize a nil slice as JSON null on empty
     // result sets. `flatMap((p) => p.data)` over null would yield [null].
     // Coerce + drop nulls so downstream UIs can safely read fields.
-    const contacts = queryResult.data?.pages
-        .flatMap((p) => p.data ?? [])
-        .filter((c): c is NonNullable<typeof c> => c != null);
+    const contacts = useMemo(
+        () => queryResult.data?.pages
+            .flatMap((p) => p.data ?? [])
+            .filter((c): c is NonNullable<typeof c> => c != null),
+        [queryResult.data],
+    );
 
     return {
         ...queryResult,

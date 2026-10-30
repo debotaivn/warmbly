@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,7 +13,18 @@ import (
 	"github.com/warmbly/warmbly/internal/app/emailsend"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/mailhdr"
 )
+
+// uniboxReadTimeout bounds an interactive unibox read, connection wait and body load included.
+const uniboxReadTimeout = 30 * time.Second
+
+// boundUniboxRead puts the interactive read deadline on the request context; defer the returned cancel.
+func boundUniboxRead(c *gin.Context) context.CancelFunc {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), uniboxReadTimeout)
+	c.Request = c.Request.WithContext(ctx)
+	return cancel
+}
 
 // gateUnibox enforces feature access for any unibox endpoint that
 // needs an org context. Returns true when the caller is allowed.
@@ -33,12 +45,7 @@ func (h *Handler) gateUnibox(c *gin.Context) bool {
 }
 
 func (h *Handler) GetUniboxIncoming(c *gin.Context) {
-	userID := middleware.GetUserID(c)
-	uid, err := uuid.Parse(userID)
-	if err != nil {
-		errx.Handle(c, errx.ErrUser)
-		return
-	}
+	defer boundUniboxRead(c)()
 
 	orgID := middleware.GetOrganizationID(c)
 	if orgID == nil {
@@ -87,14 +94,21 @@ func (h *Handler) GetUniboxIncoming(c *gin.Context) {
 		params.Direction = &direction
 	}
 
-	// Folder scope. Absent = every folder except spam and trash; an
-	// unknown value is a 400 rather than silently widening the result.
+	// Folder scope. Absent = every working folder (spam, trash and archive
+	// stay out); an unknown value is a 400 rather than silently widening the
+	// result.
 	if folder := c.Query("folder"); folder != "" {
 		if !models.ValidFolder(folder) {
 			errx.Handle(c, errx.ErrUniboxFolder)
 			return
 		}
 		params.Folder = &folder
+	}
+
+	// All mail and reference reads ask for filed conversations back.
+	if c.Query("include_archived") == "true" {
+		v := true
+		params.IncludeArchived = &v
 	}
 
 	// Parse subject filter
@@ -172,6 +186,17 @@ func (h *Handler) GetUniboxIncoming(c *gin.Context) {
 		params.Uncategorized = &v
 	}
 
+	// automated=true lists only conversations no person wrote in, false leaves
+	// them out; absent is both.
+	switch c.Query("automated") {
+	case "true":
+		v := true
+		params.Automated = &v
+	case "false":
+		v := false
+		params.Automated = &v
+	}
+
 	// Conversation-label filter: category_ids=<uuid>,<uuid>. A thread
 	// matches if it carries any of the listed labels. Invalid UUIDs are
 	// dropped, matching the email_ids behaviour.
@@ -187,7 +212,14 @@ func (h *Handler) GetUniboxIncoming(c *gin.Context) {
 		}
 	}
 
-	resp, xerr := h.UniboxService.Search(c.Request.Context(), *orgID, uid, params)
+	scoped, xerr := allowedMailboxFilter(c, params.EmailAccountIDs)
+	if xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+	params.EmailAccountIDs = scoped
+
+	resp, xerr := h.UniboxService.Search(c.Request.Context(), *orgID, params)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -197,6 +229,8 @@ func (h *Handler) GetUniboxIncoming(c *gin.Context) {
 }
 
 func (h *Handler) GetUniboxEmail(c *gin.Context) {
+	defer boundUniboxRead(c)()
+
 	// Org-scoped: the inbox list is org-wide, so opening a message must be too.
 	// A non-owner member who sees a message in the org-scoped list would
 	// otherwise get "email not found" because the row is keyed to the mailbox
@@ -223,10 +257,17 @@ func (h *Handler) GetUniboxEmail(c *gin.Context) {
 		return
 	}
 
-	resp, xerr := h.UniboxService.GetByID(
-		c.Request.Context(),
-		*orgID, mid,
-	)
+	if xerr := h.uniboxMessagesAllowed(c, *orgID, []uuid.UUID{mid}, nil); xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+
+	// A restricted member reads the inbox without changing its shared read state.
+	get := h.UniboxService.GetByID
+	if middleware.IsScopeRestricted(c) {
+		get = h.UniboxService.Peek
+	}
+	resp, xerr := get(c.Request.Context(), *orgID, mid)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -236,6 +277,8 @@ func (h *Handler) GetUniboxEmail(c *gin.Context) {
 }
 
 func (h *Handler) GetUniboxThread(c *gin.Context) {
+	defer boundUniboxRead(c)()
+
 	// Org-scoped: the inbox list is org-wide, so the thread view must be too.
 	// Otherwise a non-owner member sees the conversation in the list but an
 	// empty thread when they open it — the messages are keyed to the mailbox
@@ -269,6 +312,10 @@ func (h *Handler) GetUniboxThread(c *gin.Context) {
 			errx.Handle(c, errx.ErrUuid)
 			return
 		}
+		if xerr := mailboxAllowed(c, parsed); xerr != nil {
+			errx.Handle(c, xerr)
+			return
+		}
 		eid = parsed
 	}
 
@@ -283,15 +330,16 @@ func (h *Handler) GetUniboxThread(c *gin.Context) {
 	cursor := c.Query("cursor")
 	limit := c.Query("limit")
 
-	resp, xerr := h.UniboxService.GetByThread(
+	resp, xerr := h.UniboxService.GetByThreadWithin(
 		c.Request.Context(),
 		*orgID, eid,
-		threadID, limit, cursor,
+		threadID, limit, cursor, restrictedMailboxes(c),
 	)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
+	keepAllowedMessages(c, resp)
 
 	c.JSON(http.StatusOK, resp)
 }
@@ -299,13 +347,14 @@ func (h *Handler) GetUniboxThread(c *gin.Context) {
 // GetUniboxThreadLabels returns the conversation labels on a thread.
 // GET /unibox/thread/labels?thread_id=<id>
 func (h *Handler) GetUniboxThreadLabels(c *gin.Context) {
+	defer boundUniboxRead(c)()
+
 	if !h.gateUnibox(c) {
 		return
 	}
-	userID := middleware.GetUserID(c)
-	uid, err := uuid.Parse(userID)
-	if err != nil {
-		errx.Handle(c, errx.ErrUser)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.ErrNoOrganization)
 		return
 	}
 
@@ -318,7 +367,7 @@ func (h *Handler) GetUniboxThreadLabels(c *gin.Context) {
 		return
 	}
 
-	labels, xerr := h.UniboxService.ListThreadLabels(c.Request.Context(), uid, threadID)
+	labels, xerr := h.UniboxService.ListThreadLabelsWithin(c.Request.Context(), *orgID, threadID, restrictedMailboxes(c))
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -328,27 +377,33 @@ func (h *Handler) GetUniboxThreadLabels(c *gin.Context) {
 
 // SetUniboxThreadLabels replaces the full conversation-label set on a
 // thread. Idempotent (PUT semantics): the body's category_ids is the
-// desired set, so retries are naturally safe. Only the user's own
+// desired set, so retries are naturally safe. Only the workspace's own
 // categories are attached.
 // PUT /unibox/thread/labels
 func (h *Handler) SetUniboxThreadLabels(c *gin.Context) {
 	if !h.gateUnibox(c) {
 		return
 	}
-	userID := middleware.GetUserID(c)
-	uid, err := uuid.Parse(userID)
-	if err != nil {
-		errx.Handle(c, errx.ErrUser)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.ErrNoOrganization)
 		return
 	}
+	// Attribution only; a label an API key applies has no human behind it.
+	uid, _ := middleware.GetUserUUID(c)
 
 	var req models.UniboxThreadLabels
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
-	labels, xerr := h.UniboxService.SetThreadLabels(c.Request.Context(), uid, req.ThreadID, req.CategoryIDs)
+	if xerr := h.uniboxMessagesAllowed(c, *orgID, nil, []string{req.ThreadID}); xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+
+	labels, xerr := h.UniboxService.SetThreadLabels(c.Request.Context(), *orgID, uid, req.ThreadID, req.CategoryIDs)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -374,7 +429,16 @@ func (h *Handler) UniboxMarkSeen(c *gin.Context) {
 
 	var data models.MarkSeen
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
+		return
+	}
+
+	if data.Folder != "" && len(restrictedMailboxes(c)) > 0 {
+		errx.Handle(c, errx.New(errx.Forbidden, "an API key limited to specific mailboxes cannot mark a whole folder; name the messages or threads"))
+		return
+	}
+	if xerr := h.uniboxMessagesAllowed(c, *orgID, data.EmailIDs, data.ThreadIDs); xerr != nil {
+		errx.Handle(c, xerr)
 		return
 	}
 
@@ -387,9 +451,55 @@ func (h *Handler) UniboxMarkSeen(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// UniboxMoveFolder re-files messages (Archive = archive, Delete = trash,
+// Move to inbox = inbox). Org-scoped like /seen: the inbox is shared, so any
+// member with unibox access may file it. Naturally idempotent, so no
+// Idempotency-Key: the body names the destination, not a delta.
+// PATCH /unibox/folder
+func (h *Handler) UniboxMoveFolder(c *gin.Context) {
+	if !h.gateUnibox(c) {
+		return
+	}
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.ErrUser)
+		return
+	}
+
+	var data models.MoveFolder
+	if err := c.ShouldBindJSON(&data); err != nil {
+		errx.Handle(c, errx.InvalidBody(err))
+		return
+	}
+
+	if xerr := h.uniboxMessagesAllowed(c, *orgID, data.EmailIDs, data.ThreadIDs); xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+
+	resp, xerr := h.UniboxService.MoveFolderBulk(c.Request.Context(), *orgID, &data)
+	if xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+
+	// Audited so the spine broadcasts it: a teammate looking at the same list
+	// has to lose the thread too, and there is no sync event behind this one.
+	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityUnibox, nil, nil, map[string]string{
+		"action":   "move_folder",
+		"folder":   data.Folder,
+		"messages": strconv.Itoa(len(data.EmailIDs)),
+		"threads":  strconv.Itoa(len(data.ThreadIDs)),
+	})
+
+	c.JSON(http.StatusOK, resp)
+}
+
 // GetUnseenCount gets the count of unseen emails
 // GET /unibox/count
 func (h *Handler) GetUnseenCount(c *gin.Context) {
+	defer boundUniboxRead(c)()
+
 	orgID := middleware.GetOrganizationID(c)
 	if orgID == nil {
 		errx.Handle(c, errx.New(errx.BadRequest, "no organization selected"))
@@ -400,11 +510,21 @@ func (h *Handler) GetUnseenCount(c *gin.Context) {
 	var emailAccountID *uuid.UUID
 	if emailIDStr := c.Query("email_id"); emailIDStr != "" {
 		if id, err := uuid.Parse(emailIDStr); err == nil {
+			if xerr := mailboxAllowed(c, id); xerr != nil {
+				errx.Handle(c, xerr)
+				return
+			}
 			emailAccountID = &id
 		}
 	}
 
-	count, xerr := h.UniboxService.GetUnseenCount(c.Request.Context(), *orgID, emailAccountID)
+	var count int64
+	var xerr *errx.Error
+	if allowed := restrictedMailboxes(c); emailAccountID == nil && len(allowed) > 0 {
+		count, xerr = h.UniboxService.UnseenCountForMailboxes(c.Request.Context(), *orgID, allowed)
+	} else {
+		count, xerr = h.UniboxService.GetUnseenCount(c.Request.Context(), *orgID, emailAccountID)
+	}
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -425,9 +545,12 @@ type UniboxReplyRequest struct {
 	ThreadID       string     `json:"thread_id"`
 	SendMode       string     `json:"send_mode"`
 	ScheduledAt    *time.Time `json:"scheduled_at,omitempty"`
+	// ForwardMessageID makes the send a forward of that stored message, which
+	// goes out under the body and signature.
+	ForwardMessageID string `json:"forward_message_id"`
 }
 
-// UniboxReply schedules a reply email from Unibox.
+// UniboxReply schedules a reply or forward email from Unibox.
 // POST /unibox/reply
 func (h *Handler) UniboxReply(c *gin.Context) {
 	orgID := middleware.GetOrganizationID(c)
@@ -444,7 +567,7 @@ func (h *Handler) UniboxReply(c *gin.Context) {
 
 	var req UniboxReplyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -453,14 +576,44 @@ func (h *Handler) UniboxReply(c *gin.Context) {
 		errx.Handle(c, errx.ErrUuid)
 		return
 	}
+	if xerr := mailboxAllowed(c, accountID); xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+
+	var forward *models.ForwardedMessage
+	if req.ForwardMessageID != "" {
+		// Forwarding discloses the message, so it needs read access as well as write.
+		if xerr := h.hasAccess(c, models.PermAccessUnibox, models.APIPermReadUnibox); xerr != nil {
+			errx.Handle(c, xerr)
+			return
+		}
+		forwardID, err := uuid.Parse(req.ForwardMessageID)
+		if err != nil {
+			errx.Handle(c, errx.New(errx.BadRequest, "forward_message_id must be a message id"))
+			return
+		}
+		src, xerr := h.UniboxService.ForwardSource(c.Request.Context(), *orgID, forwardID)
+		if xerr != nil {
+			errx.Handle(c, xerr)
+			return
+		}
+		// Its mailbox is checked like the sender's.
+		if xerr := mailboxAllowed(c, src.EmailID); xerr != nil {
+			errx.Handle(c, xerr)
+			return
+		}
+		forward = src
+	}
 
 	// The composer only knows the provider thread id, but a thread id is
 	// meaningless outside the sending mailbox: the recipient's client threads
 	// on In-Reply-To/References. Resolve the parent Message-ID here so a reply
-	// nests for them too, without needing a client change.
+	// nests for them too, without needing a client change. A forward answers
+	// nobody: it is filed into the forwarded message's conversation instead.
 	inReplyTo := req.InReplyTo
-	if len(inReplyTo) == 0 && req.ThreadID != "" {
-		if parentMessageID, xerr := h.UniboxService.LatestMessageIDInThread(c.Request.Context(), *orgID, req.ThreadID); xerr == nil && parentMessageID != "" {
+	if len(inReplyTo) == 0 && req.ThreadID != "" && forward == nil {
+		if parentMessageID, xerr := h.UniboxService.LatestMessageIDInThread(c.Request.Context(), *orgID, req.ThreadID); xerr == nil && mailhdr.ValidMessageID(parentMessageID) {
 			inReplyTo = []string{parentMessageID}
 		}
 	}
@@ -476,6 +629,7 @@ func (h *Handler) UniboxReply(c *gin.Context) {
 		ThreadID:    req.ThreadID,
 		SendMode:    req.SendMode,
 		ScheduledAt: req.ScheduledAt,
+		Forward:     forward,
 	}
 	if sendReq.SendMode == "" {
 		sendReq.SendMode = "instant"
@@ -487,12 +641,57 @@ func (h *Handler) UniboxReply(c *gin.Context) {
 		return
 	}
 
-	h.auditOrg(c, models.AuditActionSend, models.AuditEntityUnibox, &accountID, nil, map[string]string{
+	audit := map[string]string{
 		"send_mode":  sendReq.SendMode,
 		"recipients": strconv.Itoa(len(req.To)),
-	})
+	}
+	if forward != nil {
+		audit["forwarded_message_id"] = req.ForwardMessageID
+	}
+	h.auditOrg(c, models.AuditActionSend, models.AuditEntityUnibox, &accountID, nil, audit)
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// readOnlyPosts take a POST only to carry a query body and are gated on a read permission, so they write nothing the overview counts.
+var readOnlyPosts = map[string]bool{
+	"/v1/campaign-template-preview":   true,
+	"/v1/campaigns-estimate":          true,
+	"/v1/contacts/search":             true,
+	"/v1/segments/preview":            true,
+	"/v1/segments/:id/members/lookup": true,
+	"/v1/templates/:id/render":        true,
+	"/v1/crm/deals/search":            true,
+	"/v1/crm/deals/summary":           true,
+	"/v1/crm/tasks/search":            true,
+	"/v1/crm/tasks/summary":           true,
+}
+
+// ReadOnlyPostRoutes lists readOnlyPosts as "POST path", for the test that keeps each one registered.
+func ReadOnlyPostRoutes() []string {
+	out := make([]string, 0, len(readOnlyPosts))
+	for path := range readOnlyPosts {
+		out = append(out, http.MethodPost+" "+path)
+	}
+	return out
+}
+
+// ForgetUniboxOverviewOnWrite drops the organization's shared unibox overview after any successful write.
+func (h *Handler) ForgetUniboxOverviewOnWrite(c *gin.Context) {
+	c.Next()
+	switch c.Request.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return
+	}
+	if readOnlyPosts[c.FullPath()] {
+		return
+	}
+	if h.UniboxService == nil || c.Writer.Status() >= http.StatusBadRequest {
+		return
+	}
+	if orgID := middleware.GetOrganizationID(c); orgID != nil {
+		h.UniboxService.ForgetOverview(*orgID)
+	}
 }
 
 // GetUniboxOverview rolls up unread/today/week/snoozed/awaiting plus
@@ -500,6 +699,8 @@ func (h *Handler) UniboxReply(c *gin.Context) {
 // rail and metric strip share this response.
 // GET /unibox/overview
 func (h *Handler) GetUniboxOverview(c *gin.Context) {
+	defer boundUniboxRead(c)()
+
 	if !h.gateUnibox(c) {
 		return
 	}
@@ -515,6 +716,16 @@ func (h *Handler) GetUniboxOverview(c *gin.Context) {
 		return
 	}
 
+	if allowed := restrictedMailboxes(c); len(allowed) > 0 {
+		resp, xerr := h.UniboxService.OverviewForMailboxes(c.Request.Context(), *orgID, allowed)
+		if xerr != nil {
+			errx.Handle(c, xerr)
+			return
+		}
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+
 	resp, xerr := h.UniboxService.Overview(c.Request.Context(), *orgID, uid)
 	if xerr != nil {
 		errx.Handle(c, xerr)
@@ -524,12 +735,26 @@ func (h *Handler) GetUniboxOverview(c *gin.Context) {
 }
 
 type UniboxSnoozeRequest struct {
-	ThreadID     string    `json:"thread_id" binding:"required"`
+	ThreadID string `json:"thread_id"`
+	// ThreadIDs snoozes a whole selection in one call. Either field will do;
+	// naming both snoozes the union.
+	ThreadIDs    []string  `json:"thread_ids"`
 	SnoozedUntil time.Time `json:"snoozed_until" binding:"required"`
 }
 
-// CreateUniboxSnooze hides a thread until snoozed_until passes.
+// threads is every conversation the request names, in either field.
+func (r UniboxSnoozeRequest) threads() []string {
+	out := r.ThreadIDs
+	if r.ThreadID != "" {
+		out = append([]string{r.ThreadID}, out...)
+	}
+	return out
+}
+
+// CreateUniboxSnooze hides conversations until snoozed_until passes.
 // Upsert semantics: a second call on the same thread updates the time.
+// A request naming one thread answers with that row, as it always has; one
+// naming several answers with `data`.
 // POST /unibox/snooze
 func (h *Handler) CreateUniboxSnooze(c *gin.Context) {
 	if !h.gateUnibox(c) {
@@ -544,22 +769,36 @@ func (h *Handler) CreateUniboxSnooze(c *gin.Context) {
 
 	var req UniboxSnoozeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
-	resp, xerr := h.UniboxService.Snooze(c.Request.Context(), uid, req.ThreadID, req.SnoozedUntil)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.ErrNoOrganization)
+		return
+	}
+	threads := req.threads()
+	if xerr := h.uniboxMessagesAllowed(c, *orgID, nil, threads); xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+	rows, xerr := h.UniboxService.Snooze(c.Request.Context(), *orgID, uid, threads, req.SnoozedUntil)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
 
 	h.auditOrg(c, models.AuditActionCreate, models.AuditEntityUnibox, nil, nil, map[string]string{
-		"action":    "snooze",
-		"thread_id": req.ThreadID,
+		"action":  "snooze",
+		"threads": strconv.Itoa(len(threads)),
 	})
 
-	c.JSON(http.StatusOK, resp)
+	if len(threads) == 1 && len(rows) == 1 {
+		c.JSON(http.StatusOK, rows[0])
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rows})
 }
 
 // DeleteUniboxSnooze un-snoozes a thread immediately. Idempotent —
@@ -576,29 +815,41 @@ func (h *Handler) DeleteUniboxSnooze(c *gin.Context) {
 		return
 	}
 
-	threadID := c.Query("thread_id")
-	if threadID == "" {
+	// One id, or a comma-separated selection. Same shape as email_ids on the
+	// other list endpoints.
+	var threads []string
+	for _, raw := range strings.Split(c.Query("thread_id"), ",") {
+		if id := strings.TrimSpace(raw); id != "" {
+			threads = append(threads, id)
+		}
+	}
+	if len(threads) == 0 {
 		errx.Handle(c, errx.New(errx.BadRequest, "thread_id is required"))
 		return
 	}
 
-	if xerr := h.UniboxService.Unsnooze(c.Request.Context(), uid, threadID); xerr != nil {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.ErrNoOrganization)
+		return
+	}
+	if xerr := h.UniboxService.Unsnooze(c.Request.Context(), *orgID, uid, threads); xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
 
 	h.auditOrg(c, models.AuditActionDelete, models.AuditEntityUnibox, nil, nil, map[string]string{
-		"action":    "snooze",
-		"thread_id": threadID,
+		"action":  "snooze",
+		"threads": strconv.Itoa(len(threads)),
 	})
 
 	c.Status(http.StatusNoContent)
 }
 
-// ListUniboxScheduled returns every pending email task the user has
-// queued: what the "Scheduled" scope in the dashboard reads from.
-// When `thread_id` is set we scope the response to a single thread,
-// which the ThreadView uses to render queued replies inline. The
+// ListUniboxScheduled returns every pending email task queued from the
+// organization's mailboxes: what the "Scheduled" scope in the dashboard
+// reads from. When `thread_id` is set we scope the response to a single
+// thread, which the ThreadView uses to render queued replies inline. The
 // response shape is identical either way so the same client + hook
 // handle both forms.
 // GET /unibox/scheduled
@@ -607,15 +858,14 @@ func (h *Handler) ListUniboxScheduled(c *gin.Context) {
 	if !h.gateUnibox(c) {
 		return
 	}
-	userID := middleware.GetUserID(c)
-	uid, err := uuid.Parse(userID)
-	if err != nil {
-		errx.Handle(c, errx.ErrUser)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.New(errx.BadRequest, "no organization selected"))
 		return
 	}
 
 	if threadID := c.Query("thread_id"); threadID != "" {
-		items, xerr := h.UniboxService.ListScheduledByThread(c.Request.Context(), uid, threadID)
+		items, xerr := h.UniboxService.ListScheduledByThread(c.Request.Context(), *orgID, threadID, middleware.AllowedEmailAccounts(c))
 		if xerr != nil {
 			errx.Handle(c, xerr)
 			return
@@ -624,7 +874,7 @@ func (h *Handler) ListUniboxScheduled(c *gin.Context) {
 		return
 	}
 
-	items, xerr := h.UniboxService.ListScheduled(c.Request.Context(), uid)
+	items, xerr := h.UniboxService.ListScheduled(c.Request.Context(), *orgID, middleware.AllowedEmailAccounts(c))
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -640,10 +890,9 @@ func (h *Handler) CancelUniboxScheduled(c *gin.Context) {
 	if !h.gateUnibox(c) {
 		return
 	}
-	userID := middleware.GetUserID(c)
-	uid, err := uuid.Parse(userID)
-	if err != nil {
-		errx.Handle(c, errx.ErrUser)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.New(errx.BadRequest, "no organization selected"))
 		return
 	}
 	taskID, err := uuid.Parse(c.Param("task_id"))
@@ -652,7 +901,7 @@ func (h *Handler) CancelUniboxScheduled(c *gin.Context) {
 		return
 	}
 
-	if xerr := h.UniboxService.CancelScheduled(c.Request.Context(), uid, taskID); xerr != nil {
+	if xerr := h.UniboxService.CancelScheduled(c.Request.Context(), *orgID, taskID, middleware.AllowedEmailAccounts(c)); xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
@@ -677,7 +926,12 @@ func (h *Handler) ListUniboxSnoozes(c *gin.Context) {
 		return
 	}
 
-	resp, xerr := h.UniboxService.ListSnoozes(c.Request.Context(), uid)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.ErrNoOrganization)
+		return
+	}
+	resp, xerr := h.UniboxService.ListSnoozes(c.Request.Context(), *orgID, uid)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return

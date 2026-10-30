@@ -8,11 +8,17 @@ A fresh instance has no accounts and is described as **unclaimed**. Claiming it 
 ## Claim the instance
 
 ```bash
+curl -fsSL https://warmbly.com/install.sh | sh
+```
+
+The [installer](/development/install/) starts the stack and prints the claim link when it finishes. From a clone it is the same two steps and a build:
+
+```bash
 git clone https://github.com/warmbly/warmbly && cd warmbly
 make up
 ```
 
-`make up` builds the images, starts the stack, waits for the backend to answer, then runs `make claim`, which prints a single-use link and ends on the command that reissues it:
+Both print a single-use link when they finish. `make claim`, or `warmblyctl setup-link` inside the backend container, prints a fresh one at any time while the instance is still unclaimed:
 
 ```
   No accounts exist yet. Open this link to claim the instance and
@@ -26,7 +32,7 @@ make up
 
 Open it, pick a password, and you are the owner and platform admin of the instance.
 
-If no link is in the logs yet, `make claim` mints a fresh one instead of printing nothing, which retires any outstanding link.
+The backend log carries the link only when `APP_ENV` is `dev` (the compose default from a clone). Anywhere else it carries a line naming `warmblyctl setup-link` instead, so a log shipped to a collector never holds a way in. If no link is in the logs, `make claim` mints a fresh one instead of printing nothing, which retires any outstanding link.
 
 The link is derived from `APP_URL`, so outside compose set `APP_URL` before the first boot or the printed link points at the hosted service instead of at your deployment. Only the hash of the token is stored, so reading the database does not yield a working link, and it is invalidated the moment it is used.
 
@@ -36,7 +42,7 @@ Opening the dashboard without a token also works: while the instance is unclaime
 
 Four things make a claim link disappear, and all four have the same answer:
 
-- the logs rotated, or the container was recreated
+- the logs rotated, the container was recreated, or `APP_ENV` is not `dev`, so the log never carried it
 - 24 hours passed
 - Redis was flushed or restarted without persistence
 - you are on Kubernetes or a bare binary and never saw a compose log at all
@@ -113,7 +119,7 @@ printf '%s' 'your password' | warmblyctl hash-password
 An argon2 PHC string contains `$` characters. Docker Compose reads those as interpolation, so a bare hash in `.env` silently loses part of itself and the bootstrap fails with no useful message. Wrap it in single quotes in `.env`, and double every `$` if you paste it directly into `docker-compose.yml`.
 </Callout>
 
-`WARMBLY_BOOTSTRAP_PASSWORD` accepts a plaintext password instead. It works, it warns at boot, and it leaves the password readable in your process environment through `docker inspect` and `/proc`. Prefer the hash, and remove either variable once the owner exists.
+`WARMBLY_BOOTSTRAP_PASSWORD` accepts a plaintext password instead, held to the same password rules as sign-up. It works, it warns at boot, and it leaves the password readable in your process environment through `docker inspect` and `/proc`. Prefer the hash, and remove either variable once the owner exists.
 
 All of these are read **only while the users table is empty**, so they are a no-op on every later restart. That also means they cannot be used to fix a lockout: an instance that already has accounts ignores them entirely.
 
@@ -122,7 +128,7 @@ All of these are read **only while the users table is empty**, so they are a no-
 | It gets | Detail |
 |---|---|
 | An owner account | Owner of a new organization, which is a membership status rather than a role |
-| An organization | Named from `WARMBLY_BOOTSTRAP_ORG`, or derived from the owner's name |
+| An organization | Named from `WARMBLY_BOOTSTRAP_ORG` when it is a valid workspace name, otherwise derived from the owner's name |
 | A trial | Irrelevant when `BILLING_PROVIDER=none`, which is the self-host default and unlocks everything. The dashboard header shows a `Self-hosted` badge instead of a plan or trial, and the billing and referral settings pages are hidden |
 | Every platform admin bit | So the same account signs in to the dashboard on `:5173` and the admin panel on `:5174` |
 
@@ -204,6 +210,8 @@ Loads the showcase workspace: mailboxes, campaigns, contacts and two weeks of hi
 
 <Callout type="warn" title="The demo seed plants a published super-admin credential">
 `make seed-demo` runs with `SEED_FULL=true`, which also inserts `admin@warmbly.local` with the password `Test1234!`, **every platform admin permission**, and a full-access API key whose secret is a constant in this repository. All three values are public. Never run it on an instance anyone else can reach, and if you already did, delete that account and revoke the key before you expose the instance.
+
+The seeder runs only when `APP_ENV` is `dev`, `development` or `local`. An unset `APP_ENV` or `prod` refuses before anything is written, so an instance configured for production cannot be seeded.
 </Callout>
 
 Seeding also spends the first-launch exemption, so a seeded instance never issues a claim link again. That is fine when you seeded on purpose; it is the surprise described in [if the instance already has accounts](#if-the-instance-already-has-accounts) when you did not.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -17,8 +18,10 @@ import (
 	"github.com/warmbly/warmbly/internal/app/email"
 	"github.com/warmbly/warmbly/internal/app/emailsend"
 	"github.com/warmbly/warmbly/internal/app/feature"
+	"github.com/warmbly/warmbly/internal/app/form"
 	"github.com/warmbly/warmbly/internal/app/integration"
 	"github.com/warmbly/warmbly/internal/app/organization"
+	"github.com/warmbly/warmbly/internal/app/segment"
 	"github.com/warmbly/warmbly/internal/app/sequence"
 	"github.com/warmbly/warmbly/internal/app/subscription"
 	"github.com/warmbly/warmbly/internal/app/unibox"
@@ -68,12 +71,25 @@ type Deps struct {
 	// handlers do (e.g. unibox requires an active trial/paid plan), so a tool
 	// can never read data a 403'd HTTP route would refuse.
 	FeatureGate feature.FeatureGateService
+	// Segments and Forms back the audience and lead-capture tools, both gated
+	// on the contact permissions.
+	Segments segment.Service
+	Forms    form.Service
+	// Suppressions edits the do-not-contact list. A second field rather than a
+	// wider Advanced, so a deployment can keep the send guard above without
+	// exposing the list to agents.
+	Suppressions SuppressionManager
 	// Skills backs the load_skill tool (org playbooks). Optional.
 	Skills SkillLookup
 	// Advisor backs the read-only recommendation tools, so the assistant can
 	// ground an answer in what the Advisor has already diagnosed rather than
 	// re-deriving it from raw stats. Optional.
 	Advisor AdvisorReader
+	// WarmupScheduler seeds a mailbox's warmup chain after a tool turns it on. Optional.
+	WarmupScheduler func(ctx context.Context, accountID uuid.UUID) error
+	// Slack backs the Slack settings tools, added by RegisterSlackTools once
+	// the Slack app is built.
+	Slack SlackControl
 	// AppBaseURL is the dashboard origin used to build deep links in draft
 	// artifacts (e.g. https://app.warmbly.com). Empty falls back to a relative
 	// path.
@@ -85,6 +101,14 @@ type Deps struct {
 // as a local interface so aitools does not import the advanced package.
 type SuppressionChecker interface {
 	ShouldSuppressRecipient(ctx context.Context, orgID uuid.UUID, recipient string) (bool, string, *errx.Error)
+}
+
+// SuppressionManager reads and edits the do-not-contact list. *advanced.service
+// satisfies it, the same value that satisfies SuppressionChecker above.
+type SuppressionManager interface {
+	ListSuppressions(ctx context.Context, organizationID uuid.UUID, q string, beforeAt *time.Time, beforeID *uuid.UUID, limit int) ([]models.SuppressedRecipient, *errx.Error)
+	AddSuppressions(ctx context.Context, organizationID, actorID uuid.UUID, req *models.AddSuppressionsRequest) (*models.AddSuppressionsResult, *errx.Error)
+	RemoveSuppression(ctx context.Context, organizationID, id uuid.UUID) (*models.SuppressedRecipient, *errx.Error)
 }
 
 // SkillLookup returns an enabled org playbook's full content by name (backs the
@@ -101,6 +125,9 @@ func BuildRegistry(d Deps) *Registry {
 	d.registerCRMTools(r)
 	d.registerCampaignTools(r)
 	d.registerSequenceTools(r)
+	d.registerSegmentTools(r)
+	d.registerFormTools(r)
+	d.registerSuppressionTools(r)
 	d.registerAnalyticsTools(r)
 	d.registerUniboxTools(r)
 	d.registerInboxActionTools(r)
@@ -114,6 +141,7 @@ func BuildRegistry(d Deps) *Registry {
 	d.registerWebhookTools(r)
 	d.registerWebTools(r)
 	d.registerSkillTools(r)
+	d.registerIntegrationTools(r)
 	// Advisor tools are registered separately, after the advisor service is
 	// constructed against this registry (see aitools.RegisterAdvisorTools).
 	return r

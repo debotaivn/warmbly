@@ -5,12 +5,41 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/warmbly/warmbly/internal/models"
 )
+
+// AdvisorSection names a snapshot section that loads on its own.
+type AdvisorSection string
+
+const (
+	AdvisorSectionCampaigns AdvisorSection = "campaigns"
+	AdvisorSectionSteps     AdvisorSection = "steps"
+	AdvisorSectionLists     AdvisorSection = "lists"
+	AdvisorSectionOrg       AdvisorSection = "org"
+)
+
+// SectionFailed reports whether sec did not load this run.
+func (s *AdvisorSnapshot) SectionFailed(sec AdvisorSection) bool {
+	_, failed := s.Failed[sec]
+	return failed
+}
+
+func (s *AdvisorSnapshot) fail(sec AdvisorSection, err error) {
+	if err == nil {
+		return
+	}
+	if s.Failed == nil {
+		s.Failed = map[AdvisorSection]error{}
+	}
+	s.Failed[sec] = err
+}
 
 // LoadSnapshot reads one org's advisor view. Every section is best-effort: a
 // single failing rollup must not cost the org its whole evaluation, because a
-// partial snapshot still produces correct findings for the parts that loaded
-// (detectors are written to no-op on absent data rather than guess).
+// partial snapshot still produces correct findings for the parts that loaded.
+// A section that fails is recorded in Failed, so the detectors that read it
+// are held for the run rather than run on empty data.
 func (r *advisorRepository) LoadSnapshot(ctx context.Context, orgID uuid.UUID, now time.Time) (*AdvisorSnapshot, error) {
 	snap := &AdvisorSnapshot{
 		OrganizationID: orgID,
@@ -18,7 +47,7 @@ func (r *advisorRepository) LoadSnapshot(ctx context.Context, orgID uuid.UUID, n
 		Lists:          map[uuid.UUID]AdvisorListStats{},
 	}
 
-	mailboxes, err := r.loadMailboxes(ctx, orgID)
+	mailboxes, err := r.loadMailboxes(ctx, orgID, now)
 	if err != nil {
 		// Mailboxes are the one section worth failing on: almost every detector
 		// is scoped to a mailbox, and an empty list would look like "org has no
@@ -27,15 +56,19 @@ func (r *advisorRepository) LoadSnapshot(ctx context.Context, orgID uuid.UUID, n
 	}
 	snap.Mailboxes = mailboxes
 
-	snap.Campaigns, _ = r.loadCampaigns(ctx, orgID)
-	snap.Steps, _ = r.loadSteps(ctx, orgID)
-	snap.Lists, _ = r.loadListStats(ctx, orgID)
-	snap.Org, _ = r.loadOrgStats(ctx, orgID)
+	snap.Campaigns, err = r.loadCampaigns(ctx, orgID)
+	snap.fail(AdvisorSectionCampaigns, err)
+	snap.Steps, err = r.loadSteps(ctx, orgID)
+	snap.fail(AdvisorSectionSteps, err)
+	snap.Lists, err = r.loadListStats(ctx, orgID)
+	snap.fail(AdvisorSectionLists, err)
+	snap.Org, err = r.loadOrgStats(ctx, orgID)
+	snap.fail(AdvisorSectionOrg, err)
 
 	return snap, nil
 }
 
-func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) ([]AdvisorMailbox, error) {
+func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID, now time.Time) ([]AdvisorMailbox, error) {
 	// Bounce/complaint attribution runs through tasks: deliverability_events
 	// carries task_id, not email_account_id, so a mailbox's complaints are the
 	// events whose task was sent by it.
@@ -55,11 +88,15 @@ func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) 
 			ea.risk_band::text,
 			COALESCE(sent.d7, 0), COALESCE(sent.d1, 0), COALESCE(sent.d30, 0),
 			COALESCE(dl.bounces, 0), COALESCE(dl.complaints, 0),
-			COALESCE(w.sent7, 0), COALESCE(w.recv7, 0), COALESCE(ws.spam7, 0),
-			COALESCE(p.health_state, ''), COALESCE(p.spam_score, 0),
-			COALESCE(p.blocked_until > NOW(), false) AS pool_blocked,
+			COALESCE(w.sent7, 0), COALESCE(w.recv7, 0),
+			ws.major, ws.major_spam, ws.other, ws.other_spam,
+			CASE WHEN cstatus.cloud_only THEN 'blocked' ELSE COALESCE(p.health_state, '') END, COALESCE(p.last_health_score, 0),
+			CASE WHEN cstatus.cloud_only THEN '` + models.WarmupReasonCloudEvidenceUnavailable + `' ELSE COALESCE(p.last_health_reason, '') END,
+			(NOT cstatus.cloud_only AND COALESCE(p.blocked_until > NOW(), false)) AS pool_blocked,
 			COALESCE(err.n, 0),
-			COALESCE(camp.active, false)
+			COALESCE(camp.active, false),
+			ea.send_lifecycle,
+			inb.delivered, inb.arrived, inb.lost_by
 		FROM email_accounts ea
 		LEFT JOIN LATERAL (
 			SELECT
@@ -68,18 +105,23 @@ func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) 
 				COUNT(*) FILTER (WHERE t.completed_at > NOW() - INTERVAL '30 days') AS d30
 			FROM tasks t
 			WHERE t.email_account_id = ea.id
-			  AND t.task_type = 'campaign' AND t.status = 'completed'
+			  AND t.task_type = 'campaign' AND ` + completedSendTaskSQL("t") + `
 			  AND t.completed_at > NOW() - INTERVAL '30 days'
+			  AND ` + taskDispatchedEmail + `
 		) sent ON true
-		LEFT JOIN LATERAL (
+		-- One pass per org: no index bounds a single mailbox's events, so a lateral rescanned the window per mailbox.
+		LEFT JOIN (
 			SELECT
+				t2.email_account_id,
 				COUNT(*) FILTER (WHERE de.event_type = 'bounce')    AS bounces,
 				COUNT(*) FILTER (WHERE de.event_type = 'complaint') AS complaints
 			FROM deliverability_events de
 			JOIN tasks t2 ON t2.id = de.task_id
-			WHERE t2.email_account_id = ea.id
+			WHERE t2.email_account_id IN (SELECT id FROM email_accounts WHERE organization_id = $1)
+			  AND de.event_type IN ('bounce', 'complaint')
 			  AND de.created_at > NOW() - INTERVAL '30 days'
-		) dl ON true
+			GROUP BY t2.email_account_id
+		) dl ON dl.email_account_id = ea.id
 		LEFT JOIN LATERAL (
 			SELECT
 				COALESCE(SUM(emails_sent), 0)    AS sent7,
@@ -87,20 +129,12 @@ func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) 
 			FROM warmup_statistics wst
 			WHERE wst.email_account_id = ea.id AND wst.date > CURRENT_DATE - 7
 		) w ON true
-		LEFT JOIN LATERAL (
-			SELECT COUNT(*) AS spam7
-			FROM warmup_spam_reports sr
-			WHERE sr.reported_account_id = ea.id
-			  AND sr.report_type = 'spam_placement'
-			  AND sr.created_at > NOW() - INTERVAL '7 days'
+		LEFT JOIN LATERAL (` + placementEvidenceSQL("ea.id", "$2") + `
 		) ws ON true
-		LEFT JOIN LATERAL (
-			SELECT wpp.health_state, wpp.spam_score, wpp.blocked_until
-			FROM warmup_pool_participants wpp
-			WHERE wpp.email_account_id = ea.id
-			ORDER BY wpp.joined_at DESC
-			LIMIT 1
+		LEFT JOIN LATERAL (` + warmupKnownStandingSQL("ea.id") + `
 		) p ON true
+		-- Unknown Cloud evidence reads as unavailable unless a real hold stands beside it.
+		CROSS JOIN LATERAL (SELECT (` + cloudStandingUnknownSQL("ea.id") + ` AND NOT ` + liveHoldSQL("p") + `) AS cloud_only) cstatus
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) AS n
 			FROM email_account_errors eae
@@ -108,6 +142,10 @@ func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) 
 			  AND eae.resolved_at IS NULL
 			  AND eae.created_at > NOW() - INTERVAL '7 days'
 		) err ON true
+		LEFT JOIN LATERAL (
+			SELECT ` + warmupInboundColumns + ` ` + warmupInboundSQL + `
+			  AND wt.recipient_account_id = ea.id
+		) inb ON true
 		LEFT JOIN LATERAL (
 			-- A mailbox counts as "in an active campaign" when a running
 			-- campaign either lists it explicitly or matches one of its tags.
@@ -128,7 +166,7 @@ func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) 
 		WHERE ea.organization_id = $1
 		ORDER BY ea.created_at ASC`
 
-	rows, err := r.db.Query(ctx, query, orgID)
+	rows, err := r.db.Query(ctx, query, orgID, models.WarmupPlacementWindowStart(now))
 	if err != nil {
 		return nil, err
 	}
@@ -147,9 +185,13 @@ func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) 
 			&m.RiskBand,
 			&m.ColdSent7d, &m.ColdSent1d, &m.ColdSent30d,
 			&m.Bounces30d, &m.Complaints30d,
-			&m.WarmupSent7d, &m.WarmupRecv7d, &m.WarmupSpam7d,
-			&m.PoolHealth, &m.PoolSpamScore, &m.PoolBlocked,
+			&m.WarmupSent7d, &m.WarmupRecv7d,
+			&m.WarmupPlacement.MajorDelivered, &m.WarmupPlacement.MajorSpam,
+			&m.WarmupPlacement.OtherDelivered, &m.WarmupPlacement.OtherSpam,
+			&m.PoolHealth, &m.PoolHealthScore, &m.PoolHealthReason, &m.PoolBlocked,
 			&m.UnresolvedErrs, &m.InActiveCampaign,
+			&m.SendLifecycle,
+			&m.WarmupDelivered7d, &m.WarmupArrived7d, &m.WarmupLostBy7d,
 		); err != nil {
 			return nil, err
 		}
@@ -167,13 +209,16 @@ func (r *advisorRepository) loadCampaigns(ctx context.Context, orgID uuid.UUID) 
 			c.id, c.name, c.status::text,
 			c.daily_limit, c.open_tracking, c.link_tracking, c.unsubscribe_header,
 			c.stop_on_reply, c.text_only,
-			c.timezone, c.days, to_char(c.start_time, 'HH24:MI'), to_char(c.end_time, 'HH24:MI'),
+			COALESCE(NULLIF(c.timezone, ''), (SELECT NULLIF(o.timezone, '') FROM organizations o WHERE o.id = c.organization_id), 'UTC'), c.days, to_char(c.start_time, 'HH24:MI'), to_char(c.end_time, 'HH24:MI'),
 			COALESCE(c.schedule_windows, '{}'::jsonb),
 			c.sender_strategy, c.rotation_mode, c.esp_match_mode,
 			c.ramp_enabled, c.ramp_start, c.ramp_ceiling,
 			c.tracking_domain, c.tracking_domain_verified,
 			c.created_at, c.last_status_change_at,
-			COALESCE(snd.n, 0), COALESCE(snd.capacity, 0), COALESCE(st.total, 0), COALESCE(st.emails, 0), COALESCE(ab.n, 0),
+			COALESCE(snd.n, 0), COALESCE(snd.capacity, 0),
+			(SELECT COUNT(*) FROM campaign_senders cs WHERE cs.campaign_id = c.id AND cs.enabled),
+			(SELECT COUNT(*) FROM campaign_email_tags cet WHERE cet.campaign_id = c.id),
+			COALESCE(st.total, 0), COALESCE(st.emails, 0), COALESCE(ab.n, 0),
 			COALESCE(f.sent, 0), COALESCE(f.opened, 0), COALESCE(f.clicked, 0),
 			COALESCE(f.replied, 0), COALESCE(f.bounced, 0),
 			COALESCE(cx.complaints, 0),
@@ -185,11 +230,22 @@ func (r *advisorRepository) loadCampaigns(ctx context.Context, orgID uuid.UUID) 
 			WHERE ea.organization_id = c.organization_id
 			  AND ea.status = 'active'
 			  AND (
-			    EXISTS (SELECT 1 FROM campaign_senders cs WHERE cs.campaign_id = c.id AND cs.email_account_id = ea.id)
+			    EXISTS (SELECT 1 FROM campaign_senders cs WHERE cs.campaign_id = c.id AND cs.email_account_id = ea.id AND cs.enabled)
 			    OR EXISTS (
 			      SELECT 1 FROM campaign_email_tags cet
 			      JOIN email_tags et ON et.tag_id = cet.tag_id
 			      WHERE cet.campaign_id = c.id AND et.email_id = ea.id
+			    )
+			    -- The "all active mailboxes" fallback, on ResolveCampaignSenderPool's terms.
+			    OR (
+			      c.sender_strategy <> 'explicit'
+			      AND NOT EXISTS (SELECT 1 FROM campaign_email_tags cet WHERE cet.campaign_id = c.id)
+			      AND NOT EXISTS (
+			        SELECT 1 FROM campaign_senders cs
+			        JOIN email_accounts sea ON sea.id = cs.email_account_id
+			        WHERE cs.campaign_id = c.id AND cs.enabled
+			          AND sea.organization_id = c.organization_id AND sea.status = 'active'
+			      )
 			    )
 			  )
 		) snd ON true
@@ -212,6 +268,7 @@ func (r *advisorRepository) loadCampaigns(ctx context.Context, orgID uuid.UUID) 
 			FROM campaign_contact_progress ccp
 			WHERE ccp.campaign_id = c.id
 			  AND ccp.sent_at > NOW() - INTERVAL '30 days'
+			  AND ` + progressIsEmailStep("ccp") + `
 		) f ON true
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) AS complaints FROM deliverability_events de
@@ -224,6 +281,7 @@ func (r *advisorRepository) loadCampaigns(ctx context.Context, orgID uuid.UUID) 
 				COUNT(*) FILTER (WHERE NOT EXISTS (
 					SELECT 1 FROM campaign_contact_progress p
 					WHERE p.campaign_id = c.id AND p.contact_id = cl.contact_id AND p.sent_at IS NOT NULL
+					  AND ` + progressIsEmailStep("p") + `
 				)) AS remaining
 			FROM campaign_leads cl WHERE cl.campaign_id = c.id
 		) l ON true
@@ -250,7 +308,7 @@ func (r *advisorRepository) loadCampaigns(ctx context.Context, orgID uuid.UUID) 
 			&c.RampEnabled, &c.RampStart, &c.RampCeiling,
 			&c.TrackingDomain, &c.TrackingDomainVerified,
 			&c.CreatedAt, &c.LastStatusChangeAt,
-			&c.SenderCount, &c.SenderCapacity, &c.StepCount, &c.EmailStepCount, &c.VariantCount,
+			&c.SenderCount, &c.SenderCapacity, &c.PickedSenders, &c.SenderTags, &c.StepCount, &c.EmailStepCount, &c.VariantCount,
 			&c.Sent, &c.Opened, &c.Clicked, &c.Replied, &c.Bounced, &c.Complaints,
 			&c.LeadsTotal, &c.LeadsRemaining,
 		); err != nil {
@@ -320,11 +378,7 @@ func (r *advisorRepository) loadListStats(ctx context.Context, orgID uuid.UUID) 
 			COUNT(*) AS total,
 			COUNT(*) FILTER (WHERE split_part(lower(ct.email), '@', 1) IN (` + rolePrefixesSQL + `)) AS role_addresses,
 			COUNT(*) FILTER (WHERE split_part(lower(ct.email), '@', 2) IN (` + freeMailDomainsSQL + `)) AS free_mail,
-			COUNT(*) FILTER (WHERE EXISTS (
-				SELECT 1 FROM suppressed_recipients sr
-				WHERE sr.organization_id = $1 AND lower(sr.email) = lower(ct.email)
-				  AND (sr.expires_at IS NULL OR sr.expires_at > NOW())
-			)) AS suppressed,
+			COUNT(*) FILTER (WHERE recipient_suppressed($1, ct.email)) AS suppressed,
 			COUNT(*) FILTER (WHERE ct.subscribed IS FALSE) AS unsubscribed,
 			COUNT(*) FILTER (WHERE btrim(ct.first_name) = '') AS missing_first_name
 		FROM campaign_leads cl

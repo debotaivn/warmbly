@@ -3,6 +3,7 @@ package validate
 import (
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/warmbly/warmbly/internal/bitmask"
 	"github.com/warmbly/warmbly/internal/config"
@@ -145,6 +146,20 @@ func CampaignMaxNewLeads(v int) *errx.Error {
 	return nil
 }
 
+// CampaignEntryDelay validates the delay held before a contact's first email,
+// in minutes. 0 means the first email is due the moment the contact enters the
+// campaign; the ceiling mirrors the column's CHECK constraint.
+func CampaignEntryDelay(v int) *errx.Error {
+	if v < 0 || v > CampaignEntryDelayMaxMinutes {
+		return errx.New(errx.BadRequest, "delay before the first email must be between 0 minutes and 90 days")
+	}
+	return nil
+}
+
+// CampaignEntryDelayMaxMinutes is the ceiling for the entry delay (90 days),
+// kept in step with the entry_delay_minutes CHECK constraint.
+const CampaignEntryDelayMaxMinutes = 90 * 24 * 60
+
 // CampaignTrackingDomain validates a campaign-scoped tracking-domain override.
 // Empty means "fall back to the mailbox/default domain". Otherwise it has to be
 // a bare hostname, by the same rule the mailbox field uses.
@@ -154,6 +169,21 @@ func CampaignTrackingDomain(host string) *errx.Error {
 	}
 	if !TrackingHostname(host) {
 		return errx.New(errx.BadRequest, "invalid tracking domain")
+	}
+	return nil
+}
+
+// CampaignUTMValue validates one of the campaign's UTM overrides. Empty means
+// "use the default". Values are query-string parameters, so they must be
+// short, single-line and printable; encoding is the send path's job.
+func CampaignUTMValue(v string) *errx.Error {
+	if utf8.RuneCountInString(v) > 128 {
+		return errx.New(errx.BadRequest, "utm values must be 128 characters or fewer")
+	}
+	for _, r := range v {
+		if r < 0x20 || r == 0x7f {
+			return errx.New(errx.BadRequest, "utm values cannot contain control characters")
+		}
 	}
 	return nil
 }

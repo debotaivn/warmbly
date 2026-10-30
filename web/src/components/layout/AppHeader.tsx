@@ -11,75 +11,37 @@
 // This component is purely the row. Layout (where it sits) is decided by
 // AppShell, not here.
 
-import { Link, useLocation } from "react-router-dom";
+import { useRef } from "react";
+import { Link } from "@tanstack/react-router";
 import { ChevronRight, Menu, Search } from "lucide-react";
 import { Logo } from "@/components/svg";
 import AgentMark from "@/components/app/agent/AgentMark";
+import RemieTip from "@/components/app/agent/RemieTip";
 import { useAppStore } from "@/stores";
 import { ConnectionIndicator } from "@/components/shared/ConnectionIndicator";
-import { usePermission } from "@/hooks/usePermission";
+import { useAccessRestricted, usePermission } from "@/hooks/usePermission";
 import ShortcutTooltip from "@/components/ui/shortcut-tooltip";
 import PresenceAvatars from "@/components/app/presence/PresenceAvatars";
 import OutboxIndicator from "@/components/app/unibox/compose/OutboxIndicator";
 import { NotificationBell } from "./NotificationBell";
 import { OrgSwitcher } from "./OrgSwitcher";
+import { BetaPill } from "./BetaPill";
 import { PlanPill } from "./PlanPill";
+import { VersionPill } from "./VersionPill";
 import { CreditsMeter } from "./CreditsMeter";
-
-// Pretty labels for path segments. Anything missing falls back to the
-// raw segment with its first letter capitalised.
-const labelMap: Record<string, string> = {
-    app: "Home",
-    emails: "Accounts",
-    unibox: "Inbox",
-    contacts: "Contacts",
-    segments: "Segments",
-    categories: "Categories",
-    campaigns: "Campaigns",
-    analytics: "Analytics",
-    crm: "CRM",
-    pipelines: "Pipelines",
-    deals: "Deals",
-    tasks: "Tasks",
-    templates: "Templates",
-    "api-keys": "API Keys",
-    settings: "Settings",
-    billing: "Billing",
-    team: "Team",
-    admin: "Admin",
-    workers: "Workers",
-    credentials: "Credentials",
-    audit: "Audit",
-    leads: "Leads",
-    preferences: "Preferences",
-    schedule: "Schedule",
-    steps: "Steps",
-};
-
-function pretty(segment: string): string {
-    return labelMap[segment] ?? segment.charAt(0).toUpperCase() + segment.slice(1);
-}
+import { useIsMobile } from "@/hooks/use-mobile";
+import { cn } from "@/lib/utils";
+import { hrefTarget } from "@/lib/routerSearch";
+import { useHeaderBreadcrumbs } from "@/hooks/useHeaderBreadcrumbs";
 
 export function AppHeader({ onMenu }: { onMenu?: () => void }) {
-    const { pathname } = useLocation();
+    const crumbs = useHeaderBreadcrumbs();
+    const restricted = useAccessRestricted();
     const setCommandPaletteOpen = useAppStore((s) => s.setCommandPaletteOpen);
-
-    // Path under /app — first segment is the section ("emails", "admin", ...),
-    // subsequent ones are subpages. Don't show UUID-looking segments verbatim
-    // because nobody wants "Campaigns > 47a3-..." in their chrome.
-    const segments = pathname
-        .split("/")
-        .filter(Boolean)
-        .filter((s) => s !== "app");
-    // Each crumb links to its own path prefix so "Campaigns > Leads" gets you
-    // back to the list; hidden UUID segments still count toward the prefix.
-    const crumbs = segments
-        .map((seg, i) => ({ seg, to: `/app/${segments.slice(0, i + 1).join("/")}` }))
-        .filter(({ seg }) => !/^[0-9a-f]{8}-[0-9a-f]{4}/i.test(seg));
-    // A crumb whose prefix is the page itself is a label; every other one is a
-    // link (so "Campaigns" stays clickable on /campaigns/<id>, where the hidden
-    // id is the real last segment).
-    const currentPath = `/app/${segments.join("/")}`;
+    // The logo zone spans the sidebar column, so it has to collapse with it or
+    // the breadcrumb stops lining up with the content panel below.
+    const isMobile = useIsMobile();
+    const navCollapsed = useAppStore((s) => s.navCollapsed) && !isMobile;
 
     return (
         <div className="h-14 flex items-center shrink-0">
@@ -95,7 +57,10 @@ export function AppHeader({ onMenu }: { onMenu?: () => void }) {
             </button>
             <Link
                 to="/app/emails"
-                className="h-full flex items-center gap-2.5 shrink-0 group pl-2 pr-3 md:w-64 md:px-5"
+                className={cn(
+                    "h-full flex items-center gap-2.5 shrink-0 group pl-2 pr-3 md:transition-[width,padding] md:duration-200 md:ease-out",
+                    navCollapsed ? "md:w-14 md:px-0 md:justify-center" : "md:w-64 md:px-5",
+                )}
             >
                 {/* Cool blue-leaning gray at rest; deeper blue-gray on hover.
                     Light enough to read as neutral chrome, but with a clear
@@ -110,7 +75,10 @@ export function AppHeader({ onMenu }: { onMenu?: () => void }) {
                     header carry it there, leaving room for the workspace pill. */}
                 <span
                     style={{ fontFamily: "var(--font-display)" }}
-                    className="hidden md:inline font-extrabold text-[15.5px] tracking-tight text-slate-900"
+                    className={cn(
+                        "wb-title font-extrabold text-[15.5px] tracking-tight text-slate-900",
+                        navCollapsed ? "hidden" : "hidden md:inline",
+                    )}
                 >
                     Warmbly
                 </span>
@@ -120,33 +88,46 @@ export function AppHeader({ onMenu }: { onMenu?: () => void }) {
                 section crumbs are redundant with each page's own title on a
                 phone, so they only show on >=md. */}
             <div className="flex items-center gap-1.5 min-w-0 flex-1 pr-2 md:pr-4">
-                <Crumb>
+                <div className="min-w-0 md:shrink-0 max-w-32 lg:max-w-48">
                     <OrgSwitcher />
-                </Crumb>
-                {crumbs.map(({ seg, to }) => (
-                    <div key={to} className="hidden md:flex items-center gap-2 min-w-0">
-                        <ChevronRight className="w-3.5 h-3.5 text-slate-300 shrink-0" />
-                        {to === currentPath ? (
-                            <span className="text-[13px] font-medium text-slate-900 truncate">
-                                {pretty(seg)}
-                            </span>
-                        ) : (
-                            <Link
-                                to={to}
-                                className="text-[13px] text-slate-500 hover:text-slate-900 truncate transition-colors"
-                            >
-                                {pretty(seg)}
-                            </Link>
-                        )}
-                    </div>
-                ))}
+                </div>
+                <nav aria-label="Breadcrumb" className="hidden md:block min-w-0">
+                    <ol className="flex items-center gap-2 min-w-0">
+                        {crumbs.map(({ label, to, current }, index) => (
+                            <li key={to} className="flex items-center gap-2 min-w-0">
+                                <ChevronRight aria-hidden="true" className="w-3.5 h-3.5 text-slate-300 shrink-0" />
+                                {current ? (
+                                    <span aria-current="page" title={label} className="text-[13px] font-medium text-slate-900 truncate">
+                                        {label}
+                                    </span>
+                                ) : (
+                                    <Link
+                                        {...hrefTarget(to)}
+                                        title={label}
+                                        className={cn(
+                                            "text-[13px] hover:text-slate-900 truncate transition-colors",
+                                            index === crumbs.length - 1 ? "font-medium text-slate-900" : "text-slate-500",
+                                        )}
+                                    >
+                                        {label}
+                                    </Link>
+                                )}
+                            </li>
+                        ))}
+                    </ol>
+                </nav>
             </div>
 
-            <div className="flex items-center gap-2 px-2 sm:px-4 shrink-0">
+            <div className="flex items-center gap-1 sm:gap-2 px-2 sm:px-4 shrink-0">
+                {/* Outside the sm-only group on purpose: once the dialog is
+                    dismissed this pill is the only way back to it, and a phone
+                    is exactly where someone dismisses it fastest. */}
+                <BetaPill />
                 <div className="hidden sm:flex items-center gap-2">
-                    <PlanPill />
-                    <CreditsMeter />
-                    <div className="h-4 w-px bg-slate-200/80" />
+                    <div className="hidden lg:contents"><PlanPill /></div>
+                    <VersionPill />
+                    {!restricted && <div className="hidden lg:contents"><CreditsMeter /></div>}
+                    <div className="hidden lg:block h-4 w-px bg-slate-200/80" />
                 </div>
                 <OutboxIndicator />
                 <PresenceAvatars />
@@ -154,12 +135,14 @@ export function AppHeader({ onMenu }: { onMenu?: () => void }) {
                 <NotificationBell />
                 <AssistantButton />
                 <button
+                    type="button"
+                    aria-label="Search"
                     onClick={() => setCommandPaletteOpen(true)}
                     className="flex items-center gap-2 px-2 h-7 rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-200/60 transition-colors text-[12.5px]"
                 >
                     <Search className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Search</span>
-                    <kbd className="hidden md:inline-flex h-4 items-center px-1 rounded border border-slate-300/70 bg-white/60 font-mono text-[10px] text-slate-500 ml-0.5">
+                    <span className="hidden xl:inline">Search</span>
+                    <kbd className="hidden xl:inline-flex h-4 items-center px-1 rounded border border-slate-300/70 bg-white/60 font-mono text-[10px] text-slate-500 ml-0.5">
                         ⌘K
                     </kbd>
                 </button>
@@ -168,13 +151,8 @@ export function AppHeader({ onMenu }: { onMenu?: () => void }) {
     );
 }
 
-function Crumb({ children }: { children: React.ReactNode }) {
-    return <div className="flex items-center gap-2 min-w-0">{children}</div>;
-}
-
-// The assistant toggle, with a live status badge so background work is never
-// invisible: pulsing sky while a run streams, amber when a tool waits for
-// approval, solid sky when a finished response hasn't been read yet.
+// Remie's toggle. Working, waiting on an approval and finishing all show on the
+// blob itself, the dot marks an unread reply, and tips hang off it (RemieTip).
 function AssistantButton() {
     const open = useAppStore((s) => s.aiAssistantOpen);
     const minimized = useAppStore((s) => s.agentMinimized);
@@ -182,6 +160,8 @@ function AssistantButton() {
     const setMinimized = useAppStore((s) => s.setAgentMinimized);
     const tabs = useAppStore((s) => s.agentTabs);
     const canAI = usePermission("USE_AI");
+    const lastRunOk = useAppStore((s) => s.agentLastRunOk);
+    const anchor = useRef<HTMLDivElement>(null);
 
     if (!canAI) return null;
 
@@ -190,7 +170,9 @@ function AssistantButton() {
     const unseen = tabs.some((t) => t.unseen);
 
     return (
-        <ShortcutTooltip label="AI assistant" combo="mod+I" side="bottom">
+        // Relative so Remie's tip bubble can hang off the blob.
+        <div ref={anchor} className="relative">
+        <ShortcutTooltip label="Ask Remie" combo="mod+I" side="bottom">
         <button
             onClick={() => {
                 if (open && minimized) {
@@ -203,23 +185,22 @@ function AssistantButton() {
                     setOpen(true);
                 }
             }}
-            aria-label="AI assistant"
-            className="relative flex items-center justify-center size-7 rounded-md text-slate-500 hover:text-sky-700 hover:bg-sky-50 transition-colors"
+            aria-label="Ask Remie"
+            data-tour="remie"
+            className="group relative flex items-center justify-center size-7 rounded-md hover:bg-sky-50 transition-colors"
         >
-            <AgentMark className="w-4 h-4" />
-            {(running || pending || unseen) && (
-                <span
-                    className={
-                        "absolute top-0.5 right-0.5 size-1.5 rounded-full ring-2 ring-white " +
-                        (running
-                            ? "bg-sky-500 animate-pulse"
-                            : pending
-                              ? "bg-amber-500"
-                              : "bg-sky-500")
-                    }
-                />
+            <AgentMark
+                size={20}
+                celebrate={lastRunOk}
+                state={pending ? "attention" : running ? "thinking" : "idle"}
+            />
+            {/* Working and waiting show on the mark itself; the dot is an unread reply. */}
+            {unseen && !running && !pending && (
+                <span className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-sky-500 ring-2 ring-white" />
             )}
         </button>
         </ShortcutTooltip>
+        <RemieTip anchor={anchor} />
+        </div>
     );
 }

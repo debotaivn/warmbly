@@ -4,10 +4,10 @@ import (
 	"context"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/errx"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 	"github.com/warmbly/warmbly/internal/tasks/proto"
 )
 
@@ -18,7 +18,7 @@ import (
 func (s *tasksService) HandleTask(task *proto.ProcessTask) *errx.Error {
 	taskID, err := uuid.Parse(task.TaskId)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return errx.New(errx.BadRequest, "invalid task ID")
 	}
 
@@ -26,11 +26,14 @@ func (s *tasksService) HandleTask(task *proto.ProcessTask) *errx.Error {
 	rec, err := s.taskRepo.GetTask(ctx, taskID)
 	cancel()
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return errx.InternalError()
 	}
 	if rec == nil {
 		return errx.ErrNotFound
+	}
+	if rec.Status != "pending" || rec.ScheduledAt != nil && rec.ScheduledAt.After(time.Now()) {
+		return nil
 	}
 
 	switch rec.TaskType {
@@ -43,6 +46,8 @@ func (s *tasksService) HandleTask(task *proto.ProcessTask) *errx.Error {
 	// anywhere in the database.
 	case "email":
 		return s.HandleUserEmailTask(task)
+	case "placement":
+		return s.HandlePlacementTask(task)
 	default:
 		log.Warn().Str("task_id", taskID.String()).Str("task_type", rec.TaskType).Msg("task dispatch: unknown task type")
 		return errx.New(errx.BadRequest, "unknown task type")

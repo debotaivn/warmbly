@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/warmbly/warmbly/internal/app/lifecycle"
+	"github.com/warmbly/warmbly/internal/jobrun"
 	"github.com/warmbly/warmbly/internal/models"
 )
 
@@ -22,16 +23,10 @@ func (s *JobsService) StartLifecycleRebalancer(ctx context.Context, interval tim
 	if s.LifecycleRepo == nil {
 		return
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.rebalanceLifecycles(ctx)
-		}
-	}
+	jobrun.Loop(ctx, "lifecycle_rebalancer", interval, false, func(ctx context.Context) error {
+		s.rebalanceLifecycles(ctx)
+		return nil
+	})
 }
 
 func (s *JobsService) rebalanceLifecycles(ctx context.Context) {
@@ -46,7 +41,7 @@ func (s *JobsService) rebalanceLifecycles(ctx context.Context) {
 	seen := make([]uuid.UUID, 0, len(candidates))
 	for _, c := range candidates {
 		seen = append(seen, c.EmailAccountID)
-		d := lifecycle.Decide(c.Current, c.Since, c.HealthState, now)
+		d := lifecycle.Decide(c.Current, c.Since, c.HealthState, c.CloudEvidenceUnknown, now)
 		if d.RestartProbation {
 			if err := s.LifecycleRepo.RestartProbation(ctx, c.EmailAccountID); err != nil {
 				log.Warn().Err(err).Str("email_account_id", c.EmailAccountID.String()).

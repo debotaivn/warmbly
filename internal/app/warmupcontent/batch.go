@@ -2,18 +2,21 @@ package warmupcontent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/warmbly/warmbly/internal/errx"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/pkg/generation"
-	"github.com/warmbly/warmbly/internal/pkg/humanlint"
 	"github.com/warmbly/warmbly/internal/pkg/warmlint"
+	"github.com/warmbly/warmbly/internal/repository"
 )
 
 // themeForIndex uses a pinned theme when present, otherwise it rotates through
@@ -48,7 +51,13 @@ func (s *service) GenerateBatch(ctx context.Context, req GenerateRequest) (uuid.
 		req.Count = maxPerBatch
 	}
 
-	settings, _ := s.repo.GetGenerationSettings(ctx)
+	settings, err := s.repo.GetGenerationSettings(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if settings == nil || !settings.GenerationEnabled {
+		return uuid.Nil, ErrGenerationStopped
+	}
 	if req.Model == "" && settings != nil {
 		req.Model = settings.Model
 	}
@@ -59,6 +68,7 @@ func (s *service) GenerateBatch(ctx context.Context, req GenerateRequest) (uuid.
 	if req.MaxMessages > 0 {
 		maxMessages = req.MaxMessages
 	}
+	maxMessages = max(1, min(5, maxMessages))
 
 	// Respect the daily generation cap (shared with the sync/scheduled paths) so
 	// a huge batch can't blow past the admin's budget for the day.
@@ -76,19 +86,28 @@ func (s *service) GenerateBatch(ctx context.Context, req GenerateRequest) (uuid.
 	if window == "" {
 		window = "24h"
 	}
+	if window != "24h" {
+		return uuid.Nil, fmt.Errorf("batch completion window must be 24h")
+	}
+	if err := s.gen.CheckModel(ctx, req.Model); err != nil {
+		return uuid.Nil, err
+	}
 
+	version := generation.WarmupScenarioVersion
 	job := &models.WarmupGenerationJob{
-		ID:               uuid.New(),
-		RequestedBy:      req.RequestedBy,
-		Trigger:          req.Trigger,
-		Mode:             models.WarmupGenerationModeBatch,
-		PoolType:         req.PoolType,
-		Segment:          req.Segment,
-		Theme:            req.Theme,
-		Model:            req.Model,
-		RequestedCount:   req.Count,
-		Status:           "pending",
-		CompletionWindow: window,
+		ContentVersion:       &version,
+		MaxMessagesPerThread: &maxMessages,
+		ID:                   uuid.New(),
+		RequestedBy:          req.RequestedBy,
+		Trigger:              req.Trigger,
+		Mode:                 models.WarmupGenerationModeBatch,
+		PoolType:             req.PoolType,
+		Segment:              req.Segment,
+		Theme:                req.Theme,
+		Model:                req.Model,
+		RequestedCount:       req.Count,
+		Status:               "pending",
+		CompletionWindow:     window,
 	}
 
 	// custom_id → theme so results map back after the (unordered) batch returns.
@@ -114,13 +133,13 @@ func (s *service) GenerateBatch(ctx context.Context, req GenerateRequest) (uuid.
 	if err != nil {
 		now := time.Now()
 		job.Status = "failed"
-		job.Error = err.Error()
+		job.Error = "provider batch submission failed"
 		job.StartedAt = &now
 		job.FinishedAt = &now
 		if updateErr := s.repo.UpdateGenerationJob(ctx, job); updateErr != nil {
 			return uuid.Nil, updateErr
 		}
-		return uuid.Nil, err
+		return uuid.Nil, fmt.Errorf("provider batch submission failed")
 	}
 
 	now := time.Now()
@@ -143,10 +162,11 @@ func (s *service) GenerateBatch(ctx context.Context, req GenerateRequest) (uuid.
 	return job.ID, nil
 }
 
-// PollBatches reconciles every in-flight batch job against OpenAI. Completed
-// batches are downloaded and ingested (clean, lint, and cache);
-// failed/expired/cancelled batches mark the job failed; otherwise the latest
-// batch status is persisted so the admin UI reflects progress.
+// PollBatches reconciles every in-flight batch job against OpenAI. A batch
+// that stopped running is ingested from whatever file it left (clean, lint,
+// and cache), with an expired or cancelled reason recorded; one that left
+// nothing marks the job failed. Otherwise the latest batch status is
+// persisted so the admin UI reflects progress.
 func (s *service) PollBatches(ctx context.Context) error {
 	if s.gen == nil {
 		return nil
@@ -158,7 +178,7 @@ func (s *service) PollBatches(ctx context.Context) error {
 	for i := range jobs {
 		job := &jobs[i]
 		if err := s.pollBatchJob(ctx, job); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			log.Warn().Err(err).Str("job_id", job.ID.String()).Str("batch_id", job.BatchID).
 				Msg("warmup batch generation: poll failed")
 		}
@@ -170,38 +190,66 @@ func (s *service) PollBatches(ctx context.Context) error {
 func (s *service) pollBatchJob(ctx context.Context, job *models.WarmupGenerationJob) error {
 	state, err := s.gen.GetBatch(ctx, job.BatchID)
 	if err != nil {
-		return err
+		return fmt.Errorf("provider batch status unavailable")
 	}
 	job.BatchStatus = state.Status
 
-	switch state.Status {
-	case "completed":
-		job.BatchOutputFileID = state.OutputFileID
-		// A batch whose requests all failed completes with no output file; the
-		// refusals are in the error file, which has the same JSONL shape. Read
-		// it instead of failing on the empty id, or the reason is never seen.
-		resultsFileID := state.OutputFileID
-		if resultsFileID == "" {
-			resultsFileID = state.ErrorFileID
-		}
-		return s.ingestBatch(ctx, job, resultsFileID, state.Counts)
-	case "failed", "expired", "cancelled":
-		now := time.Now()
-		job.Status = "failed"
-		job.FinishedAt = &now
-		if job.Error == "" {
-			// A batch that failed as a whole has no error file; this is the only account of why.
-			job.Error = fmt.Sprintf("batch %s", state.Status)
-			if state.FailureReason != "" {
-				job.Error += ": " + state.FailureReason
-			}
-		}
-		return s.repo.UpdateGenerationJob(ctx, job)
-	default:
+	if !batchEnded(state.Status) {
 		// validating | in_progress | finalizing | cancelling | submitted —
 		// still running; persist the latest status for visibility.
 		return s.repo.UpdateGenerationJob(ctx, job)
 	}
+
+	outcome := endedBatchOutcome(state)
+	if job.Error == "" {
+		job.Error = outcome.Error
+	}
+	if outcome.ResultsFileID != "" {
+		job.BatchOutputFileID = state.OutputFileID
+		return s.ingestBatch(ctx, job, outcome.ResultsFileID, state.Counts)
+	}
+
+	now := time.Now()
+	job.Status = "failed"
+	job.FinishedAt = &now
+	return s.repo.UpdateGenerationJob(ctx, job)
+}
+
+// batchEnded reports whether a batch status is terminal.
+func batchEnded(status string) bool {
+	switch status {
+	case "completed", "failed", "expired", "cancelled":
+		return true
+	}
+	return false
+}
+
+// batchOutcome is what the poller does with a batch that stopped running.
+type batchOutcome struct {
+	// ResultsFileID is the JSONL to ingest, empty when the batch left none.
+	ResultsFileID string
+	// Error is the reason to record, empty when the batch ended cleanly.
+	Error string
+}
+
+// endedBatchOutcome decides what a terminal batch leaves behind. A window that
+// closes early still hands back the requests it did finish, so an expired or
+// cancelled batch is ingested rather than discarded, with the reason recorded
+// so the shortfall is not read as a clean run.
+func endedBatchOutcome(state generation.BatchState) batchOutcome {
+	// Output holds the successes, the error file the refusals; same JSONL shape.
+	results := state.OutputFileID
+	if results == "" {
+		results = state.ErrorFileID
+	}
+	if state.Status == "completed" {
+		if results == "" {
+			return batchOutcome{Error: "batch completed with no output file"}
+		}
+		return batchOutcome{ResultsFileID: results}
+	}
+	reason := fmt.Sprintf("batch %s", state.Status)
+	return batchOutcome{ResultsFileID: results, Error: reason}
 }
 
 // ingestBatch downloads a completed batch's output, cleans, lints, and caches
@@ -209,12 +257,7 @@ func (s *service) pollBatchJob(ctx context.Context, job *models.WarmupGeneration
 func (s *service) ingestBatch(ctx context.Context, job *models.WarmupGenerationJob, outputFileID string, counts generation.BatchCounts) error {
 	results, err := s.gen.FetchBatchResults(ctx, outputFileID)
 	if err != nil {
-		now := time.Now()
-		job.Status = "failed"
-		job.FinishedAt = &now
-		job.Error = err.Error()
-		_ = s.repo.UpdateGenerationJob(ctx, job)
-		return err
+		return fmt.Errorf("provider batch results unavailable")
 	}
 
 	// Reset the per-ingest counters; the output file is the source of truth.
@@ -222,14 +265,18 @@ func (s *service) ingestBatch(ctx context.Context, job *models.WarmupGenerationJ
 	job.LintRejectedCount = 0
 	job.FailedCount = 0
 
+	seen := make(map[string]bool, len(results))
+	subjects := make(map[string]bool, len(results))
+	openings := make(map[string]bool, len(results))
 	for i := range results {
 		r := &results[i]
+		index, indexErr := strconv.Atoi(strings.TrimPrefix(r.CustomID, job.ID.String()+"-"))
+		if !strings.HasPrefix(r.CustomID, job.ID.String()+"-") || indexErr != nil || index < 0 || index >= job.RequestedCount || r.CustomID != fmt.Sprintf("%s-%d", job.ID, index) || seen[r.CustomID] {
+			continue
+		}
+		seen[r.CustomID] = true
 		if r.Err != "" || r.Conversation == nil {
 			job.FailedCount++
-			if r.Err != "" {
-				log.Debug().Str("job_id", job.ID.String()).Str("custom_id", r.CustomID).Str("err", r.Err).
-					Msg("warmup batch generation: result line failed")
-			}
 			continue
 		}
 
@@ -242,43 +289,105 @@ func (s *service) ingestBatch(ctx context.Context, job *models.WarmupGenerationJ
 			job.FailedCount++
 			continue
 		}
-
-		// Humanize before the gates (identical to the sync runJob path).
-		subject, description, messages = humanizeThread(subject, description, messages)
-
-		lintBody := description
-		if len(messages) > 0 {
-			lintBody += "\n\n" + strings.Join(messages, "\n")
+		subjectKey := strings.ToLower(strings.Join(strings.Fields(subject), " "))
+		openingKey := strings.ToLower(strings.Join(strings.Fields(description), " "))
+		duplicate := subjects[subjectKey] || openings[openingKey]
+		subjects[subjectKey], openings[openingKey] = true, true
+		recordID := batchConversationID(job.ID, r.CustomID)
+		prior, err := s.repo.GetConversation(ctx, recordID)
+		if err != nil {
+			return err
 		}
-		if humanlint.LooksRobotic(lintBody) {
+		if prior != nil {
+			if prior.SemanticReview == "passed" || prior.SemanticReview == "legacy_unreviewed" {
+				job.GeneratedCount++
+			}
+			if prior.SemanticReview == "rejected" {
+				job.LintRejectedCount++
+			}
+			if prior.SemanticReview == "unavailable" {
+				job.FailedCount++
+			}
+			continue
+		}
+		if duplicate {
 			job.LintRejectedCount++
 			continue
 		}
+		if job.ContentVersion == nil {
+			record := &models.WarmupConversation{ID: recordID, PoolType: job.PoolType, Segment: job.Segment, Source: models.WarmupContentSourceAI, Theme: theme, Subject: subject, Description: description, Messages: messages, Status: models.WarmupConversationArchived, SemanticReview: "legacy_unreviewed", GeneratedByJob: &job.ID}
+			if err := s.repo.InsertConversation(ctx, record); err != nil {
+				job.FailedCount++
+				return err
+			}
+			job.GeneratedCount++
+			continue
+		}
+		// A batch queued under the retired version is still reviewed, so its output is archived rather than lost.
+		if *job.ContentVersion != generation.WarmupScenarioVersion && *job.ContentVersion != generation.DiagnosticScenarioVersion {
+			job.FailedCount++
+			continue
+		}
+		if job.MaxMessagesPerThread != nil && len(messages) != *job.MaxMessagesPerThread {
+			job.LintRejectedCount++
+			continue
+		}
+
+		// Preserve canonical facts before reviewing the complete rendered thread.
+		subject, description, messages = preserveCanonicalThread(subject, description, messages)
+		rendered, err := generation.RenderDiagnostic(generation.Conversation{Subject: subject, Description: description, Messages: messages}, [2]string{"Alex", "Sam"})
+		if err != nil {
+			job.LintRejectedCount++
+			continue
+		}
+		lintBody := rendered.Description + "\n\n" + strings.Join(rendered.Messages, "\n")
 		if err := warmlint.Check(subject, lintBody, false); err != nil {
 			job.LintRejectedCount++
 			continue
 		}
+		review, status := "unavailable", models.WarmupConversationArchived
+		if err := generation.ValidateFreshWarmup(*r.Conversation); err != nil {
+			review = "rejected"
+			job.LintRejectedCount++
+		} else if judgment, err := s.reviewThread(ctx, rendered, job.Model); err != nil {
+			review = "unavailable"
+			job.FailedCount++
+		} else if reject, _ := judgment.Reject(); reject {
+			review = "rejected"
+			job.LintRejectedCount++
+		} else {
+			review, status = "passed", models.WarmupConversationActive
+		}
+		scenarioVersion, renderingVersion := generation.WarmupScenarioVersion, generation.CanonicalRenderingVersion
 
 		record := &models.WarmupConversation{
-			ID:             uuid.New(),
-			PoolType:       job.PoolType,
-			Segment:        job.Segment,
-			Source:         models.WarmupContentSourceAI,
-			Theme:          theme,
-			Subject:        subject,
-			Description:    description,
-			Messages:       messages,
-			Status:         "active",
-			LintPassed:     true,
-			ReplyEligible:  true,
-			GeneratedByJob: &job.ID,
+			ID:               recordID,
+			PoolType:         job.PoolType,
+			Segment:          job.Segment,
+			Source:           models.WarmupContentSourceAI,
+			Theme:            theme,
+			Subject:          subject,
+			Description:      description,
+			Messages:         messages,
+			Status:           status,
+			LintPassed:       true,
+			ReplyEligible:    status == models.WarmupConversationActive,
+			GeneratedByJob:   &job.ID,
+			ScenarioVersion:  &scenarioVersion,
+			RenderingVersion: &renderingVersion,
+			SemanticReview:   review,
 		}
 		if err := s.repo.InsertConversation(ctx, record); err != nil {
+			if errors.Is(err, repository.ErrWarmupConversationDuplicate) {
+				job.LintRejectedCount++
+				continue
+			}
 			job.FailedCount++
-			sentry.CaptureException(err)
-			continue
+			return err
 		}
-		job.GeneratedCount++
+		if status == models.WarmupConversationActive {
+			job.GeneratedCount++
+		}
 	}
 
 	// The output file already contains one line per request (success or error),
@@ -287,7 +396,7 @@ func (s *service) ingestBatch(ctx context.Context, job *models.WarmupGenerationJ
 	// added on top (that would double-count); it's reconciled only if the output
 	// reported fewer lines than the batch's total, which shouldn't normally
 	// happen but guards against a truncated/partial download.
-	if missing := counts.Total - len(results); missing > 0 {
+	if missing := max(counts.Total, job.RequestedCount) - len(seen); missing > 0 {
 		job.FailedCount += missing
 	}
 
@@ -298,11 +407,6 @@ func (s *service) ingestBatch(ctx context.Context, job *models.WarmupGenerationJ
 		job.Status = "failed"
 		if job.Error == "" {
 			job.Error = fmt.Sprintf("all %d batch results failed", job.FailedCount)
-			// One line's reason is worth more than the count: when every
-			// request is refused it is the same reason for all of them.
-			if reason := firstResultError(results); reason != "" {
-				job.Error += ": " + reason
-			}
 		}
 	}
 	if err := s.repo.UpdateGenerationJob(ctx, job); err != nil {
@@ -339,7 +443,9 @@ func themeForCustomID(customID, pinnedTheme string) string {
 	return defaultThemes[n%len(defaultThemes)]
 }
 
-// CancelBatch cancels an in-flight batch job both on OpenAI and locally.
+// CancelBatch asks OpenAI to cancel an in-flight batch. The job stays running
+// so the poller ingests what the batch finished before the cancel landed; the
+// admin's reason is recorded now and survives that ingest.
 func (s *service) CancelBatch(ctx context.Context, jobID uuid.UUID) error {
 	if s.gen == nil {
 		return ErrNotConfigured
@@ -349,27 +455,31 @@ func (s *service) CancelBatch(ctx context.Context, jobID uuid.UUID) error {
 		return err
 	}
 	if job == nil {
-		return fmt.Errorf("generation job not found")
+		return errx.New(errx.NotFound, "generation job not found")
 	}
 	if job.Mode != models.WarmupGenerationModeBatch || job.BatchID == "" {
-		return fmt.Errorf("job is not a batch job")
+		return errx.New(errx.BadRequest, "job is not a batch job")
 	}
 	if job.Status == "completed" || job.Status == "failed" {
-		return fmt.Errorf("job already finished")
+		return errx.New(errx.BadRequest, "job already finished")
+	}
+	if job.BatchStatus == "cancelling" {
+		return errx.New(errx.BadRequest, "cancellation already requested")
 	}
 
 	if err := s.gen.CancelBatch(ctx, job.BatchID); err != nil {
-		return err
+		return fmt.Errorf("provider batch cancellation failed")
 	}
 
-	now := time.Now()
-	job.Status = "failed"
-	job.BatchStatus = "cancelling"
-	job.FinishedAt = &now
-	if job.Error == "" {
-		job.Error = "cancelled by admin"
-	}
-	return s.repo.UpdateGenerationJob(ctx, job)
+	// A conditional write: if the poller finished the job between the read
+	// above and now, its terminal state and counts stand and there is nothing
+	// left to mark.
+	_, err = s.repo.MarkBatchCancelling(ctx, jobID, "cancelled by admin")
+	return err
+}
+
+func batchConversationID(jobID uuid.UUID, customID string) uuid.UUID {
+	return uuid.NewSHA1(jobID, []byte(customID))
 }
 
 // firstResultError returns the first non-empty per-line error in a batch's

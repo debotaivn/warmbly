@@ -2,10 +2,12 @@ package advisor
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/warmbly/warmbly/internal/app/copyjudge"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/repository"
 	"github.com/warmbly/warmbly/internal/tasks"
@@ -21,37 +23,57 @@ func copyDetectors() []Detector {
 			Key:      "copy_broken_template",
 			Category: models.AdvisorCategoryCopy,
 			About:    "Copy that the template engine cannot parse. On send it silently degrades to the naive replacement path, so conditionals and merge variables ship to the recipient as literal text. This is the single most visible mistake in cold outreach and instantly marks a message as bulk.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectBrokenTemplate,
 		},
 		{
 			Key:      "copy_spam_phrases",
 			Category: models.AdvisorCategoryCopy,
 			About:    "Phrases that both spam filters and human readers treat as bulk-mail markers. The filter cost is real but secondary; the main cost is that these phrases make a message read as something nobody wrote to anyone in particular.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectSpamPhrases,
 		},
 		{
 			Key:      "copy_too_long",
 			Category: models.AdvisorCategoryCopy,
 			About:    "Cold emails long enough that a busy recipient will not read them. Length is the most reliable predictor of a cold email being ignored on a phone, which is where most of them are opened.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectCopyTooLong,
 		},
 		{
 			Key:      "copy_subject_too_long",
 			Category: models.AdvisorCategoryCopy,
 			About:    "Subject lines long enough to be truncated in the inbox list, especially on mobile clients, so the part that would earn the open is never seen.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectSubjectTooLong,
 		},
 		{
 			Key:      "copy_too_many_links",
 			Category: models.AdvisorCategoryCopy,
 			About:    "Link count in a cold email. Multiple links in a first-touch email is a strong bulk-mail signal to filters, and it splits the reader's attention away from the single thing you want them to do.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectTooManyLinks,
 		},
 		{
 			Key:      "copy_shouty_subject",
 			Category: models.AdvisorCategoryCopy,
 			About:    "Subject lines in capitals or stacked with exclamation marks. This is a bulk-mail signal for filters and reads as shouting to a person.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectShoutySubject,
+		},
+		{
+			Key:      "copy_reads_as_bulk",
+			Category: models.AdvisorCategoryCopy,
+			About:    "An optional automated copy review, not a measurement of spam placement or reply likelihood. It flags tone only when a confident reader model agrees the message sounds promotional and lacks relevance to a specific reader or role. A business offer, reusable template or merge variable alone does not qualify. Explicit guarantees, free-money or prize promises and urgency are checked separately. Present this as a possible wording issue to review, never a fact about how recipients or spam filters will react. Only runs with TypeSafe configured.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
+			Run:      detectReadsAsBulk,
+		},
+		{
+			Key:      "copy_no_clear_ask",
+			Category: models.AdvisorCategoryCopy,
+			About:    "Copy that asks the reader for nothing, or for several things at once. A cold email earns a reply by making one small, specific request; with none there is nothing to answer, and with several the reader answers none. Judged by a calibrated reader model, and only when the operator has configured TypeSafe.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
+			Run:      detectNoClearAsk,
 		},
 	}
 }
@@ -105,7 +127,7 @@ func emailSteps(s *repository.AdvisorSnapshot) []stepContext {
 func stepLabel(sc stepContext) string {
 	name := sc.step.Name
 	if name == "" {
-		name = fmt.Sprintf("Step %d", sc.step.Position+1)
+		name = fmt.Sprintf("Step %d", sc.step.Position)
 	}
 	return name
 }
@@ -440,4 +462,123 @@ func joinQuoted(items []string) string {
 		quoted = append(quoted, fmt.Sprintf("%q", it))
 	}
 	return joinWords(quoted)
+}
+
+// judgmentFor returns the step's TypeSafe verdict, when the run judged it.
+func judgmentFor(s *repository.AdvisorSnapshot, sc stepContext) (copyjudge.Verdict, bool) {
+	if s.CopyJudgments == nil {
+		return copyjudge.Verdict{}, false
+	}
+	v, ok := s.CopyJudgments[sc.step.ID]
+	return v, ok
+}
+
+// round2 bands a probability for evidence, so the narrator and the card show
+// "0.82" rather than a float's full tail.
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
+}
+
+func detectReadsAsBulk(s *repository.AdvisorSnapshot) []Finding {
+	out := []Finding{}
+	for _, sc := range emailSteps(s) {
+		v, ok := judgmentFor(s, sc)
+		if !ok || !v.ReadsAsBulk() {
+			continue
+		}
+
+		reason := "may sound promotional and lack a clear connection to the recipient or their role"
+		title := fmt.Sprintf("Review the tone of %s", stepLabel(sc))
+		if v.SpamClaim >= copyjudge.SpamClaimAt {
+			reason = "may contain a guarantee, a free-money or prize promise, or pressure to act immediately"
+			title = fmt.Sprintf("Review the claims in %s", stepLabel(sc))
+		}
+
+		out = append(out, Finding{
+			Key:         "copy_reads_as_bulk",
+			GroupTitle:  "{count} steps have wording to review",
+			Category:    models.AdvisorCategoryCopy,
+			Severity:    models.AdvisorLow,
+			Surface:     models.AdvisorSurfaceCampaigns,
+			EntityType:  "step",
+			EntityID:    ref(sc.step.ID),
+			EntityLabel: fmt.Sprintf("%s / %s", sc.campaign, stepLabel(sc)),
+			ParentType:  "campaign",
+			ParentID:    ref(sc.step.CampaignID),
+			Impact:      clampImpact(35 + int(v.ReadsAs*20) + sc.step.Sent/100),
+			Title:       title,
+			Detail: fmt.Sprintf(
+				"An automated copy review suggests %s in %s %s. This is a wording assessment, not evidence that recipients will ignore it or that a spam filter will reject it.",
+				stepLabel(sc), sc.campaign, reason),
+			Remedy: "Check whether the email explains why the offer is relevant to this recipient, describes what you do plainly, and asks one small question. Edit any unsupported promises or artificial urgency. If the wording already fits, dismiss this suggestion.",
+			Steps: []string{
+				fmt.Sprintf("Open the campaign and go to %s.", stepLabel(sc)),
+				"Read it aloud as if to the one person it is addressed to. Every line that would be strange to say to them is a line to cut.",
+				"Replace claims (guaranteed, free, act now, limited time) with what is true for this reader: what you noticed, why it is relevant to them.",
+				"Save any changes to refresh the review, or dismiss it if the assessment does not fit your message.",
+			},
+			Evidence: map[string]any{
+				"campaign":        sc.campaign,
+				"step":            stepLabel(sc),
+				"subject":         sc.step.Subject,
+				"reads_as":        round2(v.ReadsAs),
+				"personalization": round2(v.Personalization),
+				"spam_claim":      round2(v.SpamClaim),
+				"confidence":      round2(v.Confidence),
+				"step_sends":      sc.step.Sent,
+				"content_hash":    copyjudge.ContentHash(sc.step.Subject, copyjudge.Body(sc.step.BodyPlain, sc.step.BodyHTML)),
+			},
+		})
+	}
+	return out
+}
+
+func detectNoClearAsk(s *repository.AdvisorSnapshot) []Finding {
+	out := []Finding{}
+	for _, sc := range emailSteps(s) {
+		v, ok := judgmentFor(s, sc)
+		if !ok || !v.LacksClearAsk() {
+			continue
+		}
+
+		what := "asks the reader for nothing"
+		fix := "End with one small question the reader can answer in a line: whether this is worth a look, or who the right person is."
+		if v.Ask == copyjudge.AskSeveral {
+			what = "asks the reader for several things"
+			fix = "Keep one ask and move the rest to the reply. A reader with three requests answers none of them."
+		}
+
+		out = append(out, Finding{
+			Key:         "copy_no_clear_ask",
+			GroupTitle:  "{count} steps have no clear ask",
+			Category:    models.AdvisorCategoryCopy,
+			Severity:    models.AdvisorLow,
+			Surface:     models.AdvisorSurfaceCampaigns,
+			EntityType:  "step",
+			EntityID:    ref(sc.step.ID),
+			EntityLabel: fmt.Sprintf("%s / %s", sc.campaign, stepLabel(sc)),
+			ParentType:  "campaign",
+			ParentID:    ref(sc.step.CampaignID),
+			Impact:      clampImpact(20 + sc.step.Sent/100),
+			Title:       fmt.Sprintf("%s %s", stepLabel(sc), what),
+			Detail: fmt.Sprintf(
+				"%s in %s %s. A cold email earns a reply by making one small, specific request; anything else leaves the reader nothing to answer.",
+				stepLabel(sc), sc.campaign, what),
+			Remedy: fix,
+			Steps: []string{
+				fmt.Sprintf("Open the campaign and go to %s.", stepLabel(sc)),
+				"Decide the one thing you want back from this email: a yes or no, a name, a time.",
+				fix,
+			},
+			Evidence: map[string]any{
+				"campaign":   sc.campaign,
+				"step":       stepLabel(sc),
+				"subject":    sc.step.Subject,
+				"ask":        v.Ask,
+				"confidence": round2(v.Confidence),
+				"step_sends": sc.step.Sent,
+			},
+		})
+	}
+	return out
 }

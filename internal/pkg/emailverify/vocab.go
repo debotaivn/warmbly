@@ -16,6 +16,12 @@ type ExternalVerdict struct {
 // vocabularies maps a provider name to the statuses it emits. Keys are
 // lower-cased with spaces, dashes and underscores removed (see vocabKey).
 var vocabularies = map[string]map[string]ExternalVerdict{
+	ProviderCleanMyList: {
+		"deliverable":   {Status: StatusValid},
+		"undeliverable": {Status: StatusInvalid},
+		"risky":         {Status: StatusRisky},
+		"unknown":       {Status: StatusUnknown},
+	},
 	ProviderMillionVerifier: {
 		"ok":         {Status: StatusValid},
 		"good":       {Status: StatusValid},
@@ -128,12 +134,13 @@ var vocabularies = map[string]map[string]ExternalVerdict{
 // value. Specific vocabularies first; the generic one last.
 var vocabProviderOrder = []string{
 	"zerobounce", ProviderMillionVerifier, "neverbounce", "emaillistverify",
-	"debounce", "bouncer", "kickbox", "emailable", "clearout", ProviderBuiltin,
+	"debounce", "bouncer", "kickbox", "emailable", "clearout", ProviderCleanMyList, ProviderBuiltin,
 }
 
 // vocabProviderAliases maps how a provider is written in a column header to
 // its vocabulary key.
 var vocabProviderAliases = map[string]string{
+	"cleanmylist":     ProviderCleanMyList,
 	"millionverifier": ProviderMillionVerifier, "mv": ProviderMillionVerifier,
 	"zerobounce": "zerobounce", "zb": "zerobounce",
 	"neverbounce": "neverbounce", "nb": "neverbounce",
@@ -144,6 +151,32 @@ var vocabProviderAliases = map[string]string{
 	"clearout":        "clearout",
 	"emaillistverify": "emaillistverify", "elv": "emaillistverify",
 	"warmbly": ProviderBuiltin, "builtin": ProviderBuiltin,
+}
+
+// providerLabels are the names a member reads for each verifier.
+var providerLabels = map[string]string{
+	ProviderBuiltin:         "Warmbly's built-in check",
+	ProviderMillionVerifier: "MillionVerifier",
+	ProviderCleanMyList:     "CleanMyList",
+	"zerobounce":            "ZeroBounce",
+	"neverbounce":           "NeverBounce",
+	"bouncer":               "Bouncer",
+	"kickbox":               "Kickbox",
+	"emailable":             "Emailable",
+	"debounce":              "DeBounce",
+	"clearout":              "Clearout",
+	"emaillistverify":       "EmailListVerify",
+}
+
+// ProviderLabel is the display name of a verifier, or "" for one it does not know.
+func ProviderLabel(name string) string {
+	if l, ok := providerLabels[name]; ok {
+		return l
+	}
+	if k, ok := KnownVocabulary(name); ok {
+		return providerLabels[k]
+	}
+	return ""
 }
 
 func vocabKey(raw string) string {

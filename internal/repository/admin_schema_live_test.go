@@ -28,6 +28,105 @@ type adminFixture struct {
 	tag      string
 }
 
+func TestLiveAdminPlatformOverviewConfirmedSends(t *testing.T) {
+	_, pool := liveContactDB(t)
+	ctx := t.Context()
+	f := newAdminFixture(t, pool)
+	config := pool.Config()
+	config.ConnConfig.RuntimeParams["timezone"] = "Pacific/Honolulu"
+	localPool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localPool.Close()
+	repo := &adminRepository{db: localPool}
+	before, err := repo.GetPlatformOverview(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []uuid.UUID
+	t.Cleanup(func() {
+		for _, query := range []string{
+			`DELETE FROM warmup_tokens WHERE task_id = ANY($1::uuid[])`,
+			`DELETE FROM tasks WHERE id = ANY($1::uuid[])`,
+		} {
+			if _, err := pool.Exec(context.Background(), query, ids); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
+		}
+	})
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	yesterday := today.Add(-24 * time.Hour)
+	tomorrow := today.Add(24 * time.Hour)
+	for _, tt := range []struct {
+		name, kind, status, messageID, state string
+		completedAt                          time.Time
+		appliedAt                            *time.Time
+		tokens                               int
+		confirmedToken                       bool
+	}{
+		{"legacy warmup", "warmup", "completed", "", "", yesterday, nil, 1, true},
+		{"delayed warmup result", "warmup", "completed", "planned@test.local", "sent", yesterday, &today, 2, true},
+		{"campaign result", "campaign", "completed", "", "sent", yesterday, &today, 0, false},
+		{"legacy direct dispatch", "email", "completed", "planned@test.local", "", today, nil, 0, false},
+		{"direct result", "email", "completed", "", "sent", today, &today, 0, false},
+		{"placement result", "placement", "completed", "", "sent", today, &today, 0, false},
+		{"future receipt", "email", "completed", "", "sent", today, &tomorrow, 0, false},
+		{"warmup dispatch", "warmup", "completed", "planned@test.local", "unknown", today, nil, 1, false},
+		{"warmup without receipt", "warmup", "completed", "planned@test.local", "sent", today, &today, 1, false},
+		{"campaign dispatch", "campaign", "completed", "", "", today, nil, 0, false},
+		{"unknown with message ID", "email", "completed", "planned@test.local", "unknown", today, nil, 0, false},
+		{"unapplied success", "campaign", "completed", "planned@test.local", "sent", today, nil, 0, false},
+		{"legacy failure", "email", "failed", "planned@test.local", "", today, nil, 0, false},
+		{"failed result", "campaign", "failed", "planned@test.local", "failed", today, &today, 0, false},
+		{"cancelled dispatch", "warmup", "cancelled", "planned@test.local", "failed", today, &today, 1, false},
+	} {
+		id := uuid.New()
+		ids = append(ids, id)
+		_, err := pool.Exec(ctx, `INSERT INTO tasks
+			(id, task_type, email_account_id, status, message_id, completed_at, send_result_state, send_result_applied_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8)`,
+			id, tt.kind, f.mailbox, tt.status, tt.messageID, tt.completedAt, tt.state, tt.appliedAt)
+		if err != nil {
+			t.Fatalf("%s: %v", tt.name, err)
+		}
+		for range tt.tokens {
+			messageID := ""
+			if tt.confirmedToken {
+				messageID = "<confirmed@test.local>"
+			}
+			_, err := pool.Exec(ctx, `INSERT INTO warmup_tokens
+				(token, task_id, sender_account_id, recipient_account_id, conversation_turn, sent_message_id)
+				VALUES ($1, $2, $3, $3, 0, $4)`, uuid.New(), id, f.mailbox, messageID)
+			if err != nil {
+				t.Fatalf("%s token: %v", tt.name, err)
+			}
+		}
+	}
+	after, err := repo.GetPlatformOverview(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after.TotalEmailsSent - before.TotalEmailsSent; got != 6 {
+		t.Fatalf("confirmed total delta = %d, want 6", got)
+	}
+	if got := after.EmailsSentToday - before.EmailsSentToday; got != 4 {
+		t.Fatalf("confirmed UTC today delta = %d, want 4", got)
+	}
+}
+
+func TestAdminPlatformOverviewReturnsSendCountError(t *testing.T) {
+	pool, err := pgxpool.New(t.Context(), "postgres://test:test@127.0.0.1:1/test?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Close()
+	got, err := (&adminRepository{db: pool}).GetPlatformOverview(t.Context())
+	if err == nil || got != nil {
+		t.Fatalf("closed database: got %+v, %v; want an error, not zero counters", got, err)
+	}
+}
+
 func newAdminFixture(t *testing.T, pool *pgxpool.Pool) *adminFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -85,28 +184,6 @@ func newAdminFixture(t *testing.T, pool *pgxpool.Pool) *adminFixture {
 	return f
 }
 
-// ensureDuration returns the id of the durations row with this title, creating
-// it for the duration of the test if the instance does not have one.
-func ensureDuration(t *testing.T, pool *pgxpool.Pool, title string) uuid.UUID {
-	t.Helper()
-	ctx := context.Background()
-	var id uuid.UUID
-	err := pool.QueryRow(ctx, `SELECT id FROM durations WHERE title = $1`, title).Scan(&id)
-	if err == nil {
-		return id
-	}
-	id = uuid.New()
-	if _, err := pool.Exec(ctx, `INSERT INTO durations (id, title) VALUES ($1, $2)`, id, title); err != nil {
-		t.Fatalf("create durations row %q: %v", title, err)
-	}
-	t.Cleanup(func() {
-		if _, err := pool.Exec(context.Background(), `DELETE FROM durations WHERE id = $1`, id); err != nil {
-			t.Errorf("cleanup durations row %q: %v", title, err)
-		}
-	})
-	return id
-}
-
 // The email-account section of the user preview compared a uuid column against
 // a text parameter, so the query errored and the caller swallowed it: every
 // user looked like they had no mailboxes.
@@ -134,7 +211,7 @@ func TestLiveAdminUserPreviewListsMailboxes(t *testing.T) {
 
 	// The paginated mailbox list behind the user detail page compared the same
 	// uuid column against a text parameter, and that one surfaced as a 500.
-	emails, pagination, err := repo.GetUserEmails(context.Background(), f.user, nil, 50)
+	emails, pagination, err := repo.GetUserEmails(context.Background(), f.user, 0, 50)
 	if err != nil {
 		t.Fatalf("GetUserEmails: %v", err)
 	}
@@ -217,82 +294,6 @@ func TestLiveAdminForceStopLeavesTerminalCampaignsAlone(t *testing.T) {
 		if got != status {
 			t.Fatalf("a %s campaign is now %q; the stop overwrote a state it had no business touching", status, got)
 		}
-	}
-}
-
-// plans stores the billing period as duration_id (FK to durations); the admin
-// writes named a `duration` column that does not exist.
-func TestLiveAdminPlanRoundTripsDuration(t *testing.T) {
-	_, pool := liveContactDB(t)
-	repo := NewAdminRepository(pool)
-	ctx := context.Background()
-
-	// A bare install ships only the monthly duration (migration 000080); the
-	// yearly one arrives with the seed. Add whatever is missing and take it
-	// back out again, so this runs on either.
-	monthID := ensureDuration(t, pool, "month")
-	yearID := ensureDuration(t, pool, "year")
-
-	resolved, err := repo.DurationIDByTitle(ctx, "month")
-	if err != nil {
-		t.Fatalf("DurationIDByTitle(month): %v", err)
-	}
-	if resolved == nil || *resolved != monthID {
-		t.Fatalf("DurationIDByTitle(month) = %v, want %v", resolved, monthID)
-	}
-	if unknown, err := repo.DurationIDByTitle(ctx, "fortnight"); err != nil || unknown != nil {
-		t.Fatalf("DurationIDByTitle(fortnight) = %v, %v; want nil, nil so the API can answer 400", unknown, err)
-	}
-
-	name := "Issue 209 plan"
-	plan := &models.Plan{
-		ID:             uuid.New(),
-		Name:           &name,
-		MaxContacts:    1000,
-		DailyEmails:    50,
-		AccountLimit:   3,
-		Price:          49,
-		Duration:       models.DurationMonth,
-		MonthlyCredits: 25,
-	}
-	t.Cleanup(func() {
-		if _, err := pool.Exec(context.Background(), `DELETE FROM plans WHERE id = $1`, plan.ID); err != nil {
-			t.Errorf("cleanup plan: %v", err)
-		}
-	})
-
-	if err := repo.CreatePlan(ctx, plan, monthID); err != nil {
-		t.Fatalf("CreatePlan: %v", err)
-	}
-
-	got, err := repo.GetPlan(ctx, plan.ID)
-	if err != nil {
-		t.Fatalf("GetPlan: %v", err)
-	}
-	if got == nil {
-		t.Fatal("GetPlan found nothing for a plan that was just created")
-	}
-	if got.Duration != models.DurationMonth {
-		t.Fatalf("plan reads back duration %q, want %q", got.Duration, models.DurationMonth)
-	}
-	if got.MonthlyCredits != 25 {
-		t.Fatalf("plan reads back %d monthly credits, want 25", got.MonthlyCredits)
-	}
-
-	got.Duration = models.DurationYear
-	got.Price = 490
-	if err := repo.UpdatePlan(ctx, got, yearID); err != nil {
-		t.Fatalf("UpdatePlan: %v", err)
-	}
-	after, err := repo.GetPlan(ctx, plan.ID)
-	if err != nil {
-		t.Fatalf("GetPlan after update: %v", err)
-	}
-	if after.Duration != models.DurationYear {
-		t.Fatalf("plan reads back duration %q after switching to yearly, want %q", after.Duration, models.DurationYear)
-	}
-	if after.Price != 490 {
-		t.Fatalf("plan reads back price %v, want 490", after.Price)
 	}
 }
 

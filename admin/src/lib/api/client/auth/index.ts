@@ -4,6 +4,7 @@
 
 import { Request } from "@/lib/api/client";
 import type {
+    DeploymentAuthConfig,
     LoginRequest,
     LoginStartResponse,
     LoginConfirmRequest,
@@ -12,6 +13,17 @@ import type {
     TwoFAVerifyRequest,
     AdminProfile,
 } from "@/lib/api/models/auth";
+
+// What this deployment's auth can do. Public and unauthenticated: it is the
+// first request the sign-in screen makes, and the answer decides whether a
+// Turnstile widget is mounted at all.
+export function getAuthConfig(): Promise<DeploymentAuthConfig> {
+    return Request<DeploymentAuthConfig>({
+        method: "GET",
+        url: "/v1/auth/config",
+        timeout: 10_000,
+    });
+}
 
 // Step 1: verify password + captcha. Emails a one-time code, returns a session.
 export function login(input: LoginRequest): Promise<LoginStartResponse> {
@@ -58,5 +70,27 @@ export function logout(): Promise<void> {
         method: "POST",
         url: "/v1/auth/logout",
         authorization: true,
+    });
+}
+
+// Which of password and authenticator code this account can confirm with.
+export function reauthMethods(): Promise<{ password: boolean; totp: boolean }> {
+    return Request<{ password: boolean; totp: boolean }>({
+        method: "GET",
+        url: "/v1/auth/reauth/methods",
+        authorization: true,
+        skipReauthPrompt: true,
+    });
+}
+
+// Re-proves the operator behind the session; the changes gated on a recent
+// confirmation (join tokens, admin grants, workspace archives) wait for it.
+export function reauth(input: { password?: string; code?: string }): Promise<{ valid_for_seconds: number }> {
+    return Request<{ valid_for_seconds: number }>({
+        method: "POST",
+        url: "/v1/auth/reauth",
+        data: input,
+        authorization: true,
+        skipReauthPrompt: true,
     });
 }

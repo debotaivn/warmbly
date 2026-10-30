@@ -128,12 +128,13 @@ var segmentEnumColumns = map[string]string{
 	"source":              "c.source",
 	"verification_status": "c.verification_status",
 	"esp_provider":        "c.esp_provider",
+	"mail_host":           "c.mail_host",
 }
 
 var segmentDateExprs = map[string]string{
 	"created_at":      "c.created_at",
 	"updated_at":      "c.updated_at",
-	"last_sent_at":    "(SELECT MAX(p.sent_at) FROM campaign_contact_progress p WHERE p.contact_id = c.id)",
+	"last_sent_at":    "(SELECT MAX(p.sent_at) FROM campaign_contact_progress p WHERE p.contact_id = c.id AND " + progressIsEmailStep("p") + ")",
 	"last_opened_at":  "(SELECT MAX(p.opened_at) FROM campaign_contact_progress p WHERE p.contact_id = c.id AND NOT p.opened_machine)",
 	"last_clicked_at": "(SELECT MAX(p.clicked_at) FROM campaign_contact_progress p WHERE p.contact_id = c.id)",
 	"last_replied_at": "(SELECT MAX(p.replied_at) FROM campaign_contact_progress p WHERE p.contact_id = c.id)",
@@ -141,7 +142,7 @@ var segmentDateExprs = map[string]string{
 
 var segmentNumberExprs = map[string]string{
 	"campaign_count": "(SELECT COUNT(*) FROM campaign_leads cl WHERE cl.contact_id = c.id)",
-	"emails_sent":    "(SELECT COUNT(*) FROM campaign_contact_progress p WHERE p.contact_id = c.id AND p.sent_at IS NOT NULL)",
+	"emails_sent":    "(SELECT COUNT(*) FROM campaign_contact_progress p WHERE p.contact_id = c.id AND p.sent_at IS NOT NULL AND " + progressIsEmailStep("p") + ")",
 	"emails_opened":  "(SELECT COUNT(*) FROM campaign_contact_progress p WHERE p.contact_id = c.id AND p.opened_at IS NOT NULL AND NOT p.opened_machine)",
 	"emails_clicked": "(SELECT COUNT(*) FROM campaign_contact_progress p WHERE p.contact_id = c.id AND p.clicked_at IS NOT NULL)",
 	"emails_replied": "(SELECT COUNT(*) FROM campaign_contact_progress p WHERE p.contact_id = c.id AND p.replied_at IS NOT NULL)",
@@ -197,7 +198,7 @@ func (b *segmentBuilder) condition(c models.SegmentCondition, visited map[uuid.U
 		case "is_catch_all":
 			expr = "c.is_catch_all"
 		case "suppressed":
-			expr = fmt.Sprintf("EXISTS (SELECT 1 FROM suppressed_recipients sr WHERE sr.organization_id = %s AND lower(sr.email) = lower(c.email) AND (sr.expires_at IS NULL OR sr.expires_at > now()))", b.bind(b.orgID))
+			expr = fmt.Sprintf("recipient_suppressed(%s, c.email)", b.bind(b.orgID))
 		default:
 			return "FALSE"
 		}

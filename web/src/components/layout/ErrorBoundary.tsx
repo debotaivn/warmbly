@@ -10,29 +10,46 @@
 // the <withBoundary> helper to opt a page in.
 
 import React from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useLocation, useRouter } from "@tanstack/react-router";
 import { AlertTriangleIcon, RefreshCcwIcon } from "lucide-react";
+import { captureException } from "@/lib/observability";
+import { SENTRY_RELEASE } from "@/lib/information";
+import { isModuleLoadError } from "@/lib/moduleLoadError";
 
 interface State {
     error: Error | null;
     info: React.ErrorInfo | null;
+    /** Last `resetKey` seen, so a change clears the error without a remount. */
+    seenResetKey?: string;
 }
 
-export class ErrorBoundary extends React.Component<
-    { children: React.ReactNode; onReset?: () => void },
-    State
-> {
+interface BoundaryProps {
+    children: React.ReactNode;
+    onReset?: () => void;
+    /** Change this to drop a caught error and re-render the children. */
+    resetKey?: string;
+}
+
+export class ErrorBoundary extends React.Component<BoundaryProps, State> {
     state: State = { error: null, info: null };
 
     static getDerivedStateFromError(error: Error): Partial<State> {
         return { error };
     }
 
+    // Clearing the error here rather than remounting the boundary is what lets
+    // a healthy page keep its state across a URL change.
+    static getDerivedStateFromProps(props: BoundaryProps, state: State): Partial<State> | null {
+        if (state.seenResetKey === props.resetKey) return null;
+        return { seenResetKey: props.resetKey, error: null, info: null };
+    }
+
     componentDidCatch(error: Error, info: React.ErrorInfo) {
         this.setState({ info });
-        if (typeof window !== "undefined" && (window as unknown as { Sentry?: { captureException: (e: Error) => void } }).Sentry) {
-            (window as unknown as { Sentry?: { captureException: (e: Error) => void } }).Sentry?.captureException(error);
-        }
+        // Through lib/observability, so the error reaches whichever backend
+        // the deployment configured. Reading a global off `window` found the
+        // SDK only when it had put itself there, which a bundled one does not.
+        captureException(error);
         console.error("[ErrorBoundary]", error, info?.componentStack);
     }
 
@@ -47,8 +64,9 @@ export class ErrorBoundary extends React.Component<
     }
 }
 
-function BoundaryFallback({ error, info, reset }: { error: Error; info: React.ErrorInfo | null; reset: () => void }) {
-    const navigate = useNavigate();
+export function BoundaryFallback({ error, info, reset }: { error: Error; info: Pick<React.ErrorInfo, "componentStack"> | null; reset: () => void }) {
+    const router = useRouter();
+    const reload = isModuleLoadError(error);
     return (
         <div className="flex flex-col min-h-full bg-white">
             <div className="min-h-12 md:h-12 px-5 py-1.5 md:py-0 border-b border-slate-200 flex flex-wrap md:flex-nowrap items-center gap-3 gap-y-1.5 shrink-0 bg-white">
@@ -61,17 +79,17 @@ function BoundaryFallback({ error, info, reset }: { error: Error; info: React.Er
                 </span>
                 <div className="ml-auto flex items-center gap-1.5">
                     <button
-                        onClick={() => navigate(-1)}
+                        onClick={() => router.history.back()}
                         className="h-7 px-2.5 rounded-md border border-slate-200 hover:border-slate-300 text-slate-700 hover:text-slate-900 text-[12px] font-medium transition-colors"
                     >
                         Back
                     </button>
                     <button
-                        onClick={reset}
+                        onClick={() => reload ? window.location.reload() : reset()}
                         className="h-7 px-2.5 rounded-md bg-sky-600 hover:bg-sky-700 text-white text-[12px] font-medium inline-flex items-center gap-1.5 transition-colors"
                     >
                         <RefreshCcwIcon className="w-3 h-3" />
-                        Retry
+                        {reload ? "Reload" : "Retry"}
                     </button>
                 </div>
             </div>
@@ -93,6 +111,7 @@ function BoundaryFallback({ error, info, reset }: { error: Error; info: React.Er
                                 Stack
                             </summary>
                             <pre className="px-3 py-3 text-[10.5px] font-mono text-slate-700 leading-relaxed overflow-x-auto whitespace-pre-wrap border-t border-slate-200">
+                                {SENTRY_RELEASE ? `Build: ${SENTRY_RELEASE}\n\n` : ""}
                                 {error.stack || ""}
                                 {info?.componentStack ? `\n\nComponent stack:${info.componentStack}` : ""}
                             </pre>
@@ -105,13 +124,16 @@ function BoundaryFallback({ error, info, reset }: { error: Error; info: React.Er
 }
 
 /**
- * RouteBoundary — react-router compatible: resets the boundary on
+ * RouteBoundary resets the boundary on
  * pathname change so navigating away from a broken page recovers
  * automatically.
  */
 export function RouteBoundary({ children }: { children: React.ReactNode }) {
     const { pathname } = useLocation();
-    // Key forces a fresh ErrorBoundary instance on every route change, which
-    // both clears stale errors and lets the new page mount cleanly.
-    return <ErrorBoundary key={pathname}>{children}</ErrorBoundary>;
+    // resetKey, not key: a `key` here would tear down and re-create the whole
+    // routed subtree on every URL change, which throws away the scroll offset
+    // of any list whose page encodes in-page state in the path (issue #396).
+    // Mounting the next page cleanly is the Suspense boundary's job in
+    // AppShell, which keys off the route identity instead.
+    return <ErrorBoundary resetKey={pathname}>{children}</ErrorBoundary>;
 }

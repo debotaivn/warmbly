@@ -1,6 +1,7 @@
 import { API_BASE_URL } from "@/lib/information";
 import getToken from "@/lib/helper/getToken";
 import type { AgentStreamEvent } from "@/lib/api/models/app/agent/Agent";
+import { readEventStream } from "../../eventStream";
 
 // streamAgentRun POSTs to an SSE agent endpoint and invokes onEvent for each
 // `data:` frame. Uses raw fetch (not the axios client) because the response is
@@ -29,7 +30,7 @@ export default async function streamAgentRun(
         });
     } catch (e) {
         if ((e as Error)?.name === "AbortError") return;
-        onEvent({ type: "error", message: "Could not reach the assistant." });
+        onEvent({ type: "error", message: "Could not reach Remie." });
         return;
     }
 
@@ -40,40 +41,16 @@ export default async function streamAgentRun(
             onEvent({
                 type: "error",
                 code: j.code,
-                message: j.message || "The assistant is unavailable.",
+                message: j.message || "Remie is unavailable.",
             });
         } catch {
-            onEvent({ type: "error", message: "The assistant is unavailable." });
+            onEvent({ type: "error", message: "Remie is unavailable." });
         }
         return;
     }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
     try {
-        for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            let sep: number;
-            // SSE frames are separated by a blank line.
-            while ((sep = buffer.indexOf("\n\n")) >= 0) {
-                const frame = buffer.slice(0, sep);
-                buffer = buffer.slice(sep + 2);
-                const dataLine = frame
-                    .split("\n")
-                    .find((l) => l.startsWith("data:"));
-                if (!dataLine) continue;
-                const json = dataLine.slice(5).trim();
-                if (!json) continue;
-                try {
-                    onEvent(JSON.parse(json) as AgentStreamEvent);
-                } catch {
-                    /* skip malformed frame */
-                }
-            }
-        }
+        await readEventStream(res.body, (data) => onEvent(data as AgentStreamEvent));
     } catch (e) {
         if ((e as Error)?.name !== "AbortError") {
             onEvent({ type: "error", message: "The connection was interrupted." });

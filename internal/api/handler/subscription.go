@@ -1,15 +1,18 @@
 package handler
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/api/middleware"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/displayname"
 )
 
 // GetSubscription returns the current organization's subscription
@@ -79,11 +82,22 @@ func (h *Handler) CreateCheckoutSession(c *gin.Context) {
 		DiscountCode string `json:"discount_code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
-	session, errX := h.StripeService.CreateCheckoutSession(c.Request.Context(), uid, *orgID, req.PriceID, req.SuccessURL, req.CancelURL, req.DiscountCode)
+	// Sells public plans; a private one only to a workspace holding an open offer for it.
+	if xerr := h.authorizePlanPurchase(c, *orgID, req.PriceID, uuid.Nil); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+
+	// Pinned to this instance's dashboard: Stripe will redirect the customer
+	// to whatever is set here.
+	successURL := billingReturnURL(c.Request.Context(), req.SuccessURL, "/app/settings/billing?checkout=done")
+	cancelURL := billingReturnURL(c.Request.Context(), req.CancelURL, "/app/settings/billing")
+
+	session, errX := h.StripeService.CreateCheckoutSession(c.Request.Context(), uid, *orgID, req.PriceID, successURL, cancelURL, req.DiscountCode)
 	if errX != nil {
 		errx.JSON(c, errX)
 		return
@@ -112,7 +126,7 @@ func (h *Handler) CreateBillingPortalSession(c *gin.Context) {
 		ReturnURL string `json:"return_url" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -122,7 +136,8 @@ func (h *Handler) CreateBillingPortalSession(c *gin.Context) {
 		return
 	}
 
-	portalURL, errX := h.StripeService.CreatePortalSession(c.Request.Context(), sub.StripeCustomerID, req.ReturnURL)
+	portalURL, errX := h.StripeService.CreatePortalSession(c.Request.Context(), sub.StripeCustomerID,
+		billingReturnURL(c.Request.Context(), req.ReturnURL, "/app/settings/billing"))
 	if errX != nil {
 		errx.JSON(c, errX)
 		return
@@ -143,7 +158,7 @@ func (h *Handler) CancelSubscription(c *gin.Context) {
 		CancelAtPeriodEnd bool `json:"cancel_at_period_end"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -203,7 +218,8 @@ func (h *Handler) HandleStripeWebhook(c *gin.Context) {
 		// recorded as processed (see ProcessWebhookEvent), and every handler is
 		// idempotent on the event id, so a retry safely re-runs without
 		// double-applying. Silently 200-ing here would strand paid-for credits.
-		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "error": errX.Message})
+		log.Error().Str("request_id", c.GetString("request_id")).Str("event_id", event.ID).Str("detail", errX.Message).Msg("stripe webhook processing failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "error": "event could not be processed"})
 		return
 	}
 
@@ -279,7 +295,12 @@ func (h *Handler) ChangePlan(c *gin.Context) {
 		Interval          string    `json:"interval"` // "month" or "year"; defaults to monthly
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+
+	if xerr := h.authorizePlanPurchase(c, *orgID, "", req.PlanID); xerr != nil {
+		errx.JSON(c, xerr)
 		return
 	}
 
@@ -340,17 +361,34 @@ type EnterpriseInquiryRequest struct {
 	Notes           string `json:"notes,omitempty"`
 }
 
+const enterpriseNotesMaxLength = 2000
+
 // SubmitEnterpriseInquiry submits an enterprise pricing inquiry
 func (h *Handler) SubmitEnterpriseInquiry(c *gin.Context) {
 	var req EnterpriseInquiryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+
+	company, xerr := displayname.Validate("Company name", req.CompanyName, displayname.Workspace, false)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	contact, xerr := displayname.Validate("Contact name", req.ContactName, displayname.Person, false)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	if len([]rune(req.Notes)) > enterpriseNotesMaxLength {
+		errx.JSON(c, errx.New(errx.BadRequest, fmt.Sprintf("Notes must be %d characters or less.", enterpriseNotesMaxLength)))
 		return
 	}
 
 	inquiry := &models.EnterpriseInquiry{
-		CompanyName:     req.CompanyName,
-		ContactName:     req.ContactName,
+		CompanyName:     company,
+		ContactName:     contact,
 		ContactEmail:    req.ContactEmail,
 		EstimatedVolume: req.EstimatedVolume,
 		TeamSize:        req.TeamSize,
@@ -374,4 +412,15 @@ func (h *Handler) SubmitEnterpriseInquiry(c *gin.Context) {
 		"message":    "Thank you! Our team will contact you within 24 hours.",
 		"inquiry_id": created.ID,
 	})
+}
+
+// authorizePlanPurchase applies the plan offer rule to a price or, when priceID is empty, a plan id.
+func (h *Handler) authorizePlanPurchase(c *gin.Context, orgID uuid.UUID, priceID string, planID uuid.UUID) *errx.Error {
+	if h.PlanOfferService == nil {
+		return errx.New(errx.ServiceUnavailable, "billing is not enabled on this instance")
+	}
+	if priceID != "" {
+		return h.PlanOfferService.AuthorizePrice(c.Request.Context(), orgID, priceID)
+	}
+	return h.PlanOfferService.AuthorizePlanID(c.Request.Context(), orgID, planID)
 }

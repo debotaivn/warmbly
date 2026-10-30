@@ -40,7 +40,16 @@ type openAIProvider struct {
 	// stream_options is OpenAI's usage-in-stream opt-in; some compatible
 	// backends reject the field entirely.
 	omitStreamOptions atomic.Bool
+	// Some newer OpenAI models refuse function tools on /chat/completions
+	// unless reasoning is explicitly switched off, and name the parameter to
+	// set in the 400. Without it the whole agent loop is unusable on them.
+	reasoningEffortNone atomic.Bool
 }
+
+// maxParamAdaptations bounds the compatibility retries in one call. It is the
+// number of flags above, because a model can reject one parameter per 400 and
+// a model that rejects every one of them must still reach a working shape.
+const maxParamAdaptations = 4
 
 // defaultOpenAIBaseURL is the public OpenAI API. Overridable for
 // OpenAI-compatible self-hosted endpoints (Ollama, vLLM, LocalAI, OpenRouter).
@@ -48,7 +57,7 @@ const defaultOpenAIBaseURL = "https://api.openai.com/v1"
 
 // defaultLocalModel is the fall-back model tag for a free/local backend
 // (AI_FREE) when no explicit model id is set, so a dev who forgets
-// AI_MODEL does not 404 on "gpt-4o-mini". llama3.1 has reliable
+// AI_MODEL does not 404 on "gpt-6-luna". llama3.1 has reliable
 // tool-calling in Ollama; override with AI_MODEL (or AI_MODEL_TRIAL / _PAID).
 const defaultLocalModel = "llama3.1"
 
@@ -138,6 +147,7 @@ type oaiRequest struct {
 	Temperature         *float64          `json:"temperature,omitempty"`
 	Stream              bool              `json:"stream,omitempty"`
 	StreamOptions       *oaiStreamOptions `json:"stream_options,omitempty"`
+	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
 }
 
 type oaiStreamOptions struct {
@@ -250,6 +260,9 @@ func (p *openAIProvider) complete(ctx context.Context, model string, maxTokens i
 		if !p.omitTemperature.Load() {
 			reqBody.Temperature = temperature
 		}
+		if p.reasoningEffortNone.Load() {
+			reqBody.ReasoningEffort = "none"
+		}
 		if len(tools) > 0 {
 			reqBody.Tools = tools
 			reqBody.ToolChoice = "auto"
@@ -279,7 +292,7 @@ func (p *openAIProvider) complete(ctx context.Context, model string, maxTokens i
 			return nil, fmt.Errorf("openai: decode response: %w", err)
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			if resp.StatusCode == http.StatusBadRequest && attempt < 2 && p.adaptParams(parsed.Error) {
+			if resp.StatusCode == http.StatusBadRequest && attempt < maxParamAdaptations && p.adaptParams(parsed.Error) {
 				continue
 			}
 			if parsed.Error != nil {
@@ -313,6 +326,9 @@ func (p *openAIProvider) completeStream(ctx context.Context, model string, maxTo
 		if !p.omitTemperature.Load() {
 			reqBody.Temperature = temperature
 		}
+		if p.reasoningEffortNone.Load() {
+			reqBody.ReasoningEffort = "none"
+		}
 		if len(tools) > 0 {
 			reqBody.Tools = tools
 			reqBody.ToolChoice = "auto"
@@ -343,7 +359,7 @@ func (p *openAIProvider) completeStream(ctx context.Context, model string, maxTo
 			}
 			var parsed oaiResponse
 			_ = json.Unmarshal(raw, &parsed)
-			if resp.StatusCode == http.StatusBadRequest && attempt < 3 && p.adaptParams(parsed.Error) {
+			if resp.StatusCode == http.StatusBadRequest && attempt < maxParamAdaptations && p.adaptParams(parsed.Error) {
 				continue
 			}
 			if parsed.Error != nil {
@@ -470,6 +486,12 @@ func (p *openAIProvider) adaptParams(e *oaiError) bool {
 		}
 		p.omitTemperature.Store(true)
 		return true
+	case e.Param == "reasoning_effort":
+		if p.reasoningEffortNone.Load() {
+			return false
+		}
+		p.reasoningEffortNone.Store(true)
+		return true
 	case e.Param == "stream_options" || strings.Contains(e.Message, "stream_options"):
 		if p.omitStreamOptions.Load() {
 			return false
@@ -496,11 +518,16 @@ func (p *openAIProvider) RunAgent(ctx context.Context, req AgentRequest) (*Agent
 		maxTokens = defaultAgentTokens
 	}
 
-	byName := make(map[string]ToolDef, len(req.Tools))
-	for _, t := range req.Tools {
+	catalog := newToolCatalog(req.Tools, req.Messages)
+	tools, system := req.Tools, req.System
+	if catalog != nil {
+		tools = append(append([]ToolDef(nil), tools...), catalog.search)
+		system += catalog.instructions()
+	}
+	byName := make(map[string]ToolDef, len(tools))
+	for _, t := range tools {
 		byName[t.Name] = t
 	}
-	wireTools := toolDefsToWire(req.Tools)
 
 	// messages is the durable transcript; we mutate a copy so the caller's
 	// slice is not aliased.
@@ -523,14 +550,19 @@ func (p *openAIProvider) RunAgent(ctx context.Context, req AgentRequest) (*Agent
 		// With a listener attached, stream the completion so text reaches the
 		// client token by token; the closing EventText below carries the full
 		// block, so deltas stay purely cosmetic.
+		available := req.Tools
+		if catalog != nil {
+			available = catalog.definitions()
+		}
+		wireTools := toolDefsToWire(available)
 		var resp *oaiResponse
 		var err error
 		if req.OnEvent != nil {
-			resp, err = p.completeStream(ctx, model, maxTokens, transcriptToWire(req.System, messages), wireTools, nil, func(delta string) {
+			resp, err = p.completeStream(ctx, model, maxTokens, transcriptToWire(system, messages), wireTools, nil, func(delta string) {
 				req.OnEvent(AgentEvent{Type: EventTextDelta, Text: delta})
 			})
 		} else {
-			resp, err = p.complete(ctx, model, maxTokens, transcriptToWire(req.System, messages), wireTools, nil)
+			resp, err = p.complete(ctx, model, maxTokens, transcriptToWire(system, messages), wireTools, nil)
 		}
 		if err != nil {
 			return nil, err
@@ -633,22 +665,23 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 	return &WritingResult{Text: text, Model: model, TokensUsed: resp.Usage.TotalTokens}, nil
 }
 
-// --- WritingGenerator port ---
-
-// GenerateWriting implements WritingGenerator over the chat-completions API,
-// behaviorally identical to the prior OpenAI writing path (voice system prompt,
-// single completion, writingMaxTokens cap).
-func (p *openAIProvider) GenerateWriting(ctx context.Context, model, prompt string, voice VoiceContext) (*WritingResult, error) {
+// CompleteStream is Complete with the text handed to onDelta as it arrives.
+func (p *openAIProvider) CompleteStream(ctx context.Context, req CompletionRequest, onDelta func(string)) (*WritingResult, error) {
 	if p == nil {
 		return nil, ErrNotConfigured
 	}
+	model := req.Model
 	if model == "" {
 		model = p.modelTrial
 	}
-	resp, err := p.complete(ctx, model, writingMaxTokens, []oaiMessage{
-		{Role: "system", Content: BuildVoiceRules(voice)},
-		{Role: "user", Content: prompt},
-	}, nil, nil)
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = defaultAgentTokens
+	}
+	resp, err := p.completeStream(ctx, model, maxTokens, []oaiMessage{
+		{Role: "system", Content: req.System},
+		{Role: "user", Content: req.Prompt},
+	}, nil, req.Temperature, onDelta)
 	if err != nil {
 		return nil, err
 	}
@@ -657,4 +690,12 @@ func (p *openAIProvider) GenerateWriting(ctx context.Context, model, prompt stri
 		return nil, errors.New("openai: empty completion")
 	}
 	return &WritingResult{Text: text, Model: model, TokensUsed: resp.Usage.TotalTokens}, nil
+}
+
+// --- WritingGenerator port ---
+
+// GenerateWriting implements WritingGenerator over the chat-completions API:
+// the voice system prompt and the writingMaxTokens cap, in one completion.
+func (p *openAIProvider) GenerateWriting(ctx context.Context, model, prompt string, voice VoiceContext) (*WritingResult, error) {
+	return p.Complete(ctx, WritingRequest(model, prompt, voice))
 }

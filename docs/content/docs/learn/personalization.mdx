@@ -5,6 +5,14 @@ description: Merge variables, conditionals, fallbacks, functions, and spintax so
 
 Every subject line and email body in Warmbly supports merge variables and simple conditionals. They're rendered separately for each recipient when the email actually sends, so a single template can read naturally for your whole list.
 
+<ShortVersion>
+
+- Variables like `{{.FirstName}}` are filled in for each recipient when the email sends.
+- A missing value renders as blank, so write around it or guard it with a conditional.
+- Conditionals show text only when a field has a value, or matches one.
+
+</ShortVersion>
+
 <Callout type="info" title="Full syntax reference">
   This page covers the ideas and how to combine them. The complete syntax reference (every field, helper, and rule) lives in the [Expressions guide](/guides/expressions/).
 </Callout>
@@ -50,6 +58,8 @@ Hi {{.FirstName}},{{if .Company}} I saw {{.Company}} is hiring.{{end}}
 ```
 
 That renders as "Hi Alex, I saw Acme is hiring." when Company is set, and "Hi Alex," when it's blank.
+
+<MergePreview />
 
 Provide a fallback with `else`:
 
@@ -113,6 +123,7 @@ That renders as "Hi Alex," when the first name is set and "Hi there," when it's 
 A handful of helpers let you reshape text and work with numbers. They go inside any `{{ }}` or condition:
 
 - Text: `upper`, `lower`, `title` (change case), `trim`, `contains`, `hasPrefix`, `hasSuffix`
+- Lists: `has` (holds a whole item), `join` (one line of text)
 - Numbers: `add`, `sub`, `mul`, `div`, `mod`, `num`, and the coercing comparisons `gtf`, `ltf`, `gef`, `lef`, which treat a value as a number even if it arrives as text
 
 ```
@@ -160,6 +171,12 @@ Warmbly guards against broken templates at three points:
 - While editing, an unbalanced conditional (an `{{if}}` with no `{{end}}`) shows an inline warning.
 - A campaign won't start if any step's template is malformed. You get an error naming the step, so recipients never receive raw `{{if ...}}` text.
 - If a broken template ever reaches sending, it falls back to plain variable substitution rather than failing the send.
+
+Templates also have limits, so one template cannot tie up the server. `{{range}}` only loops over a field of the data (`{{range .items}}`), never over a number or a function's result, and loops nest at most two deep. `{{template}}`, `{{block}}` and `call` are not supported, a template declares at most 64 variables, and a function takes at most 32 arguments. A template that breaks one of these rules is treated as malformed. A render that passes 1 MB of output or too many loop steps falls back to plain substitution, and that fallback stays within the same 1 MB.
+
+## Values in the HTML body
+
+In the HTML body every variable is escaped for the place it lands, so a contact whose name is `Tom & <b>Jerry</b>` reads exactly that way instead of turning bold. A variable inside a link (`<a href="{{.website}}">`) keeps web, `mailto:` and `tel:` addresses and is replaced with a harmless `#ZgotmplZ` for anything else, and a value placed in a link's query is URL-encoded. The subject and the plain-text part are sent as written. The mailbox signature (`{{.Sender.SignatureHTML}}`) is your own markup and is kept as is.
 
 Always check Preview and send yourself a test email before launching.
 

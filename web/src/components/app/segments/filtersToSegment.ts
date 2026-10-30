@@ -24,10 +24,12 @@ export function filtersToSegment(f: SearchContacts, campaignID?: string): Segmen
     const conditions: SegmentCondition[] = [];
     const dropped: string[] = [];
 
-    for (const cf of f.filters) {
+    for (const cf of f.custom_field_filters) {
         const name = cf.name.trim();
         const op = TEXT_OPS[cf.type];
-        if (!name || !op) continue;
+        // A half-filled pill never reaches the search, so it must not reach
+        // the segment either: the two would describe different audiences.
+        if (!name || !cf.value.trim() || !op) continue;
         conditions.push({ field: `custom.${name}`, operator: op, value: cf.value });
     }
     if (f.category_ids && f.category_ids.length > 0) {
@@ -41,6 +43,10 @@ export function filtersToSegment(f: SearchContacts, campaignID?: string): Segmen
         conditions.push({ field: "subscribed", operator: f.subscribed ? "is_true" : "is_false" });
     }
     if (f.verification_status) conditions.push({ field: "verification_status", operator: "in", values: [f.verification_status] });
+    // A segment enum has no empty value, so "unknown" is reported rather than lost.
+    const hosts = (f.mail_hosts ?? []).filter(Boolean);
+    if (hosts.length > 0) conditions.push({ field: "mail_host", operator: "in", values: hosts });
+    if (f.mail_hosts?.includes("")) dropped.push("unknown email provider");
     if (f.min_campaigns !== undefined) conditions.push({ field: "campaign_count", operator: "gte", value: String(f.min_campaigns) });
     if (f.max_campaigns !== undefined) conditions.push({ field: "campaign_count", operator: "lte", value: String(f.max_campaigns) });
     if (f.created_after) conditions.push({ field: "created_at", operator: "after", value: isoDate(f.created_after) });

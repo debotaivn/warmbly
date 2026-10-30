@@ -12,13 +12,16 @@
 // Tabs:
 //   - Overview  → engagement stats + suppression + profile snapshot
 //   - Activity  → merged timeline
+//   - Deals     → the contact's deals (the CRM's in provider mode)
 //   - Notes     → CRM notes CRUD
 //   - Details   → identity / categories / campaigns / custom fields
 
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { contactTabSchema } from "@/lib/browse-contacts-campaigns";
 import { AnimatePresence, motion } from "framer-motion";
 import { CalendarPlusIcon, CheckIcon, CopyIcon, Loader2Icon, MailIcon, XIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import useUpdateContact from "@/lib/api/hooks/app/contacts/useUpdateContact";
 import useContact from "@/lib/api/hooks/app/contacts/useContact";
 import { useConfirm } from "@/hooks/context/confirm";
@@ -31,11 +34,24 @@ import BookACallButton from "@/components/app/integrations/BookACallButton";
 import ResourceViewers from "@/components/app/presence/ResourceViewers";
 import { usePresenceResource } from "@/hooks/PresenceProvider";
 import NewMeetingDialog from "@/components/app/meetings/NewMeetingDialog";
+import ScrollStrip from "@/components/ui/scroll-strip";
 import OverviewTab from "./contact-edit/OverviewTab";
 import ActivityTab from "./contact-edit/ActivityTab";
+import DealsTab from "./contact-edit/DealsTab";
 import NotesTab from "./contact-edit/NotesTab";
 import ResearchTab from "./contact-edit/ResearchTab";
-import DetailsTab, { type CustomField } from "./contact-edit/DetailsTab";
+import DetailsTab from "./contact-edit/DetailsTab";
+import { type CustomField, customFieldsPatch, customFieldsProblem } from "./customFields";
+import {
+    fieldsOf,
+    hasUnnamedValue,
+    idsOf,
+    rebase,
+    rebaseFields,
+    sameCampaigns,
+    sameFields,
+    sameIDs,
+} from "./contact-edit/rebase";
 import {
     CONTACT_SLIDE_TABS,
     type ContactSlideTab,
@@ -52,10 +68,13 @@ export default function ContactEdit({
     setActive: React.Dispatch<React.SetStateAction<string>>;
     initialTab?: ContactSlideTab;
 }) {
-    const contact = React.useMemo(
+    const listed = React.useMemo(
         () => contacts.find((c) => c.id === active),
         [contacts, active],
     );
+    // A deep link (?contact=<id>) can name someone the loaded page does not hold.
+    const fetched = useContact(active, !!active && !listed);
+    const contact = listed ?? (active ? fetched.data : undefined);
 
     return (
         <AnimatePresence>
@@ -88,7 +107,8 @@ function ContactEditPanel({
     // teammate editing the same person sees the live-viewer pill up top.
     usePresenceResource(`contact:${contact.id}`, "editing");
 
-    const [tab, setTab] = React.useState<ContactSlideTab>(initialTab ?? "overview");
+    const [tab, setTab] = useBrowseState<ContactSlideTab>(`contacts:${contact.id}:panel:tab`, "overview", contactTabSchema,
+        initialTab ? { initialOverride: initialTab } : undefined);
 
     const [firstName, setFirstName] = React.useState(contact.first_name);
     const [lastName, setLastName] = React.useState(contact.last_name);
@@ -97,11 +117,9 @@ function ContactEditPanel({
     const [phone, setPhone] = React.useState(contact.phone);
     const [subscribed, setSubscribed] = React.useState(contact.subscribed);
     const [campaigns, setCampaigns] = React.useState<MiniCampaign[]>(contact.campaigns ?? []);
-    const [categoryIds, setCategoryIds] = React.useState<string[]>(
-        () => (contact.categories ?? []).map((c) => c.id),
-    );
+    const [categoryIds, setCategoryIds] = React.useState<string[]>(() => idsOf(contact.categories ?? []));
     const [customFields, setCustomFields] = React.useState<CustomField[]>(() =>
-        Object.entries(contact.custom_fields ?? {}).map(([n, v]) => ({ name: n, value: v })),
+        fieldsOf(contact.custom_fields),
     );
 
     function reset() {
@@ -112,40 +130,67 @@ function ContactEditPanel({
         setPhone(contact.phone);
         setSubscribed(contact.subscribed);
         setCampaigns(contact.campaigns ?? []);
-        setCategoryIds((contact.categories ?? []).map((c) => c.id));
-        setCustomFields(Object.entries(contact.custom_fields ?? {}).map(([n, v]) => ({ name: n, value: v })));
+        setCategoryIds(idsOf(contact.categories ?? []));
+        setCustomFields(fieldsOf(contact.custom_fields));
     }
 
-    const recordFromCF = React.useCallback((fields: CustomField[]) => {
-        const out: Record<string, string> = {};
-        for (const f of fields) {
-            if (!f.name.trim()) continue;
-            out[f.name.trim()] = f.value;
-        }
-        return out;
-    }, []);
+    // The panel outlives the record it edits: lifting a suppression on the
+    // Overview tab re-subscribes the contact, and a teammate's edit arrives
+    // through the audit spine. Rebase every field the user has not touched
+    // onto the new server value, so a change the user made elsewhere in this
+    // panel does not read back as an unsaved edit and pop "Discard unsaved
+    // changes?" on the way out (issue #415).
+    const serverRef = React.useRef(contact);
+    React.useEffect(() => {
+        const prev = serverRef.current;
+        if (prev === contact) return;
+        serverRef.current = contact;
+        setFirstName((v) => rebase(v, prev.first_name, contact.first_name));
+        setLastName((v) => rebase(v, prev.last_name, contact.last_name));
+        setEmail((v) => rebase(v, prev.email, contact.email));
+        setCompany((v) => rebase(v, prev.company, contact.company));
+        setPhone((v) => rebase(v, prev.phone, contact.phone));
+        setSubscribed((v) => rebase(v, prev.subscribed, contact.subscribed));
+        setCampaigns((v) => rebase(v, prev.campaigns ?? [], contact.campaigns ?? [], sameCampaigns));
+        setCategoryIds((v) =>
+            rebase(v, idsOf(prev.categories ?? []), idsOf(contact.categories ?? []), sameIDs),
+        );
+        setCustomFields((v) =>
+            rebaseFields(v, fieldsOf(prev.custom_fields), fieldsOf(contact.custom_fields)),
+        );
+    }, [contact]);
 
-    const dirty = React.useMemo(() => {
+    // What the save would send. The panel also treats a half-typed custom
+    // field as unsaved work (see `dirty`), which this deliberately does not:
+    // there is nothing to send for a row with no name.
+    const changed = React.useMemo(() => {
         if (firstName !== contact.first_name) return true;
         if (lastName !== contact.last_name) return true;
         if (email !== contact.email) return true;
         if (company !== contact.company) return true;
         if (phone !== contact.phone) return true;
         if (subscribed !== contact.subscribed) return true;
-        if (JSON.stringify(recordFromCF(customFields)) !== JSON.stringify(contact.custom_fields ?? {})) return true;
-        const curC = new Set(contact.campaigns.map((c) => c.id));
-        const nextC = new Set(campaigns.map((c) => c.id));
-        if (curC.size !== nextC.size) return true;
-        for (const id of curC) if (!nextC.has(id)) return true;
-        const curCat = new Set((contact.categories ?? []).map((c) => c.id));
-        const nextCat = new Set(categoryIds);
-        if (curCat.size !== nextCat.size) return true;
-        for (const id of curCat) if (!nextCat.has(id)) return true;
+        if (!sameFields(customFields, fieldsOf(contact.custom_fields))) return true;
+        if (!sameCampaigns(campaigns, contact.campaigns ?? [])) return true;
+        if (!sameIDs(categoryIds, idsOf(contact.categories ?? []))) return true;
         return false;
-    }, [contact, firstName, lastName, email, company, phone, subscribed, customFields, campaigns, categoryIds, recordFromCF]);
+    }, [contact, firstName, lastName, email, company, phone, subscribed, customFields, campaigns, categoryIds]);
+
+    // What the user would lose on the way out, which is more than what would
+    // be sent: a custom-field row they have typed a value into but not named
+    // yet is not savable and not, on its own, a reason to enable Save.
+    const dirty = changed || hasUnnamedValue(customFields);
 
     async function save() {
-        if (!dirty) return;
+        if (!changed) return;
+        const fieldsChanged = !sameFields(customFields, fieldsOf(contact.custom_fields));
+        const fieldsPatch = fieldsChanged ? customFieldsPatch(contact.custom_fields, customFields) : {};
+        const problem = customFieldsProblem(customFields, fieldsPatch);
+        if (problem) {
+            setTab("details");
+            toast.error(problem);
+            return;
+        }
         const data: Record<string, unknown> = {};
         if (firstName !== contact.first_name) data.first_name = firstName;
         if (lastName !== contact.last_name) data.last_name = lastName;
@@ -153,19 +198,11 @@ function ContactEditPanel({
         if (company !== contact.company) data.company = company;
         if (phone !== contact.phone) data.phone = phone;
         if (subscribed !== contact.subscribed) data.subscribed = subscribed;
-        const cf = recordFromCF(customFields);
-        if (JSON.stringify(cf) !== JSON.stringify(contact.custom_fields ?? {})) data.custom_fields = cf;
-        const cur = new Set(contact.campaigns.map((c) => c.id));
-        const next = new Set(campaigns.map((c) => c.id));
-        let campaignsChanged = cur.size !== next.size;
-        if (!campaignsChanged) for (const id of cur) if (!next.has(id)) { campaignsChanged = true; break; }
-        if (campaignsChanged) data.campaigns = campaigns.map((c) => c.id);
-
-        const curCat = new Set((contact.categories ?? []).map((c) => c.id));
-        const nextCat = new Set(categoryIds);
-        let categoriesChanged = curCat.size !== nextCat.size;
-        if (!categoriesChanged) for (const id of curCat) if (!nextCat.has(id)) { categoriesChanged = true; break; }
-        if (categoriesChanged) data.categories = categoryIds;
+        // Same comparisons `dirty` and the rebase use, so what counts as
+        // changed is decided in exactly one place.
+        if (fieldsChanged) data.custom_fields = fieldsPatch;
+        if (!sameCampaigns(campaigns, contact.campaigns ?? [])) data.campaigns = idsOf(campaigns);
+        if (!sameIDs(categoryIds, idsOf(contact.categories ?? []))) data.categories = categoryIds;
 
         try {
             await toast.promise(update.mutateAsync(data), {
@@ -187,7 +224,10 @@ function ContactEditPanel({
 
     React.useEffect(() => {
         function onKey(e: KeyboardEvent) {
-            if (e.key === "Escape") requestClose();
+            if (e.key !== "Escape") return;
+            // Innermost layer only: an open popover, confirm or dialog takes its own Escape.
+            if (document.querySelector("[data-floating], [role='alertdialog'], [aria-modal='true']")) return;
+            requestClose();
         }
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
@@ -235,7 +275,13 @@ function ContactEditPanel({
                             detailLoading={detail.isLoading}
                         />
                     )}
-                    {tab === "activity" && <ActivityTab contactId={contact.id} />}
+                    {tab === "activity" && <ActivityTab contactId={contact.id} contactName={firstName || lastName ? displayName : contact.email} />}
+                    {tab === "deals" && (
+                        <DealsTab
+                            contactId={contact.id}
+                            defaultName={contact.company || (firstName || lastName ? displayName : contact.email)}
+                        />
+                    )}
                     {tab === "notes" && <NotesTab contactId={contact.id} />}
                     {tab === "research" && <ResearchTab contactId={contact.id} />}
                     {tab === "details" && (
@@ -276,7 +322,7 @@ function ContactEditPanel({
                         <button
                             type="button"
                             onClick={save}
-                            disabled={!dirty || update.isPending}
+                            disabled={!changed || update.isPending}
                             className="ml-auto h-7 px-3 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-[12px] font-medium inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
                         >
                             {update.isPending ? (
@@ -429,15 +475,16 @@ function TabStrip({
     setTab: (t: ContactSlideTab) => void;
 }) {
     return (
-        <nav className="shrink-0 px-3 flex items-center gap-1 border-b border-slate-200 overflow-x-auto md:overflow-visible">
+        <ScrollStrip activeKey={tab} className="shrink-0 border-b border-slate-200" innerClassName="px-3 gap-1">
             {CONTACT_SLIDE_TABS.map((t) => {
                 const isActive = tab === t.id;
                 return (
                     <button
                         key={t.id}
                         type="button"
+                        data-active={isActive ? "true" : undefined}
                         onClick={() => setTab(t.id)}
-                        className={`relative h-10 px-2.5 inline-flex items-center gap-1.5 text-[12.5px] outline-none transition-colors ${
+                        className={`relative h-10 px-2.5 shrink-0 inline-flex items-center gap-1.5 text-[12.5px] whitespace-nowrap outline-none transition-colors ${
                             isActive
                                 ? "text-slate-900 font-medium"
                                 : "text-slate-500 hover:text-slate-800"
@@ -448,14 +495,14 @@ function TabStrip({
                         {isActive && (
                             <motion.span
                                 layoutId="contact-tab-underline"
-                                className="absolute left-1.5 right-1.5 -bottom-px h-0.5 rounded-full bg-sky-600"
+                                className="absolute left-1.5 right-1.5 bottom-0 h-0.5 rounded-full bg-sky-600"
                                 transition={{ type: "spring", duration: 0.3, bounce: 0.15 }}
                             />
                         )}
                     </button>
                 );
             })}
-        </nav>
+        </ScrollStrip>
     );
 }
 

@@ -29,14 +29,18 @@ defmodule RealtimeWeb.AccountChannel do
       user_id = socket.assigns.user_id
 
       # Verify user has access to this email account via organization membership
-      case Auth.check_email_account_access(user_id, account_id) do
+      checked_at = System.monotonic_time(:millisecond)
+
+      case user_id
+           |> Auth.check_email_account_access(account_id)
+           |> Auth.confine(socket.assigns[:credential]) do
         {:ok, member} ->
           Logger.debug("User #{user_id} joined account:#{account_id}")
 
           socket =
             socket
             |> assign(:account_id, account_id)
-            |> assign(:permissions, Map.get(member, :permissions, 0))
+            |> ChannelGuard.remember_authorization(member, checked_at)
 
           send(self(), :after_join)
           {:ok, socket}
@@ -61,13 +65,42 @@ defmodule RealtimeWeb.AccountChannel do
 
   @impl true
   def handle_info(:after_join, socket) do
-    account_id = socket.assigns.account_id
-    Phoenix.PubSub.subscribe(Realtime.PubSub, "account:#{account_id}")
+    ChannelGuard.schedule_authorization_refresh(socket)
     {:noreply, socket}
   end
 
   @impl true
   def handle_info({:pubsub_event, event}, socket) do
+    case refresh_authorization(socket) do
+      {:ok, socket} -> deliver(socket, event)
+      {:error, _reason} -> {:stop, :normal, socket}
+    end
+  end
+
+  def handle_info(:refresh_authorization, socket) do
+    case refresh_authorization(socket, true) do
+      {:ok, socket} ->
+        ChannelGuard.schedule_authorization_refresh(socket)
+        {:noreply, socket}
+
+      {:error, _reason} ->
+        {:stop, :normal, socket}
+    end
+  end
+
+  defp refresh_authorization(socket, force \\ false) do
+    ChannelGuard.refresh_authorization(
+      socket,
+      fn ->
+        socket.assigns.user_id
+        |> Auth.check_email_account_access(socket.assigns.account_id)
+        |> Auth.confine(socket.assigns[:credential])
+      end,
+      force
+    )
+  end
+
+  defp deliver(socket, event) do
     # Rate limit outbound messages
     user_id = socket.assigns.user_id
     limits = Map.get(socket.assigns, :rate_limits, %{})

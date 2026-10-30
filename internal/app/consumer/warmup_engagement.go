@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/warmbly/warmbly/internal/app/warmupramp"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/pkg/warmpersona"
 )
@@ -46,6 +47,52 @@ func (s *JobsService) getGenerationSettings(ctx context.Context) models.WarmupGe
 	return *set
 }
 
+// Floors for mail from a sender in watch or throttled, on a consumer host, or backing a live campaign: the pool replies to and rescues more of it.
+const (
+	recoveryReplyRate     = warmupramp.BoostedReplyRate
+	recoveryImportantRate = 60
+	// Below 100 so the persona bias still varies it: no mailbox rescues every message.
+	recoveryRescueRate = 95
+)
+
+// senderGetsRecoveryEngagement reports whether the sender's mail gets recovery engagement:
+// its standing is watch or throttled, it is a consumer Gmail or Outlook.com mailbox,
+// or it backs a live campaign, whose cold mail draws few replies.
+func (s *JobsService) senderGetsRecoveryEngagement(ctx context.Context, senderID uuid.UUID) bool {
+	if s.WarmupRepo != nil {
+		state, _, err := s.WarmupRepo.GetHealthState(ctx, senderID)
+		if err == nil && (state == models.WarmupHealthWatch || state == models.WarmupHealthThrottled) {
+			return true
+		}
+	}
+	if s.EmailRepository != nil {
+		if sender, xerr := s.EmailRepository.GetByID(ctx, senderID); xerr == nil && sender.ConsumerMailbox() {
+			return true
+		}
+	}
+	if s.CampaignRepo == nil {
+		return false
+	}
+	n, err := s.CampaignRepo.CountActiveCampaignsForAccount(ctx, senderID)
+	return err == nil && n > 0
+}
+
+// recoveryEngagement raises the positive signals for a recovering sender's mail and never lowers them.
+func recoveryEngagement(e models.WarmupEngagementSettings) models.WarmupEngagementSettings {
+	e.SpamRescueRate = max(e.SpamRescueRate, recoveryRescueRate)
+	e.MarkReadRate = max(e.MarkReadRate, 95)
+	e.MarkImportantRate = max(e.MarkImportantRate, recoveryImportantRate)
+	return e
+}
+
+// recoveryReplyChance is the recipient's reply rate, raised for a recovering sender unless the owner turned replies off.
+func recoveryReplyChance(rate int, recovering bool) int {
+	if recovering && rate > 0 {
+		return max(rate, recoveryReplyRate)
+	}
+	return rate
+}
+
 // engagementPlan decides which recipient-side warmup actions to perform and
 // how long to wait first ("dwell"). Two goals:
 //   - break the uniform "every account marks important, instantly" bot
@@ -62,13 +109,13 @@ func engagementPlan(accountID uuid.UUID, e models.WarmupEngagementSettings) (act
 	p := warmpersona.For(accountID)
 
 	// Foldering is organisational, not an engagement fingerprint — always do it.
-	actions = append(actions, "move_to_warmbly")
+	actions = append(actions, models.WarmupActionFile)
 
 	// Spam-rescue is the reputation-critical "not spam" signal warmup exists for,
 	// so it fires regardless of neglect (and the worker only acts if it's really
 	// in spam).
 	if rollPct(e.SpamRescueRate, p.Bias("rescue", 0.8, 1.2)) {
-		actions = append(actions, "remove_from_spam")
+		actions = append(actions, models.WarmupActionRescueFromSpam)
 	}
 
 	// Occasionally a mailbox files a message but never engages with it — real
@@ -78,16 +125,16 @@ func engagementPlan(accountID uuid.UUID, e models.WarmupEngagementSettings) (act
 	neglect := rand.Float64() < 0.07*p.Bias("neglect", 0.6, 1.4)
 	if !neglect {
 		if rollPct(e.MarkReadRate, p.Bias("read", 0.85, 1.15)) {
-			actions = append(actions, "mark_read")
+			actions = append(actions, models.WarmupActionMarkRead)
 		}
 		if rollPct(e.MarkImportantRate, p.Bias("important", 0.7, 1.3)) {
-			actions = append(actions, "mark_important")
+			actions = append(actions, models.WarmupActionMarkImportant)
 		}
 		// Starring is a separate, lower-rate positive signal (Gmail STARRED). On
 		// IMAP the worker no-ops it because \Flagged is already covered by
 		// mark_important — so it never double-flags the same message.
 		if rollPct(e.StarRate, p.Bias("star", 0.6, 1.4)) {
-			actions = append(actions, "star")
+			actions = append(actions, models.WarmupActionStar)
 		}
 	}
 
@@ -103,7 +150,7 @@ func engagementPlan(accountID uuid.UUID, e models.WarmupEngagementSettings) (act
 // a worker restart can no longer drop the delayed leg.
 func splitEngagementLegs(actions []string) (immediate, delayed []string) {
 	for _, a := range actions {
-		if a == "move_to_warmbly" || a == "remove_from_spam" {
+		if a == models.WarmupActionFile || a == models.WarmupActionRescueFromSpam {
 			immediate = append(immediate, a)
 		} else {
 			delayed = append(delayed, a)
@@ -111,6 +158,9 @@ func splitEngagementLegs(actions []string) (immediate, delayed []string) {
 	}
 	return immediate, delayed
 }
+
+// biasedRateCeiling caps a persona-biased rate, so no mailbox performs an action every time.
+const biasedRateCeiling = 98.0
 
 // rollPct rolls a biased percentage chance. The persona bias nudges a given
 // mailbox consistently above/below the configured rate so mailboxes differ.
@@ -121,7 +171,8 @@ func rollPct(rate int, bias float64) bool {
 	if rate >= 100 {
 		return true
 	}
-	effective := float64(rate) * bias
+	// A bias never turns a configured chance into a certainty; only an explicit 100 is one.
+	effective := math.Min(float64(rate)*bias, biasedRateCeiling)
 	return rand.Float64()*100 < effective
 }
 

@@ -1,5 +1,6 @@
 # DATABASES / SERVICES
 PRIMARY_DB="postgresql://username:password@localhost:5433/database"
+# For a transaction pooler, set PRIMARY_DB_DIRECT and DB_POOL_MODE=transaction.
 REDIS="redis://arbitrary_usrname:password@ipaddress:6379/0"
 KAFKA="amqp://username:password@ip:port/vhost"
 GEO_DB_PATH="./database.mmdb"
@@ -32,11 +33,17 @@ PORT=8080
 GIN_MODE=release
 OPEN_API=true
 
-# Logs
+# Error tracking. PostHog is the default backend; Sentry still works alongside
+# it or instead of it. All optional: unset means errors are logged locally.
+POSTHOG_KEY=""
+POSTHOG_HOST=""
+POSTHOG_ERROR_TRACKING="true"
 SENTRY_DSN=""
 
 # SECRETS
-AUTH_SECRET="example123"
+# At least 32 characters: it signs every session token and the backend now
+# refuses to start below that. Generate one with: make gen-key
+AUTH_SECRET="replace-me-with-at-least-32-random-characters"
 TURNSTILE_SECRET=""
 
 # Passkeys (WebAuthn). Optional — derived from APP_URL / CORS_ALLOW_ORIGINS

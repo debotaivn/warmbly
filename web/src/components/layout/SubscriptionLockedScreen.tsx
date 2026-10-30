@@ -1,18 +1,33 @@
 // Full-page screen a hosted workspace sees on a locked page before it has a
-// plan: the auth screen's sky, one floating card, and the three ways forward.
+// plan: the auth screen's sky, one floating card, what is already included
+// and the plan that unlocks the feature. Self-hosting is a footnote: it is
+// one way to run the product, not the reason to be here.
 
 import React from "react";
-import { Link } from "react-router-dom";
+import { Link } from "@tanstack/react-router";
 import { motion } from "framer-motion";
-import { ArrowRightIcon, CheckIcon, CloudIcon, InboxIcon, ServerIcon, SparklesIcon } from "lucide-react";
+import { ArrowRightIcon, CheckIcon, CloudIcon, InboxIcon, SparklesIcon } from "lucide-react";
 import { getPlan } from "@/lib/plans";
 import { useAppStore } from "@/stores";
+import { useUpgradeDialog } from "@/hooks/context/upgrade";
+import useFeatureAccess from "@/hooks/useFeatureAccess";
 
 const SELF_HOST_DOCS = "https://docs.warmbly.com/development/deployment-guide/";
 
 export default function SubscriptionLockedScreen({ feature }: { feature: string }) {
     const isOwner = useAppStore((s) => s.currentOrganization?.role === "owner");
+    const upgradeDialog = useUpgradeDialog();
+    // The Warmup plan pays for warming only, so it meets the same locks.
+    const access = useFeatureAccess();
+    const warmupOnly = access.warmupOnly;
+    const warmupLabel = getPlan(access.plan).label;
     const starter = getPlan("starter");
+    const openPlans = () =>
+        upgradeDialog.open({
+            feature,
+            minPlan: "starter",
+            blurb: "Campaigns, the unified inbox, contacts, CRM, automations and integrations on our infrastructure. Pick a plan and it is live the moment checkout completes.",
+        });
 
     return (
         <div className="relative min-h-full w-full overflow-hidden flex items-center justify-center px-4 py-10">
@@ -33,34 +48,30 @@ export default function SubscriptionLockedScreen({ feature }: { feature: string 
             >
                 <div className="px-7 pt-8 pb-6 md:px-10 md:pt-10 text-center">
                     <span className="inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full bg-sky-50 text-sky-700 text-[11px] font-medium">
-                        <SparklesIcon className="w-3 h-3" /> Free workspace
+                        <SparklesIcon className="w-3 h-3" /> {warmupOnly ? `${warmupLabel} plan` : "Free workspace"}
                     </span>
                     <h1 className="mt-4 text-[26px] md:text-[34px] font-semibold tracking-[-0.03em] leading-[1.08] text-slate-900">
                         {feature} unlocks with a plan.
                     </h1>
                     <p className="mt-3 text-[14px] text-slate-500 leading-relaxed max-w-xl mx-auto">
-                        Your workspace is free forever for warming mailboxes. Pick how you want to send: connect mailboxes here, run Warmbly on your own server,
-                        or choose a plan for the full hosted product.
+                        {warmupOnly
+                            ? `Your ${warmupLabel} plan covers warming your mailboxes. Sending needs a plan that includes it, and every one of those keeps the premium pool.`
+                            : "Your workspace is free forever for warming mailboxes. Pick a plan when you are ready to send from it."}
                     </p>
                 </div>
 
-                <div className="grid md:grid-cols-3 gap-px bg-slate-200/70 border-y border-slate-200/70">
+                <div className="grid md:grid-cols-2 gap-px bg-slate-200/70 border-y border-slate-200/70">
                     <Path
                         icon={InboxIcon}
                         eyebrow="Included"
-                        title="Warm up to 10 mailboxes"
-                        body="Connect mailboxes and they warm in the Warmbly pool at no cost, with replies and spam rescue handled for you."
+                        title={warmupOnly ? "Every mailbox in the premium pool" : "Warm up to 10 mailboxes"}
+                        body={
+                            warmupOnly
+                                ? "Connect as many mailboxes as you like and they warm in the premium pool, with replies and spam rescue handled for you."
+                                : "Connect mailboxes and they warm in the Warmbly pool at no cost, with replies and spam rescue handled for you."
+                        }
                         cta="Go to mailboxes"
                         to="/app/emails"
-                    />
-                    <Path
-                        icon={ServerIcon}
-                        eyebrow="Free"
-                        title="Self-host Warmbly"
-                        body="Run the whole platform on your server, unlimited, then link the instance so this workspace warms its mailboxes."
-                        cta="Self-host guide"
-                        href={SELF_HOST_DOCS}
-                        secondary={{ label: "Linked instances", to: "/app/settings/warmbly-cloud" }}
                     />
                     <Path
                         icon={CloudIcon}
@@ -69,13 +80,19 @@ export default function SubscriptionLockedScreen({ feature }: { feature: string 
                         body="Campaigns, the unified inbox, contacts, CRM, automations and integrations on our infrastructure."
                         bullets={starter.bullets}
                         cta={isOwner ? "Choose a plan" : "See plans"}
-                        to="/app/settings/billing"
+                        onClick={openPlans}
                         primary
                     />
                 </div>
 
                 <div className="px-7 py-4 md:px-10 flex flex-wrap items-center justify-between gap-2 text-[12px] text-slate-500">
-                    <span>Settings, billing and your mailboxes stay open on the free workspace.</span>
+                    <span>
+                        Prefer your own server?{" "}
+                        <a href={SELF_HOST_DOCS} target="_blank" rel="noreferrer" className="font-medium text-slate-700 hover:text-slate-900">
+                            Self-host for free
+                        </a>{" "}
+                        and link it here to warm its mailboxes.
+                    </span>
                     {!isOwner && <span>Only the workspace owner can choose a plan.</span>}
                 </div>
             </motion.div>
@@ -92,6 +109,7 @@ function Path({
     cta,
     to,
     href,
+    onClick,
     secondary,
     primary = false,
 }: {
@@ -103,6 +121,8 @@ function Path({
     cta: string;
     to?: string;
     href?: string;
+    /** Opens something in place (the upgrade dialog) instead of navigating. */
+    onClick?: () => void;
     secondary?: { label: string; to: string };
     primary?: boolean;
 }) {
@@ -128,7 +148,11 @@ function Path({
                 </ul>
             )}
             <div className="mt-auto pt-5 flex flex-wrap items-center gap-2">
-                {href ? (
+                {onClick ? (
+                    <button type="button" onClick={onClick} className={btn}>
+                        {cta} <ArrowRightIcon className="w-3.5 h-3.5" />
+                    </button>
+                ) : href ? (
                     <a href={href} target="_blank" rel="noreferrer" className={btn}>
                         {cta} <ArrowRightIcon className="w-3.5 h-3.5" />
                     </a>

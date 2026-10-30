@@ -27,10 +27,15 @@ type Form struct {
 	Design         FormDesign  `json:"design"`
 	SuccessMessage string      `json:"success_message"`
 	RedirectURL    string      `json:"redirect_url"`
-	CampaignID     *uuid.UUID  `json:"campaign_id,omitempty"`
-	CategoryIDs    []uuid.UUID `json:"category_ids"`
-	AllowedDomains []string    `json:"allowed_domains"`
-	CaptchaEnabled bool        `json:"captcha_enabled"`
+	// RedirectURLActive is false when RedirectURL is not on one of the workspace's own domains, so visitors see SuccessMessage instead.
+	RedirectURLActive *bool       `json:"redirect_url_active,omitempty"`
+	CampaignID        *uuid.UUID  `json:"campaign_id,omitempty"`
+	CategoryIDs       []uuid.UUID `json:"category_ids"`
+	AllowedDomains    []string    `json:"allowed_domains"`
+	CaptchaEnabled    bool        `json:"captcha_enabled"`
+	// TriageEnabled classifies each submission through TypeSafe; junk is kept
+	// but creates no contact and joins no campaign.
+	TriageEnabled bool `json:"triage_enabled"`
 	// LogoURL, CoverURL and BackgroundURL are uploaded brand assets (public
 	// object URLs).
 	LogoURL       string `json:"logo_url"`
@@ -215,7 +220,18 @@ type FormWrite struct {
 	CategoryIDs    *[]uuid.UUID `json:"category_ids,omitempty"`
 	AllowedDomains *[]string    `json:"allowed_domains,omitempty"`
 	CaptchaEnabled *bool        `json:"captcha_enabled,omitempty"`
+	TriageEnabled  *bool        `json:"triage_enabled,omitempty"`
 }
+
+// Form triage verdicts, as stored on form_submissions.triage. Empty means the
+// submission was not triaged.
+const (
+	FormTriageBuyer     = "buyer"
+	FormTriageVendor    = "vendor"
+	FormTriageJobSeeker = "job_seeker"
+	FormTriageOther     = "other"
+	FormTriageJunk      = "junk"
+)
 
 // FormSubmission is one public submit, kept verbatim. Data is keyed by field
 // id; checkbox groups store a string slice, everything else a string.
@@ -229,7 +245,11 @@ type FormSubmission struct {
 	CampaignID *uuid.UUID     `json:"campaign_id,omitempty"`
 	Data       map[string]any `json:"data"`
 	SourceURL  string         `json:"source_url"`
-	CreatedAt  time.Time      `json:"created_at"`
+	// Triage is the FormTriage* verdict, empty when the form did not triage
+	// or the call did not complete; TriageConfidence is the model's own.
+	Triage           string    `json:"triage"`
+	TriageConfidence float64   `json:"triage_confidence"`
+	CreatedAt        time.Time `json:"created_at"`
 
 	// Contact and campaign summaries for the submissions table, populated by
 	// reads.
@@ -499,7 +519,7 @@ func ValidateFormRedirectURL(raw string) (string, *errx.Error) {
 		return "", nil
 	}
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 		return "", errx.New(errx.BadRequest, "redirect URL must be an absolute http(s) URL")
 	}
 	if len(raw) > 2048 {

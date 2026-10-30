@@ -11,6 +11,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/instancecheck"
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/version"
 )
 
 // errChecksFailed is how `make doctor` fails a script. The findings are already
@@ -41,6 +42,9 @@ type instanceStatus struct {
 
 	Checks  []instancecheck.Finding `json:"checks"`
 	Summary instancecheck.Summary   `json:"summary"`
+
+	Version string `json:"version"`
+	Commit  string `json:"commit,omitempty"`
 }
 
 func runStatus(ctx context.Context, args []string) error {
@@ -92,7 +96,7 @@ func collectStatus(ctx context.Context, c *conn) (*instanceStatus, error) {
 	}
 
 	admins := []string{}
-	result, aerr := c.admins.ListAdmins(ctx, nil, 100)
+	result, aerr := c.admins.ListAdmins(ctx, 0, 100)
 	if aerr != nil {
 		return nil, fmt.Errorf("listing platform admins: %w", aerr)
 	}
@@ -120,6 +124,9 @@ func collectStatus(ctx context.Context, c *conn) (*instanceStatus, error) {
 
 		AppURL:       config.AppBaseURL(),
 		AppURLSource: appURLSource(),
+
+		Version: version.String(),
+		Commit:  version.ShortCommit(),
 	}
 	state.NextSteps = nextSteps(state)
 	state.Checks, state.Summary = runChecks(ctx, c)
@@ -133,7 +140,13 @@ func printStatus(s *instanceStatus) {
 	}
 	mail := fmt.Sprintf("%s (%s; %s)", s.MailTransport, mailEffect(s.MailTransport, s.MailDelivers), s.MailTransportSource)
 
+	build := s.Version
+	if s.Commit != "" {
+		build += " (" + s.Commit + ")"
+	}
+
 	fmt.Println("Instance")
+	fmt.Printf("  Version           %s\n", build)
 	fmt.Printf("  Accounts          %d\n", s.Accounts)
 	fmt.Printf("  Claimed           %s\n", claimed)
 	fmt.Printf("  Platform admins   %d\n", s.AdminCount)
@@ -191,7 +204,10 @@ func nextSteps(s *instanceStatus) []string {
 		steps = append(steps, "Registration is closed (DISABLE_REGISTRATION=true), so the signup form refuses everyone, invitation or not. The commands above still work.")
 	}
 	if !s.MailDelivers {
-		steps = append(steps, "Mail does not leave this instance, so invitations and reset emails are printed in the backend log instead of being delivered.")
+		steps = append(steps,
+			"Mail does not leave this instance, so platform email is printed in the backend log instead of being delivered.",
+			"Login codes appear there in full. Outside APP_ENV=dev the log removes link tokens, so copy an invitation link from its row under Settings > Members > Pending invitations, and reset a password with the command above.",
+		)
 	}
 	return steps
 }

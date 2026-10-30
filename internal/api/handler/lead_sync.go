@@ -80,7 +80,7 @@ func (h *Handler) GetLeadSyncSpreadsheet(c *gin.Context) {
 	}
 	var p leadSyncSpreadsheetPayload
 	if err := c.ShouldBindJSON(&p); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid payload"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 	connID, err := uuid.Parse(strings.TrimSpace(p.ConnectionID))
@@ -116,7 +116,7 @@ func (h *Handler) PreviewLeadSync(c *gin.Context) {
 	}
 	var p leadSyncPreviewPayload
 	if err := c.ShouldBindJSON(&p); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid payload"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 	connID, err := uuid.Parse(strings.TrimSpace(p.ConnectionID))
@@ -133,7 +133,7 @@ func (h *Handler) PreviewLeadSync(c *gin.Context) {
 }
 
 // ListLeadSyncSources lists this org's saved sources, optionally filtered to a
-// campaign via ?campaign_id=.
+// campaign via ?campaign_id= or to a segment via ?segment_id=.
 func (h *Handler) ListLeadSyncSources(c *gin.Context) {
 	orgID, ok := requireOrgID(c)
 	if !ok {
@@ -148,7 +148,16 @@ func (h *Handler) ListLeadSyncSources(c *gin.Context) {
 		}
 		campaignID = &id
 	}
-	sources, err := h.LeadSyncService.List(c.Request.Context(), orgID, campaignID)
+	var segmentID *uuid.UUID
+	if raw := strings.TrimSpace(c.Query("segment_id")); raw != "" {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			errx.JSON(c, errx.New(errx.BadRequest, "invalid segment_id"))
+			return
+		}
+		segmentID = &id
+	}
+	sources, err := h.LeadSyncService.List(c.Request.Context(), orgID, campaignID, segmentID)
 	if err != nil {
 		errx.JSON(c, errx.New(errx.Internal, "failed to list sync sources"))
 		return
@@ -167,7 +176,7 @@ func (h *Handler) CreateLeadSyncSource(c *gin.Context) {
 	}
 	var in models.CreateLeadSyncSource
 	if err := c.ShouldBindJSON(&in); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid payload"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 	src, xerr := h.LeadSyncService.Create(c.Request.Context(), orgID, userID, &in)
@@ -211,7 +220,7 @@ func (h *Handler) UpdateLeadSyncSource(c *gin.Context) {
 	}
 	var in models.UpdateLeadSyncSource
 	if berr := c.ShouldBindJSON(&in); berr != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid payload"))
+		errx.JSON(c, errx.InvalidBody(berr))
 		return
 	}
 	src, xerr := h.LeadSyncService.Update(c.Request.Context(), orgID, id, &in)

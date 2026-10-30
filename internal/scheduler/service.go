@@ -53,6 +53,27 @@ type schedulerService struct {
 	// lifecycleRepo reads whether a mailbox is in cold rotation at all.
 	// Optional/nil-safe: without it every mailbox is treated as active.
 	lifecycleRepo repository.SendLifecycleRepository
+	// workers says whether a mailbox's worker is heartbeating. Optional/
+	// nil-safe: without it every mailbox is taken to be reachable.
+	workers WorkerLiveness
+}
+
+// WorkerLiveness reports whether a worker is heartbeating, the check the send
+// path makes before handing a worker a message.
+type WorkerLiveness interface {
+	IsWorkerLive(ctx context.Context, workerID uuid.UUID) (bool, error)
+}
+
+// WireWorkerLiveness attaches the worker liveness check, so a mailbox whose
+// worker cannot take a send is passed over instead of picked.
+func (s *schedulerService) WireWorkerLiveness(w WorkerLiveness) {
+	s.workers = w
+}
+
+// WorkerLivenessAware is the optional capability the caller uses to attach
+// worker liveness after construction.
+type WorkerLivenessAware interface {
+	WireWorkerLiveness(w WorkerLiveness)
 }
 
 // WireLifecycle attaches the cold-sending lifecycle.
@@ -267,8 +288,7 @@ func calculateFirstSlotTomorrow(timezone string) time.Time {
 	now := time.Now().In(loc)
 
 	// Tomorrow at 8am + random jitter (0-60 minutes)
-	tomorrow := now.Add(24 * time.Hour)
-	firstSlot := time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), 8, 0, 0, 0, loc)
+	firstSlot := time.Date(now.Year(), now.Month(), now.Day()+1, 8, 0, 0, 0, loc)
 
 	// Add random jitter
 	jitter := randomJitter(0, 60)

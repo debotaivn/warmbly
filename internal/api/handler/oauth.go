@@ -2,20 +2,20 @@ package handler
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 
 	"github.com/warmbly/warmbly/internal/api/middleware"
 	"github.com/warmbly/warmbly/internal/app/oauth"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/displayname"
 	"github.com/warmbly/warmbly/internal/utils/paging"
 )
 
@@ -27,7 +27,9 @@ func respondOAuthError(c *gin.Context, err error) {
 		c.JSON(oe.HTTPStatus, oe)
 		return
 	}
-	c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": err.Error()})
+	// Anything else is a server fault: the detail goes to the log, never to the client.
+	log.Error().Str("request_id", c.GetString("request_id")).Str("path", c.FullPath()).Err(err).Msg("oauth endpoint failed")
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error", "error_description": "Something went wrong.", "request_id": c.GetString("request_id")})
 }
 
 // --- Application management (JWT + org gate) --------------------------------
@@ -43,7 +45,8 @@ func (h *Handler) ListOAuthApplications(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.Internal, "lookup failed"))
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"applications": apps})
+	userID, _ := middleware.GetUserUUID(c)
+	c.JSON(http.StatusOK, gin.H{"applications": apps, "developer_access": h.OAuthService.DeveloperAccess(c.Request.Context(), *orgID, userID)})
 }
 
 func (h *Handler) CreateOAuthApplication(c *gin.Context) {
@@ -59,14 +62,19 @@ func (h *Handler) CreateOAuthApplication(c *gin.Context) {
 	}
 	var w models.OAuthApplicationWrite
 	if err := c.ShouldBindJSON(&w); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	if xerr := checkAppLogo(c.Request.Context(), h.Storage, *orgID, w.LogoURL, ""); xerr != nil {
+		errx.JSON(c, xerr)
 		return
 	}
 	app, err := h.OAuthService.RegisterApplication(c.Request.Context(), *orgID, userID, w)
 	if err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, err.Error()))
+		errx.JSON(c, oauthAppWriteError(err))
 		return
 	}
+	h.auditOrg(c, models.AuditActionCreate, models.AuditEntityOAuthApplication, &app.ID, nil, map[string]string{"name": app.Name})
 	c.JSON(http.StatusCreated, app)
 }
 
@@ -106,14 +114,32 @@ func (h *Handler) UpdateOAuthApplication(c *gin.Context) {
 	}
 	var w models.OAuthApplicationWrite
 	if err := c.ShouldBindJSON(&w); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
-	app, uerr := h.OAuthService.UpdateApplication(c.Request.Context(), *orgID, id, w)
+	current, gerr := h.OAuthService.GetApplication(c.Request.Context(), *orgID, id)
+	if gerr != nil {
+		errx.JSON(c, errx.New(errx.Internal, "lookup failed"))
+		return
+	}
+	if current == nil {
+		errx.JSON(c, errx.New(errx.NotFound, "application not found"))
+		return
+	}
+	if xerr := checkAppLogo(c.Request.Context(), h.Storage, *orgID, w.LogoURL, current.LogoURL); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	userID, _ := middleware.GetUserUUID(c)
+	app, uerr := h.OAuthService.UpdateApplication(c.Request.Context(), *orgID, userID, id, w)
 	if uerr != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, uerr.Error()))
+		errx.JSON(c, oauthAppWriteError(uerr))
 		return
 	}
+	if app.LogoURL != current.LogoURL {
+		h.deleteAppLogo(c.Request.Context(), *orgID, id, current.LogoURL, "")
+	}
+	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityOAuthApplication, &id, nil, nil)
 	c.JSON(http.StatusOK, app)
 }
 
@@ -132,6 +158,7 @@ func (h *Handler) DeleteOAuthApplication(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.Internal, "delete failed"))
 		return
 	}
+	h.auditOrg(c, models.AuditActionDelete, models.AuditEntityOAuthApplication, &id, nil, nil)
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
 }
 
@@ -148,9 +175,10 @@ func (h *Handler) RotateOAuthApplicationSecret(c *gin.Context) {
 	}
 	secret, rerr := h.OAuthService.RotateSecret(c.Request.Context(), *orgID, id)
 	if rerr != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, rerr.Error()))
+		errx.JSON(c, oauthAppWriteError(rerr))
 		return
 	}
+	h.auditOrg(c, models.AuditActionRotate, models.AuditEntityOAuthApplication, &id, nil, map[string]string{"secret": "client"})
 	c.JSON(http.StatusOK, gin.H{"client_secret": secret})
 }
 
@@ -171,7 +199,7 @@ func (h *Handler) GetOAuthAppWebhookSecret(c *gin.Context) {
 	}
 	secret, rerr := h.OAuthService.WebhookSecret(c.Request.Context(), *orgID, id)
 	if rerr != nil {
-		errx.JSON(c, errx.New(errx.NotFound, rerr.Error()))
+		errx.JSON(c, oauthAppWriteError(rerr))
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"webhook_secret": secret})
@@ -194,9 +222,10 @@ func (h *Handler) RotateOAuthAppWebhookSecret(c *gin.Context) {
 	}
 	secret, rerr := h.OAuthService.RotateWebhookSecret(c.Request.Context(), *orgID, id)
 	if rerr != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, rerr.Error()))
+		errx.JSON(c, oauthAppWriteError(rerr))
 		return
 	}
+	h.auditOrg(c, models.AuditActionRotate, models.AuditEntityOAuthApplication, &id, nil, map[string]string{"secret": "webhook"})
 	c.JSON(http.StatusOK, gin.H{"webhook_secret": secret})
 }
 
@@ -285,12 +314,26 @@ func (h *Handler) UploadOAuthAppLogo(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
 		return
 	}
-	body, mime, ext, xerr := readAvatarUpload(c)
+	userID, _ := middleware.GetUserUUID(c)
+	if err := h.OAuthService.CheckDeveloperAccess(c.Request.Context(), *orgID, userID); err != nil {
+		errx.JSON(c, oauthAppWriteError(err))
+		return
+	}
+	raw, _, _, xerr := readImageUpload(c, appLogoLimits)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
 	}
-	key := fmt.Sprintf("oauth-app-logos/%s-%d%s", orgID.String(), time.Now().Unix(), ext)
+	body, mime, ext, xerr := reencodeLogo(raw)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	key, err := appLogoKey(*orgID, ext)
+	if err != nil {
+		errx.JSON(c, errx.InternalError())
+		return
+	}
 	url, xerr := putPublicObject(c.Request.Context(), h.Storage, key, body, mime)
 	if xerr != nil {
 		errx.JSON(c, xerr)
@@ -316,11 +359,31 @@ func authorizeRequestFrom(get func(string) string) oauth.AuthorizeRequest {
 // OAuthAuthorizeDetails returns the consent info the dashboard renders before
 // asking the user to approve. Read from query params.
 func (h *Handler) OAuthAuthorizeDetails(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
+	member, xerr := h.callerMember(c)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
 	req := authorizeRequestFrom(c.Query)
-	info, err := h.OAuthService.AuthorizeDetails(c.Request.Context(), req)
+	info, err := h.OAuthService.AuthorizeDetails(c.Request.Context(), models.APIPermissionsFor(member), req)
 	if err != nil {
 		respondOAuthError(c, err)
 		return
+	}
+	// Rows written before the logo rule existed are re-checked on the way out.
+	if !hostedAppLogo(h.Storage, info.LogoURL) {
+		info.LogoURL = ""
+	}
+	info.OrganizationName = "Your workspace"
+	if org, oerr := h.OrganizationService.Get(c.Request.Context(), *orgID); oerr == nil && org != nil {
+		if name := displayname.Displayable(org.Name); name != "" {
+			info.OrganizationName = name
+		}
 	}
 	c.JSON(http.StatusOK, info)
 }
@@ -348,7 +411,7 @@ func (h *Handler) OAuthAuthorize(c *gin.Context) {
 		CodeChallengeMethod string `json:"code_challenge_method"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 	req := oauth.AuthorizeRequest{
@@ -360,7 +423,12 @@ func (h *Handler) OAuthAuthorize(c *gin.Context) {
 		CodeChallenge:       body.CodeChallenge,
 		CodeChallengeMethod: body.CodeChallengeMethod,
 	}
-	redirect, err := h.OAuthService.IssueAuthorizationCode(c.Request.Context(), *orgID, userID, req)
+	member, xerr := h.callerMember(c)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	redirect, err := h.OAuthService.IssueAuthorizationCode(c.Request.Context(), *orgID, userID, models.APIPermissionsFor(member), req)
 	if err != nil {
 		respondOAuthError(c, err)
 		return
@@ -379,8 +447,26 @@ func clientCredentials(c *gin.Context) (string, string) {
 	return c.PostForm("client_id"), c.PostForm("client_secret")
 }
 
+// refuseRepeatedParams answers a form that sends any parameter twice (RFC 6749 section 3.2).
+func refuseRepeatedParams(c *gin.Context) bool {
+	if err := c.Request.ParseForm(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "The request body could not be read as a form."})
+		return true
+	}
+	for _, values := range c.Request.PostForm {
+		if len(values) > 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "error_description": "Each parameter may be included only once."})
+			return true
+		}
+	}
+	return false
+}
+
 // OAuthToken is the token endpoint. It dispatches on grant_type.
 func (h *Handler) OAuthToken(c *gin.Context) {
+	if refuseRepeatedParams(c) {
+		return
+	}
 	grantType := c.PostForm("grant_type")
 	clientID, clientSecret := clientCredentials(c)
 	switch grantType {
@@ -411,6 +497,9 @@ func (h *Handler) OAuthToken(c *gin.Context) {
 // OAuthRevoke is the token-revocation endpoint (RFC 7009). It succeeds even for
 // an unknown token, so the response never confirms a token's existence.
 func (h *Handler) OAuthRevoke(c *gin.Context) {
+	if refuseRepeatedParams(c) {
+		return
+	}
 	clientID, clientSecret := clientCredentials(c)
 	token := c.PostForm("token")
 	if err := h.OAuthService.RevokeToken(c.Request.Context(), clientID, clientSecret, token); err != nil {
@@ -461,6 +550,51 @@ func (h *Handler) RevokeAuthorizedApp(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.Internal, "revoke failed"))
 		return
 	}
+	h.auditOrg(c, models.AuditActionRevoke, models.AuditEntityOAuthAuthorization, &appID, nil, map[string]string{"user_id": userID.String()})
+	c.JSON(http.StatusOK, gin.H{"revoked": true})
+}
+
+// ListWorkspaceAuthorizations lists every member's live app authorizations in the workspace.
+//
+// GET /oauth/workspace-authorizations
+func (h *Handler) ListWorkspaceAuthorizations(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
+	auths, err := h.OAuthService.ListWorkspaceAuthorizations(c.Request.Context(), *orgID)
+	if err != nil {
+		errx.JSON(c, errx.New(errx.Internal, err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"authorizations": auths})
+}
+
+// RevokeWorkspaceAuthorization ends one member's authorization of an app in the workspace.
+//
+// DELETE /oauth/workspace-authorizations/:id/members/:userId
+func (h *Handler) RevokeWorkspaceAuthorization(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
+	appID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "invalid id"))
+		return
+	}
+	memberID, err := uuid.Parse(c.Param("userId"))
+	if err != nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "invalid user id"))
+		return
+	}
+	if rerr := h.OAuthService.RevokeAuthorization(c.Request.Context(), *orgID, memberID, appID); rerr != nil {
+		errx.JSON(c, errx.New(errx.Internal, rerr.Error()))
+		return
+	}
+	h.auditOrg(c, models.AuditActionRevoke, models.AuditEntityOAuthAuthorization, &appID, nil, map[string]string{"user_id": memberID.String()})
 	c.JSON(http.StatusOK, gin.H{"revoked": true})
 }
 
@@ -538,4 +672,30 @@ func (h *Handler) OAuthProtectedResourceMetadata(c *gin.Context) {
 		"bearer_methods_supported": []string{"header"},
 		"resource_documentation":   "https://docs.warmbly.com/api/mcp/",
 	})
+}
+
+// oauthAppWriteError maps a register or update refusal to its response: a
+// naming rule keeps its own code, a block and a suspension have theirs, and
+// any other validation message is a plain 400.
+func oauthAppWriteError(err error) *errx.Error {
+	var xe *errx.Error
+	if errors.As(err, &xe) {
+		return xe
+	}
+	var blocked *oauth.DeveloperBlockedError
+	if errors.As(err, &blocked) {
+		return errx.NewWithIdentifier(errx.Forbidden, "developer_access_blocked", blocked.Error())
+	}
+	if errors.Is(err, oauth.ErrAppSuspended) {
+		return errx.NewWithIdentifier(errx.Conflict, "app_suspended", err.Error())
+	}
+	if errors.Is(err, oauth.ErrAppNotFound) {
+		return errx.New(errx.NotFound, err.Error())
+	}
+	var invalid *oauth.ValidationError
+	if errors.As(err, &invalid) {
+		return errx.New(errx.BadRequest, invalid.Error())
+	}
+	// Logged against the request id; the caller gets the fixed sentence.
+	return errx.New(errx.Internal, err.Error())
 }

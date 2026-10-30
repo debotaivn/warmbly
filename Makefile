@@ -15,6 +15,21 @@ export PATH := $(GO_BIN):$(PATH)
 # fresh clones without any environment setup.
 COMPOSE := docker compose -p warmbly
 
+# Build identity stamped into the Go images (shown in the admin panel's top bar
+# and read by the update check). Empty outside a git checkout, which the
+# binaries report as "dev".
+export WARMBLY_BUILD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
+export WARMBLY_BUILD_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
+export WARMBLY_BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# The updater sidecar (one-click "Update and restart" from the admin panel)
+# holds the docker socket, so it lives behind a compose profile. `make up`
+# turns it on; UPDATER=false leaves it off.
+UPDATER ?= true
+ifeq ($(UPDATER),true)
+UP_PROFILES := --profile updater
+endif
+
 GOLANGCI_LINT_VERSION ?= v1.64.8
 PROTOC_GEN_GO_VERSION ?= v1.36.11
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
@@ -22,11 +37,12 @@ PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
 PROTO_DIR := internal/tasks/proto
 PROTO_GEN_FILES := $(PROTO_DIR)/tasks.pb.go
 
-.PHONY: poollink-dev poollink-dev-down poollink-dev-reset setup-tools fmt lint check-migrations proto check-proto \
-        up claim doctor cli seed-demo seed seed-plan sandbox sandbox-seed sandbox-simulate reset logs status stop down test-seed \
+.PHONY: poollink-dev poollink-dev-down poollink-dev-reset setup-tools fmt schemas lint check-migrations join-check split-cloud-check pages-check kafka-check proto check-proto \
+        up upgrade claim doctor cli seed-demo seed seed-plan sandbox sandbox-seed sandbox-simulate reset logs status stop down test-seed \
         restart restart-go restart-all infra infra-down app app-down app-logs \
         backend forms forms-web consumer worker run dev tracking realtime web \
-        admin site docs grant-admin revoke-admin gen-key db-reset db-wipe migrate
+        admin site docs grant-admin revoke-admin gen-key installer-sha installer-check installer-demo \
+        db-reset db-wipe migrate warmbly warmbly-dist cli-sha cli-check images-check casa-evidence
 
 setup-tools:
 	@echo "Installing required Go tools into $(GO_BIN)"
@@ -34,12 +50,44 @@ setup-tools:
 	GOBIN=$(GO_BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
 	GOBIN=$(GO_BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 
+# Build the `warmbly` CLI into ./bin, stamped with this checkout's version so
+# `warmbly version` reports something meaningful. This is the customer CLI; the
+# operator one (warmblyctl) ships in the backend image and runs there.
+warmbly:
+	@mkdir -p bin
+	go build -ldflags="-s -w \
+	  -X github.com/warmbly/warmbly/internal/version.Version=$(WARMBLY_BUILD_VERSION) \
+	  -X github.com/warmbly/warmbly/internal/version.Commit=$(WARMBLY_BUILD_COMMIT) \
+	  -X github.com/warmbly/warmbly/internal/version.BuiltAt=$(WARMBLY_BUILD_TIME)" \
+	  -o bin/warmbly ./cmd/cli
+	@echo "built bin/warmbly ($(WARMBLY_BUILD_VERSION))"
+	@echo "put it on your PATH: sudo install -m 0755 bin/warmbly /usr/local/bin/warmbly"
+
+# Everything a release publishes for the CLI: an archive per platform, the
+# checksums, and the Homebrew and Scoop manifests. Same script the release
+# workflow runs, so an artifact can be reproduced locally.
+warmbly-dist:
+	./scripts/build-cli.sh dist
+
+# The published installer at https://warmbly.com/cli.sh. Regenerate the
+# checksum after any edit to it; CI fails when the two disagree.
+cli-sha:
+	@cd site/public && sha256sum cli.sh > cli.sh.sha256 && cat cli.sh.sha256
+
+cli-check:
+	@./scripts/check-cli-installer.sh
+
 # Format all Go code. CI's golangci-lint enforces gofmt, so this is the
 # formatting signal to run before committing, not `go build`.
 fmt:
 	gofmt -w ./cmd ./internal
 
-lint: check-migrations
+# Record the bus schemas the next release publishes. CI refuses a change the
+# registry would refuse, and a compatible one until it is recorded here.
+schemas:
+	go test ./internal/app/eventschemas -run TestPublishedSchemasStayCompatible -update
+
+lint: check-migrations join-check split-cloud-check pages-check check-dockerfiles
 	./scripts/check-forms-mirror.sh
 	$(GO_BIN)/golangci-lint run --timeout=5m
 
@@ -48,6 +96,32 @@ lint: check-migrations
 # documented ship signal covers it.
 check-migrations:
 	@./scripts/check-migrations.sh
+
+# The split-deployment bus bundle. Starts the real compose file against a
+# self-signed certificate and asserts both services reach healthy, because the
+# defects it has had were invisible in the file and obvious on first start.
+# Skips the Docker half when there is no daemon, so it stays runnable anywhere.
+split-cloud-check:
+	@./scripts/check-split-cloud.sh
+
+# The Kafka backend is behind a build tag, so nothing else compiles it.
+# Build, not vet: vet does not link, and this backend links librdkafka.
+kafka-check:
+	go build -tags kafka ./...
+
+# web and admin on a static host. They read their configuration from a
+# config.js the container entrypoint renders at start, and a static host has no
+# container start, so the same script renders it at build time. This runs both
+# entrypoints and checks the result is what the app expects.
+pages-check:
+	@./scripts/check-pages-build.sh
+
+# A COPY naming a path no longer in the repo builds green everywhere until it
+# lands: nothing in `make lint` or the CI workflow builds an image, and
+# build-push.yml runs only on push to main. Runs in a second; part of `make
+# lint` for the same reason check-migrations is.
+check-dockerfiles:
+	@./scripts/check-dockerfiles.sh
 
 proto:
 	@command -v protoc >/dev/null || (echo "protoc not found in PATH"; exit 1)
@@ -79,7 +153,7 @@ ADMIN_URL = http://$(WEB_HOST):5174
 # everything detached. Dashboard :5173, admin :5174, API :8080.
 up:
 	@command -v docker >/dev/null || { echo "docker is required: https://docs.docker.com/get-docker/"; exit 1; }
-	$(COMPOSE) up -d --build
+	$(COMPOSE) $(UP_PROFILES) up -d --build
 	@echo ""
 	@echo "Warmbly is starting. The first run builds the images once."
 	@echo ""
@@ -87,6 +161,12 @@ up:
 	@echo "  Dashboard: $(DASHBOARD_URL)     Admin: $(ADMIN_URL)"
 	@echo "  Health:    make doctor               Logs:  make logs"
 	@echo "  Demo data: make seed-demo            Guide: https://docs.warmbly.com/development/first-run/"
+
+# The by-hand equivalent of "Update and restart" in the admin panel: move the
+# checkout forward, rebuild, recreate what changed. Migrations apply on boot.
+upgrade:
+	git pull --ff-only
+	@$(MAKE) --no-print-directory up
 
 # Report how to get into this instance, and end on a command that works.
 #
@@ -208,7 +288,7 @@ sandbox:
 	@echo "Login: sandbox@warmbly.test / password123 (org: Sunrise Labs). Ctrl-C stops the app; infra stays up."
 	@echo ""
 	@trap 'kill 0' INT TERM; \
-	$(MAKE) --no-print-directory backend & \
+	$(MAKE) --no-print-directory backend MAILVENDOR_SANDBOX_URL=http://127.0.0.1:18099 & \
 	$(MAKE) --no-print-directory consumer & \
 	$(MAKE) --no-print-directory worker & \
 	$(MAKE) --no-print-directory web & \
@@ -555,9 +635,12 @@ WORKER_DEV_ENV := \
 
 # API server on :8080. Applies the embedded migrations on boot against
 # the docker postgres.
+# The sandbox's mock inbox vendor API; empty keeps the real vendors.
+MAILVENDOR_SANDBOX_URL ?=
 backend:
 	$(GO_DEV_ENV) \
 	$(AI_DEV_ENV) \
+	MAILVENDOR_SANDBOX_URL=$(MAILVENDOR_SANDBOX_URL) \
 	API_HOST=0.0.0.0:8080 \
 	FORMS_DOMAIN=localhost:$(FORMS_PORT) \
 	GIN_MODE=debug \
@@ -605,6 +688,7 @@ forms-web:
 consumer:
 	$(GO_DEV_ENV) \
 	$(AI_DEV_ENV) \
+	GEODB_PATH=data/GeoLite2-City.mmdb \
 	go run ./cmd/consumer
 
 # Send/sync worker. No Postgres by design. WORKER_ID is an explicit UUID
@@ -617,7 +701,6 @@ consumer:
 worker:
 	$(WORKER_DEV_ENV) \
 	WORKER_ID=10c8f5e4-1c39-5b2a-9c8b-3d2f0a8b1a01 \
-	WORKER_TIER=shared \
 	ENCRYPTED_KEYS_PROVIDER=http \
 	ENCRYPTED_KEYS_BACKEND_URL=http://localhost:8080 \
 	ENCRYPTED_KEYS_WORKER_TOKEN=local-dev-internal-token \
@@ -641,6 +724,46 @@ run:
 # makes every stored mailbox credential unrecoverable).
 gen-key:
 	@openssl rand -base64 32
+
+# The one-command installer, served verbatim at https://warmbly.com/install.sh.
+# The published checksum is what makes "download, verify, read, run" a real
+# alternative to piping into a shell, so it is regenerated with the script and
+# CI fails when the two disagree.
+installer-sha:
+	@cd site/public && sha256sum install.sh > install.sh.sha256 && cat install.sh.sha256
+
+# Everything CI runs against the installer: POSIX parse, shellcheck, --help,
+# --print-env, a compose file per answer shape, and the checksum.
+# Generate the CASA dependency-scan artifacts. Read-only against the tree, and
+# it writes outside this repository on purpose: CASA_EVIDENCE_DIR, defaulting
+# to ~/warmbly-casa-private/casa/artifacts.
+casa-evidence:
+	./scripts/casa-evidence.sh
+
+installer-check:
+	@./scripts/check-installer.sh
+
+# The fleet join script is served verbatim from the backend at GET /join.sh and
+# is what a stranger pipes into a root shell to add a machine. Nothing covered
+# it, and a systemd unit that could never start shipped as a result. Part of
+# `make lint`, like check-migrations.
+join-check:
+	@./scripts/check-join-script.sh
+
+# Every published image has to be pullable by a stranger, and nothing else we
+# run proves it: a package on GHCR is created private, does not inherit the
+# repository's visibility, and no API can change that, so every check that
+# talks to the registry with a token passes while the world sees nothing
+# (#371). This one carries no credentials on purpose. No TAG means the newest
+# release, which is what a fresh install resolves to.
+images-check:
+	@./scripts/check-images-public.sh $(if $(TAG),--tag $(TAG),)
+
+# Walk the installer's wizard without installing anything: the real questions,
+# the real review, and a played pull and start. Writes no file, pulls no image,
+# needs no Docker. This is the "what does it look like" target.
+installer-demo:
+	@sh site/public/install.sh --demo
 
 # ─── one-command dev stack ───────────────────────────────────────────────
 #

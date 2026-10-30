@@ -92,7 +92,7 @@ func (s *service) Get(ctx context.Context, accountID uuid.UUID) (models.SendingB
 	if err != nil {
 		return models.SendingBehavior{}, err
 	}
-	b.Timezone = account.Timezone
+	b.Timezone = account.ClockTimezone()
 	return b, nil
 }
 
@@ -130,7 +130,12 @@ func (s *service) Today(ctx context.Context, accountID uuid.UUID) (*models.Daily
 	plan := r.PlanOn(PlanDateFor(now, r.Loc))
 
 	from, to := s.localDayRange(now, r.Loc)
-	sent := s.sentInRange(ctx, accountID, from, to)
+	// The view reports, so it propagates the read error instead of taking the
+	// schedulers' fail-closed sentinel: "sent today" is a number a human reads.
+	sent, err := s.countSends(ctx, accountID, from, to)
+	if err != nil {
+		return nil, err
+	}
 	remaining := plan.DailyLimit - sent
 	if remaining < 0 {
 		remaining = 0
@@ -227,9 +232,9 @@ func (s *service) Resolve(ctx context.Context, account *models.Email) Resolved {
 		return r
 	}
 
-	b.Timezone = account.Timezone
+	b.Timezone = account.ClockTimezone()
 	r.Behavior = b
-	r.Loc = loadLocation(account.Timezone)
+	r.Loc = loadLocation(account.ClockTimezone())
 	r.Enabled = b.Enabled
 	return r
 }
@@ -251,16 +256,23 @@ func (s *service) ResolveMany(ctx context.Context, accounts []models.Email) map[
 		stored = map[uuid.UUID]models.SendingBehavior{}
 	}
 
+	locations := make(map[string]*time.Location)
 	for _, a := range accounts {
+		zone := a.ClockTimezone()
+		loc, ok := locations[zone]
+		if !ok {
+			loc = loadLocation(zone)
+			locations[zone] = loc
+		}
 		b, ok := stored[a.ID]
 		if !ok {
 			b = models.DefaultSendingBehavior(a.ID)
 		}
-		b.Timezone = a.Timezone
+		b.Timezone = zone
 		out[a.ID] = Resolved{
 			Enabled:   b.Enabled,
 			Behavior:  b,
-			Loc:       loadLocation(a.Timezone),
+			Loc:       loc,
 			accountID: a.ID,
 			svc:       s,
 			ctx:       ctx,
@@ -277,8 +289,15 @@ func (s *service) localDayRange(t time.Time, loc *time.Location) (time.Time, tim
 	return start, start.AddDate(0, 0, 1)
 }
 
+// countSends is the mailbox's real cold sends in a range: completed campaign
+// tasks that dispatched an email. Deferral and pause wake-ups are not sends and
+// pending tasks have not sent yet, so neither spends the day's plan (#469).
+func (s *service) countSends(ctx context.Context, accountID uuid.UUID, from, to time.Time) (int, error) {
+	return s.behaviorRepo.CountSendsBetween(ctx, accountID, "campaign", from, to)
+}
+
 func (s *service) sentInRange(ctx context.Context, accountID uuid.UUID, from, to time.Time) int {
-	n, err := s.behaviorRepo.CountSendsBetween(ctx, accountID, "campaign", from, to)
+	n, err := s.countSends(ctx, accountID, from, to)
 	if err != nil {
 		// Fail closed on the count: an unknown spend is treated as the budget
 		// being fully consumed, which delays a send rather than over-sending

@@ -2,8 +2,11 @@ package jobs
 
 import (
 	"context"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/infrastructure/pubsub"
 	"github.com/warmbly/warmbly/internal/models"
 )
@@ -18,12 +21,23 @@ func (s *JobsService) HandleSyncState(ctx context.Context, e *models.JobEventSyn
 		return nil
 	}
 
-	var prev *models.SyncState
-	if saved, err := s.EmailSyncStateRepository.Get(ctx, e.EmailID); err == nil {
-		prev = saved
+	prev, err := s.EmailSyncStateRepository.Get(ctx, e.EmailID)
+	if err != nil {
+		return err
+	}
+
+	// Persist recovery before state, so a failed proof write remains retryable.
+	if e.State.LastSyncedAt != nil && e.State.Deferred == 0 && e.State.BackfillCursor.GoogleRecovery == nil &&
+		(prev == nil || prev.LastSyncedAt == nil || !models.ValidMailTransportTime(*prev.LastSyncedAt, time.Now()) || e.State.LastSyncedAt.After(*prev.LastSyncedAt)) {
+		if err := s.resolveTransientMailErrors(ctx, e.EmailID, e.State.LastSyncedAt, e.State.TransportGeneration); err != nil {
+			return err
+		}
 	}
 
 	if err := s.EmailSyncStateRepository.Put(ctx, e.UserID, e.EmailID, &e.State); err != nil {
+		if s.dropForDeletedMailbox(ctx, e.UserID, e.EmailID, err) {
+			return nil
+		}
 		CaptureError(e.UserID, e.EmailID, err)
 		return err
 	}
@@ -76,6 +90,44 @@ func (s *JobsService) HandleSyncState(ctx context.Context, e *models.JobEventSyn
 			"Mailbox sync paused by fair use",
 			"New mail for "+account.Email+" is waiting on the sync budget. Replies to your outreach keep syncing; the rest resumes automatically.",
 		)
+	}
+	return nil
+}
+
+// transientMailErrorCodes are the errors a completed sync pass disproves.
+// Anything that needs the user to act (credentials, domain authentication,
+// fair-use deactivation) is deliberately absent: those stay until the person
+// fixes them or reconnects the mailbox.
+var transientMailErrorCodes = []string{
+	string(errx.MailErrorCodeServerUnreachable),
+	string(errx.MailErrorCodeConnectionLost),
+	string(errx.MailErrorCodeNotFound),
+	// A NO/BAD the client has no dedicated error for. It is relayed as a
+	// temporary server error and never deactivates the mailbox, so a pass
+	// that completed afterwards disproves it like any other outage.
+	string(errx.MailErrorCodeImapUnknown),
+	string(errx.MailErrorCodeSendingTooFast),
+	string(errx.MailErrorCodeQuotaExceeded),
+}
+
+func (s *JobsService) resolveTransientMailErrors(ctx context.Context, emailID uuid.UUID, syncedAt *time.Time, generation uuid.UUID) error {
+	if s.EmailAccountErrorRepository == nil {
+		return nil
+	}
+	// Only errors raised before this pass ran. The bus can redeliver an older
+	// event after a newer one, and without the bound a stale success would
+	// clear a failure that happened after it, leaving the mailbox looking
+	// healthy while it was not.
+	if syncedAt == nil || generation == uuid.Nil {
+		return nil
+	}
+	if !models.ValidMailTransportTime(*syncedAt, time.Now()) {
+		return nil
+	}
+	if err := s.EmailAccountErrorRepository.RecordTransportSuccess(ctx, emailID, models.MailTransportSync, *syncedAt, nil, generation); err != nil {
+		log.Warn().Str("error", err.Message).Str("email_id", emailID.String()).
+			Msg("could not clear the mailbox's transient errors after a successful sync")
+		return err
 	}
 	return nil
 }

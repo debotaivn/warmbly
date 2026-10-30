@@ -103,3 +103,91 @@ func TestEmailBlob_NoAttachments(t *testing.T) {
 		t.Errorf("expected no attachments, got %d", len(got.Attachments))
 	}
 }
+
+// The from-name section is trailing and flagged, so a blob written without it
+// decodes as before and one written with it round-trips alongside attachments.
+func TestEmailBlob_FromName(t *testing.T) {
+	out := roundTrip(t, &EmailBlob{
+		PlainText:   []byte("Hi"),
+		Attachments: []Attachment{{S3Key: "k", Filename: "deck.pdf", MimeType: "application/pdf"}},
+		FromName:    "Renée Doe, Jr.",
+	})
+	if out.FromName != "Renée Doe, Jr." {
+		t.Errorf("FromName = %q", out.FromName)
+	}
+	if len(out.Attachments) != 1 || out.Attachments[0].Filename != "deck.pdf" {
+		t.Errorf("attachments did not survive alongside the from name: %+v", out.Attachments)
+	}
+
+	legacy := roundTrip(t, &EmailBlob{PlainText: []byte("Hi")})
+	if legacy.FromName != "" {
+		t.Errorf("blob without a from name decoded one: %q", legacy.FromName)
+	}
+	data, _ := (&EmailBlob{PlainText: []byte("Hi")}).EncodeBinary()
+	if binaryFlags(data)&FlagFromName != 0 {
+		t.Error("empty from name set the flag")
+	}
+}
+
+// The from-email section is trailing too, and sits after the from name, so
+// both orders of "one set, the other not" have to decode.
+func TestEmailBlob_FromEmail(t *testing.T) {
+	out := roundTrip(t, &EmailBlob{
+		PlainText:   []byte("Hi"),
+		Attachments: []Attachment{{S3Key: "k", Filename: "deck.pdf", MimeType: "application/pdf"}},
+		FromName:    "Renée Doe",
+		FromEmail:   "hello@acme.com",
+	})
+	if out.FromEmail != "hello@acme.com" || out.FromName != "Renée Doe" {
+		t.Errorf("identity did not round-trip: name=%q email=%q", out.FromName, out.FromEmail)
+	}
+	if len(out.Attachments) != 1 {
+		t.Errorf("attachments did not survive alongside the identity: %+v", out.Attachments)
+	}
+
+	// A send with an alias but no display name: the decoder must not read the
+	// address into the name section.
+	aliasOnly := roundTrip(t, &EmailBlob{PlainText: []byte("Hi"), FromEmail: "hello@acme.com"})
+	if aliasOnly.FromName != "" || aliasOnly.FromEmail != "hello@acme.com" {
+		t.Errorf("alias-only blob decoded wrong: name=%q email=%q", aliasOnly.FromName, aliasOnly.FromEmail)
+	}
+
+	nameOnly := roundTrip(t, &EmailBlob{PlainText: []byte("Hi"), FromName: "Jane"})
+	if nameOnly.FromEmail != "" {
+		t.Errorf("blob without an alias decoded one: %q", nameOnly.FromEmail)
+	}
+
+	data, _ := (&EmailBlob{PlainText: []byte("Hi")}).EncodeBinary()
+	if binaryFlags(data)&FlagFromEmail != 0 {
+		t.Error("empty from email set the flag")
+	}
+}
+
+// Reply-To is the last section, so it has to decode after every other one
+// and alone.
+func TestEmailBlob_ReplyTo(t *testing.T) {
+	out := roundTrip(t, &EmailBlob{
+		PlainText:   []byte("Hi"),
+		Attachments: []Attachment{{S3Key: "k", Filename: "deck.pdf", MimeType: "application/pdf"}},
+		FromName:    "Renée Doe",
+		FromEmail:   "hello@acme.com",
+		ReplyTo:     "replies@acme.com",
+	})
+	if out.ReplyTo != "replies@acme.com" || out.FromEmail != "hello@acme.com" || out.FromName != "Renée Doe" {
+		t.Errorf("reply-to did not round-trip beside the identity: %+v", out)
+	}
+
+	alone := roundTrip(t, &EmailBlob{PlainText: []byte("Hi"), ReplyTo: "replies@acme.com"})
+	if alone.ReplyTo != "replies@acme.com" || alone.FromEmail != "" || alone.FromName != "" {
+		t.Errorf("reply-to-only blob decoded wrong: %+v", alone)
+	}
+
+	data, _ := (&EmailBlob{PlainText: []byte("Hi"), FromEmail: "hello@acme.com"}).EncodeBinary()
+	if binaryFlags(data)&FlagReplyTo != 0 {
+		t.Error("empty reply-to set the flag")
+	}
+}
+
+func binaryFlags(data []byte) uint32 {
+	return uint32(data[5])<<24 | uint32(data[6])<<16 | uint32(data[7])<<8 | uint32(data[8])
+}

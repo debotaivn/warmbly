@@ -10,24 +10,8 @@ import (
 )
 
 func (s *tokenService) GetSession(ctx context.Context, sessionID uuid.UUID) (*models.Session, *errx.Error) {
-	sess, err := s.getSession(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	if sess != nil {
-		return sess, nil
-	}
-
-	sess, err = s.tokenRepository.GetSession(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.saveSession(ctx, sess, SessionTTL); err != nil {
-		return nil, err
-	}
-	return sess, nil
+	// PostgreSQL is authoritative for session state on every request.
+	return s.tokenRepository.GetSession(ctx, sessionID)
 }
 
 func sameTokenIssueTime(a, b time.Time) bool {
@@ -37,7 +21,7 @@ func sameTokenIssueTime(a, b time.Time) bool {
 }
 
 func (s *tokenService) ValidateAccessToken(ctx context.Context, accessToken string) (*models.Session, *errx.Error) {
-	t, err := s.VerifyToken(accessToken)
+	t, err := s.VerifyTokenFor(PurposeAccess, accessToken)
 	if err != nil {
 		return nil, err
 	}
@@ -51,11 +35,9 @@ func (s *tokenService) ValidateAccessToken(ctx context.Context, accessToken stri
 		return nil, err
 	}
 
-	// A revoked session is dead immediately. Revocation busts the Redis cache,
-	// so the next read here re-loads the row with revoked_at set and the token
-	// stops working without waiting for the cache TTL or a refresh.
-	if session.RevokedAt != nil {
-		return nil, errx.ErrToken
+	// Revocation and absolute expiry are checked against the authoritative row.
+	if !session.Live(time.Now()) {
+		return nil, errx.ErrSessionEnded
 	}
 
 	if session.AccessNonce != t.Nonce || !sameTokenIssueTime(session.LastRefreshedAt, t.IssuedAt.Time) {
@@ -63,4 +45,17 @@ func (s *tokenService) ValidateAccessToken(ctx context.Context, accessToken stri
 	}
 
 	return session, nil
+}
+
+// VerifyTokenFor is VerifyToken plus the check that the token was minted for
+// this flow. A token with no purpose verifies for none.
+func (s *tokenService) VerifyTokenFor(purpose, tokenStr string) (*TokenClaims, *errx.Error) {
+	claims, err := s.VerifyToken(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Purpose == "" || claims.Purpose != purpose {
+		return nil, errx.ErrToken
+	}
+	return claims, nil
 }

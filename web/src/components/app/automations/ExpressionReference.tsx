@@ -3,10 +3,9 @@
 // grouped, with a link to the full guide. Mounted next to the Advanced
 // expression editor (and reusable anywhere a "?" reference helps).
 
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { CircleHelpIcon, CopyIcon, ExternalLinkIcon } from "lucide-react";
 import { PopoverMenu, PopoverMenuTrigger, PopoverMenuContent } from "@/components/ui/popover-menu";
-import { WEBSITE_URL } from "@/lib/information";
 
 interface Entry {
     code: string;
@@ -70,6 +69,14 @@ const SECTIONS: Section[] = [
             { code: "{{trim .role}}", label: "Trim outer whitespace" },
             { code: '{{contains .Email "gmail"}}', label: "Substring test (case-insensitive)" },
             { code: '{{hasPrefix .Email "info@"}}', label: "Prefix test (case-sensitive)" },
+        ],
+    },
+    {
+        title: "Lists",
+        blurb: "For list values such as a reply's inbox tagging labels.",
+        entries: [
+            { code: '{{has .ai_labels "Meeting"}}', label: "Whole-item test (case-insensitive)", note: '"Interested" does not match "Not interested".' },
+            { code: '{{join .ai_labels ", "}}', label: "Join into one line of text" },
         ],
     },
     {
@@ -167,7 +174,7 @@ export function ExpressionReference({ label = "Reference" }: { label?: string })
                 </div>
 
                 <a
-                    href={`${WEBSITE_URL}/learn/personalization`}
+                    href="https://docs.warmbly.com/learn/personalization/"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="mt-3 inline-flex items-center gap-1 border-t border-slate-100 pt-2.5 text-[11px] font-medium text-sky-600 hover:text-sky-700"

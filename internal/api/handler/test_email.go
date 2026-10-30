@@ -14,6 +14,9 @@ type sendTestEmailRequest struct {
 	SequenceID *uuid.UUID `json:"step_id"`
 	AccountID  uuid.UUID  `json:"account_id" binding:"required"`
 	Recipient  string     `json:"recipient" binding:"required,email"`
+	// ContactID renders the copy for a real contact of the organization
+	// instead of the placeholder one.
+	ContactID *uuid.UUID `json:"contact_id"`
 }
 
 // SendTestEmail sends a preview/test email for a campaign sequence
@@ -24,7 +27,6 @@ func (h *Handler) SendTestEmail(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
 		return
 	}
-	userID := middleware.GetUserID(c)
 
 	campaignID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -34,12 +36,12 @@ func (h *Handler) SendTestEmail(c *gin.Context) {
 
 	var req sendTestEmailRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
 	// Load campaign
-	campaign, xerr := h.CampaignService.Get(c.Request.Context(), userID, campaignID.String())
+	campaign, xerr := h.CampaignService.Get(c.Request.Context(), orgID.String(), campaignID.String())
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -57,33 +59,63 @@ func (h *Handler) SendTestEmail(c *gin.Context) {
 	}
 
 	// Select the right sequence
-	var sequence *models.Sequence
+	idx := 0
 	if req.SequenceID != nil {
+		idx = -1
 		for i := range sequences {
 			if sequences[i].ID == *req.SequenceID {
-				sequence = &sequences[i]
+				idx = i
 				break
 			}
 		}
-		if sequence == nil {
+		if idx < 0 {
 			errx.JSON(c, errx.New(errx.NotFound, "sequence not found"))
 			return
 		}
-	} else {
-		sequence = &sequences[0]
+	}
+	// A step that replies in the contact's thread has no subject of its own,
+	// so the test would arrive blank without resolving the conversation's.
+	step := sequences[idx]
+	step.Subject = models.StepSubject(sequences, idx)
+	sequence := &step
+
+	if xerr := mailboxAllowed(c, req.AccountID); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+
+	var contact *models.Contact
+	if req.ContactID != nil {
+		// Rendering a real contact reads its fields back, so it takes the
+		// contacts read permission on top of the route's campaigns one.
+		if xerr := h.hasAccess(c, models.PermViewContacts, models.APIPermReadContacts); xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		found, cxerr := h.orgContact(c.Request.Context(), *orgID, *req.ContactID)
+		if cxerr != nil {
+			errx.JSON(c, cxerr)
+			return
+		}
+		contact = found
 	}
 
 	// Send the test email
-	xerr = h.TasksService.SendTestEmail(c.Request.Context(), userID, req.AccountID, req.Recipient, campaign, sequence)
+	xerr = h.TasksService.SendTestEmail(c.Request.Context(), *orgID, req.AccountID, req.Recipient, campaign, sequence, contact)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"message":    "test email sent",
 		"recipient":  req.Recipient,
 		"subject":    sequence.Subject,
 		"account_id": req.AccountID.String(),
-	})
+		"step_id":    sequence.ID.String(),
+	}
+	if contact != nil {
+		resp["contact_id"] = contact.ID.String()
+	}
+	c.JSON(http.StatusOK, resp)
 }

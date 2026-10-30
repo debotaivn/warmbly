@@ -3,13 +3,14 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/warmbly/warmbly/internal/config"
@@ -17,6 +18,7 @@ import (
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/infrastructure/db"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 	"github.com/warmbly/warmbly/internal/pkg/emailverify"
 	"github.com/warmbly/warmbly/internal/pkg/encrypt"
 	"github.com/warmbly/warmbly/internal/utils"
@@ -27,6 +29,8 @@ type ContactRepository interface {
 	Add(ctx context.Context, userID string, orgID uuid.UUID, contacts []models.AddContact) ([]models.Contact, *errx.Error)
 	GetByID(ctx context.Context, contactID uuid.UUID) (*models.Contact, *errx.Error)
 	GetByEmailAndOrganization(ctx context.Context, organizationID uuid.UUID, email string) (*models.Contact, *errx.Error)
+	// GetByThreadAndOrganization is the lead of the campaign send a unibox thread answers; (nil, nil) when none.
+	GetByThreadAndOrganization(ctx context.Context, organizationID uuid.UUID, thread models.ContactLookupThread) (*models.Contact, *errx.Error)
 	// GetByIDsAndOrganization fetches the org's contacts for a set of IDs. Used
 	// by the synchronous "push to CRM" action so a member can only push contacts
 	// that belong to their organization. Foreign/missing IDs are omitted.
@@ -40,31 +44,51 @@ type ContactRepository interface {
 	// the outcome of a verify pass; ListUnverifiedContacts returns contacts that
 	// have never been conclusively checked (status 'unknown', never verified) so
 	// the batch scheduler can work them off a cap per tick.
-	UpdateContactVerification(ctx context.Context, contactID uuid.UUID, res emailverify.Result) *errx.Error
-	// ListVerificationCandidates returns contacts due for a check: never
-	// checked, or checked long enough ago that the verdict has aged out.
-	// Manual verdicts are never candidates. Oldest first.
+	// checkStatus is what the check said before evidence was applied, and
+	// requestedAt the member request it answers, if any.
+	UpdateContactVerification(ctx context.Context, contactID uuid.UUID, res emailverify.Result, checkStatus emailverify.Status, requestedAt *time.Time) *errx.Error
+	// ListVerificationCandidates returns contacts due for a check: those a
+	// member asked to re-check first, then never checked, or checked long
+	// enough ago that the verdict has aged out. Manual verdicts are only
+	// candidates on request. Oldest first.
 	ListVerificationCandidates(ctx context.Context, limit int) ([]VerificationCandidate, *errx.Error)
 	// SetContactsVerification stores one verdict on many of the org's contacts
 	// (a manual "mark deliverable"). Returns how many rows changed.
 	SetContactsVerification(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID, w models.ContactVerificationWrite) (int, *errx.Error)
-	// ResetContactsVerification clears the verdict so the scheduler checks the
-	// contacts again on its next pass. Returns how many rows changed.
-	ResetContactsVerification(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID) (int, *errx.Error)
+	// RequestContactsVerification queues a re-check of the org's listed
+	// contacts ahead of the backlog, leaving their current verdict standing
+	// until it lands. Returns how many rows changed.
+	RequestContactsVerification(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID) (int, *errx.Error)
 	// UndeliverableLeadIDs lists the campaign's leads verification refused.
 	UndeliverableLeadIDs(ctx context.Context, orgID, campaignID uuid.UUID) ([]uuid.UUID, *errx.Error)
 	// VerificationCounts is the org's contacts by verdict.
 	VerificationCounts(ctx context.Context, orgID uuid.UUID) (models.ContactVerificationCounts, *errx.Error)
-	// SetContactESP caches the recipient ESP/provider resolved from the contact's
-	// domain (control-plane only, no MX dial). Best-effort: a failure should not
-	// block sending.
-	SetContactESP(ctx context.Context, contactID uuid.UUID, provider string) error
+	// ListMailHostPending returns contacts whose inbox host the provider sweep
+	// has not detected, never-checked first. Instance-wide: control plane only.
+	ListMailHostPending(ctx context.Context, limit int) ([]ContactMailHostPending, error)
+	// SetContactMailHosts stores the sweep's results and returns the
+	// organizations whose contacts changed.
+	SetContactMailHosts(ctx context.Context, results []ContactMailHostResult) ([]uuid.UUID, error)
 	GetByEmailsAndUser(ctx context.Context, userID uuid.UUID, emails []string) (map[string]models.Contact, *errx.Error)
+	// ImportLookup resolves an import's addresses: the workspace's contact for
+	// each it already has, and the ones the importing member holds as a
+	// contact in another workspace, which the per-member unique index keeps
+	// from being created here.
+	ImportLookup(ctx context.Context, orgID, userID uuid.UUID, emails []string) (map[string]uuid.UUID, map[string]bool, *errx.Error)
+	// ImportUpdate enriches existing contacts from imported rows in one
+	// transaction: non-empty values win, blanks never erase. found[i] is false
+	// when rows[i]'s contact is no longer in the workspace.
+	ImportUpdate(ctx context.Context, orgID uuid.UUID, rows []ContactImportUpdate) ([]bool, *errx.Error)
 	// ResolveCategoryNames maps category titles (as typed in an imported file)
-	// to the caller's category IDs, creating the ones that don't exist yet.
+	// to the workspace's category IDs, creating the ones that don't exist yet.
 	// Keys of the returned map are the lowercased titles.
-	ResolveCategoryNames(ctx context.Context, userID uuid.UUID, names []string) (map[string]uuid.UUID, *errx.Error)
-	Search(ctx context.Context, userID string, category, cursor *string, filters models.SearchContacts, limit int32) (*models.ContactsResult, *errx.Error)
+	ResolveCategoryNames(ctx context.Context, orgID, userID uuid.UUID, names []string) (map[string]uuid.UUID, *errx.Error)
+	Search(ctx context.Context, userID string, category *string, cursor *paging.SortCursor, filters models.SearchContacts, limit int32) (*models.ContactsResult, *errx.Error)
+	// SearchIDs returns the ids of every contact matching the same request
+	// Search runs, capped at max+1 rows so the caller can tell "exactly max"
+	// from "more than max". Backs the dashboard's "select all matching" bulk
+	// actions, which name a filter instead of listing ids.
+	SearchIDs(ctx context.Context, orgID string, filters models.SearchContacts, max int) ([]uuid.UUID, *errx.Error)
 	// SearchCounts returns org-wide contact facet totals for the browse
 	// sidebar (independent of any search filters), mirroring campaigns-overview.
 	SearchCounts(ctx context.Context, orgID string) (*models.ContactsCounts, *errx.Error)
@@ -74,6 +98,10 @@ type ContactRepository interface {
 	ExportAll(ctx context.Context, orgID string, filters *models.SearchContacts, contactIDs []string, max int) ([]models.Contact, *errx.Error)
 	BulkUpdate(ctx context.Context, userID string, orgID uuid.UUID, data *models.BulkEditContactsData) ([]models.Contact, *errx.Error)
 	Update(ctx context.Context, userID, contactID string, orgID uuid.UUID, data *models.UpdateContact) (*models.Contact, *errx.Error)
+	// SetSubscribedByEmail flips the subscription flag on every contact in the
+	// organization with that address; a recipient's own opt-out or
+	// resubscribe is recorded on the contact as well as the suppression list.
+	SetSubscribedByEmail(ctx context.Context, orgID uuid.UUID, email string, subscribed bool) error
 	BulkDelete(ctx context.Context, userID string, orgID uuid.UUID, contactIDs []string) *errx.Error
 	Delete(ctx context.Context, userID string, orgID uuid.UUID, contactID string) *errx.Error
 	GetContactCount(ctx context.Context, userID string) (int, *errx.Error)
@@ -83,11 +111,11 @@ type ContactRepository interface {
 	// 200. Powers the dashboard variable picker's real-field suggestions.
 	DistinctCustomFieldKeys(ctx context.Context, orgID uuid.UUID) ([]string, error)
 
-	// 360 view read paths. orgID is optional — when nil, the suppression
-	// + deliverability + reply joins are skipped (they're org-scoped).
+	// GetDetail supports user-only reads with nil orgID and skips organization-scoped joins.
 	GetDetail(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, contactID uuid.UUID) (*models.ContactDetail, *errx.Error)
-	ListSentEmails(ctx context.Context, userID, contactID uuid.UUID, limit int, beforeSentAt *time.Time, beforeTaskID *uuid.UUID) (*models.ContactSentEmailsResult, *errx.Error)
-	ListTimeline(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, contactID uuid.UUID, limit int, before *time.Time) (*models.ContactTimelineResult, *errx.Error)
+	ListSentEmails(ctx context.Context, orgID, contactID uuid.UUID, limit int, beforeSentAt *time.Time, beforeTaskID *uuid.UUID) (*models.ContactSentEmailsResult, *errx.Error)
+	// ListTimeline is always scoped to the selected organization.
+	ListTimeline(ctx context.Context, orgID, contactID uuid.UUID, limit int, cursor *models.ContactTimelineKey) (*models.ContactTimelineResult, *errx.Error)
 	// ListCampaignStates returns the contact's campaigns with their flow,
 	// this contact's progress on every step, and the derived lead status.
 	ListCampaignStates(ctx context.Context, orgID, contactID uuid.UUID) ([]models.ContactCampaignState, *errx.Error)
@@ -168,10 +196,16 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 	categoryIDs := make([][]uuid.UUID, 0, len(contacts))
 	segmentIDs := make([][]uuid.UUID, 0, len(contacts))
 	for _, lead := range contacts {
-		lead.Email = strings.TrimSpace(lead.Email)
-		if !email.IsValid(lead.Email) {
+		// Normalize, not just trim: mail.ParseAddress accepts
+		// `Dana Reyes <dana@acme.com>` and the whole string used to be stored
+		// as the recipient address, which sends to nobody. The edit path
+		// normalizes the same way, so the two cannot disagree about what an
+		// address is.
+		addr, ok := email.Normalize(lead.Email)
+		if !ok {
 			return nil, errx.ErrEmail
 		}
+		lead.Email = addr
 		lead.FirstName = strings.TrimSpace(lead.FirstName)
 		lead.LastName = strings.TrimSpace(lead.LastName)
 		lead.Company = strings.TrimSpace(lead.Company)
@@ -281,7 +315,7 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 		segmentIDs = append(segmentIDs, segs)
 	}
 
-	tx, err := r.DB.Begin(ctx)
+	tx, err := beginResultTx(ctx, r.DB)
 	if err != nil {
 		db.CaptureError(err, "", nil, "begin")
 		return nil, errx.InternalError()
@@ -333,6 +367,9 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 			  is_catch_all = CASE WHEN $13::text <> '' THEN ($14::text = 'catch_all') ELSE contacts.is_catch_all END,
 			  verification_checked_at = CASE WHEN $13::text <> '' THEN NOW() ELSE contacts.verification_checked_at END,
 			  updated_at = NOW()
+			 -- The unique index is per member, so the row it names can sit in
+			 -- another workspace the member belongs to; only this one is written.
+			 WHERE contacts.organization_id = EXCLUDED.organization_id
 			 -- xmax = 0 only on a fresh row: the source is first-touch, so an
 			 -- upsert that hit an existing contact is not a creation.
 			 RETURNING id, first_name, last_name, email, company, phone, custom_fields, subscribed, updated_at, created_at, (xmax = 0)`,
@@ -359,6 +396,10 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 			&ncon.Phone, &ncon.CustomFields, &ncon.Subscribed, &ncon.UpdatedAt, &ncon.CreatedAt, &inserted,
 		); err != nil {
 			br.Close()
+			// The address is this member's contact in another workspace.
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errx.ErrContactEmailTaken
+			}
 			db.CaptureError(err, "", nil, "batch queryrow")
 			return nil, errx.InternalError()
 		}
@@ -367,6 +408,7 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 		if ncon.CustomFields == nil {
 			ncon.CustomFields = map[string]string{}
 		}
+		ncon.IsNew = inserted
 		ncontacts = append(ncontacts, ncon)
 		created = append(created, inserted)
 		if inserted {
@@ -409,6 +451,18 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 			return nil, errx.InternalError()
 		}
 		campaignLinks = append(campaignLinks, added...)
+		// A hand-picked add ends a manual removal, as the bulk add does.
+		if _, err := tx.Exec(ctx, `DELETE FROM campaign_lead_removals WHERE contact_id = $1 AND campaign_id = ANY($2)
+			AND campaign_id IN (SELECT id FROM campaigns WHERE organization_id = $3)`, ncontacts[i].ID, cids, orgID); err != nil {
+			db.CaptureError(err, "", nil, "campaign_lead_removals clear")
+			return nil, errx.InternalError()
+		}
+		// It also claims a lead a linked segment had enrolled, so detaching
+		// that segment later does not withdraw somebody's hand-picked lead.
+		if _, err := tx.Exec(ctx, claimLeadsManualSQL, cids, []uuid.UUID{ncontacts[i].ID}, orgID); err != nil {
+			db.CaptureError(err, "", nil, "campaign_leads claim")
+			return nil, errx.InternalError()
+		}
 		// A contact created from a campaign's Leads tab is attributed to that
 		// campaign by name, resolved here rather than trusted from the client.
 		if created[i] && normalized[i].Source == models.ContactSourceCampaign && normalized[i].SourceDetail == "" && len(added) > 0 {
@@ -450,7 +504,7 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 		ncontacts[i].Campaigns = linked
 	}
 
-	// Link categories. Scoped to the user's own categories so a
+	// Link categories. Scoped to the workspace's own categories so a
 	// malicious or stale ID can't attach foreign data.
 	for i, cats := range categoryIDs {
 		if len(cats) == 0 {
@@ -460,10 +514,10 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 			INSERT INTO contact_categories (contact_id, category_id)
 			SELECT $1, cat.id
 			FROM   categories cat
-			WHERE  cat.id = ANY($2) AND cat.user_id = $3
+			WHERE  cat.id = ANY($2) AND cat.organization_id = $3
 			ON CONFLICT (contact_id, category_id) DO NOTHING
 			RETURNING category_id
-		`, ncontacts[i].ID, cats, userID)
+		`, ncontacts[i].ID, cats, orgID)
 		if err != nil {
 			db.CaptureError(err, "", nil, "contact_categories insert")
 			return nil, errx.InternalError()
@@ -479,9 +533,9 @@ func (r *contactRepository) Add(ctx context.Context, userID string, orgID uuid.U
 			SELECT cat.id, cat.title, cat.color
 			FROM   categories cat
 			JOIN   contact_categories cc ON cc.category_id = cat.id
-			WHERE  cc.contact_id = $1 AND cat.user_id = $2
+			WHERE  cc.contact_id = $1 AND cat.organization_id = $2
 			ORDER BY cat.position ASC, cat.title ASC
-		`, ncontacts[i].ID, userID)
+		`, ncontacts[i].ID, orgID)
 		if err != nil {
 			db.CaptureError(err, "", nil, "contact_categories select")
 			return nil, errx.InternalError()
@@ -561,19 +615,19 @@ func (r *contactRepository) GetByID(ctx context.Context, contactID uuid.UUID) (*
 			c.custom_fields, c.subscribed, c.updated_at, c.created_at,
 			c.verification_status, c.verification_reason, c.is_catch_all, c.verification_checked_at,
 			c.verification_source, c.verification_provider, c.verification_sub_status, c.verification_confidence,
-			c.esp_provider, c.esp_resolved_at
+			c.verification_requested_at, c.mail_host, c.esp_provider, c.esp_resolved_at
 		FROM contacts c
 		WHERE c.id = $1
 	`
 
 	var contact models.Contact
-	err := r.DB.QueryRow(ctx, query, contactID).Scan(
+	err := resultDB(ctx, r.DB).QueryRow(ctx, query, contactID).Scan(
 		&contact.ID, &contact.FirstName, &contact.LastName, &contact.Email,
 		&contact.Company, &contact.Phone, &contact.CustomFields, &contact.Subscribed,
 		&contact.UpdatedAt, &contact.CreatedAt,
 		&contact.VerificationStatus, &contact.VerificationReason, &contact.IsCatchAll, &contact.VerificationCheckedAt,
 		&contact.VerificationSource, &contact.VerificationProvider, &contact.VerificationSubStatus, &contact.VerificationConfidence,
-		&contact.ESPProvider, &contact.ESPResolvedAt,
+		&contact.VerificationRequestedAt, &contact.MailHost, &contact.ESPProvider, &contact.ESPResolvedAt,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -588,23 +642,111 @@ func (r *contactRepository) GetByID(ctx context.Context, contactID uuid.UUID) (*
 	return &contact, nil
 }
 
-// SetContactESP caches the recipient ESP/provider on the contact row. It is a
-// single keyed UPDATE and intentionally tolerant: callers treat any error as a
-// best-effort cache miss and fall back to deriving the provider on the fly.
-func (r *contactRepository) SetContactESP(ctx context.Context, contactID uuid.UUID, provider string) error {
+// ContactMailHostPending is one contact the provider sweep has to look at.
+type ContactMailHostPending struct {
+	ID    uuid.UUID
+	Email string
+}
+
+// ContactMailHostResult is the sweep's answer for one contact. Email is the
+// address it was resolved for, so an address changed meanwhile is left alone.
+type ContactMailHostResult struct {
+	ID       uuid.UUID
+	Email    string
+	MailHost string
+	ESP      string
+	// Transient marks a lookup that failed and should be retried soon.
+	Transient bool
+}
+
+func (r *contactRepository) ListMailHostPending(ctx context.Context, limit int) ([]ContactMailHostPending, error) {
 	query := `
-		UPDATE contacts
-		SET esp_provider = $2, esp_resolved_at = NOW()
-		WHERE id = $1
+		SELECT id, email
+		FROM contacts
+		WHERE mail_host = ''
+		  AND (esp_resolved_at IS NULL OR esp_resolved_at < NOW() - make_interval(days => $2))
+		ORDER BY esp_resolved_at NULLS FIRST
+		LIMIT $1
 	`
-	_, err := r.DB.Exec(ctx, query, contactID, provider)
-	return err
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, limit, config.ContactMailHostRecheckDays)
+	if err != nil {
+		db.CaptureError(err, query, []any{limit}, "query")
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ContactMailHostPending
+	for rows.Next() {
+		var p ContactMailHostPending
+		if err := rows.Scan(&p.ID, &p.Email); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (r *contactRepository) SetContactMailHosts(ctx context.Context, results []ContactMailHostResult) ([]uuid.UUID, error) {
+	if len(results) == 0 {
+		return nil, nil
+	}
+	ids := make([]uuid.UUID, len(results))
+	emails := make([]string, len(results))
+	hosts := make([]string, len(results))
+	esps := make([]string, len(results))
+	transient := make([]bool, len(results))
+	for i, res := range results {
+		ids[i], emails[i], hosts[i], esps[i], transient[i] = res.ID, res.Email, res.MailHost, res.ESP, res.Transient
+	}
+	// A transient failure is stamped as checked long enough ago that the
+	// pending read offers it again after the retry delay, not the recheck window.
+	query := `
+		WITH u AS (
+			SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[], $5::bool[])
+				AS t(id, email, mail_host, esp, transient)
+		), changed AS (
+			UPDATE contacts c
+			SET mail_host = u.mail_host,
+			    esp_provider = u.esp,
+			    esp_resolved_at = CASE WHEN u.transient
+			        THEN NOW() - make_interval(days => $6) + make_interval(mins => $7)
+			        ELSE NOW() END
+			FROM u
+			WHERE c.id = u.id AND c.email = u.email AND c.mail_host = ''
+			RETURNING c.organization_id, (u.mail_host <> '') AS found
+		)
+		SELECT DISTINCT organization_id FROM changed
+		WHERE found AND organization_id IS NOT NULL
+	`
+	args := []any{ids, emails, hosts, esps, transient, config.ContactMailHostRecheckDays, config.ContactMailHostRetryMinutes}
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, args...)
+	if err != nil {
+		db.CaptureError(err, query, nil, "query")
+		return nil, err
+	}
+	defer rows.Close()
+	var orgs []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		orgs = append(orgs, id)
+	}
+	return orgs, rows.Err()
 }
 
 // UpdateContactVerification stores the outcome of a verification pass on the
 // contact. It is keyed only by contact id (the verifier runs in the control
 // plane, not in a user request) and is a no-op-safe single UPDATE.
-func (r *contactRepository) UpdateContactVerification(ctx context.Context, contactID uuid.UUID, res emailverify.Result) *errx.Error {
+func (r *contactRepository) SetSubscribedByEmail(ctx context.Context, orgID uuid.UUID, email string, subscribed bool) error {
+	_, err := resultDB(ctx, r.DB).Exec(ctx,
+		`UPDATE contacts SET subscribed = $3, updated_at = NOW()
+		 WHERE organization_id = $1 AND LOWER(email) = LOWER($2) AND subscribed IS DISTINCT FROM $3`,
+		orgID, email, subscribed)
+	return err
+}
+
+func (r *contactRepository) UpdateContactVerification(ctx context.Context, contactID uuid.UUID, res emailverify.Result, checkStatus emailverify.Status, requestedAt *time.Time) *errx.Error {
 	status := string(res.Status)
 	if status == "" {
 		status = string(emailverify.StatusUnknown)
@@ -621,7 +763,12 @@ func (r *contactRepository) UpdateContactVerification(ctx context.Context, conta
 	if provider == emailverify.ProviderBuiltin {
 		source = models.VerificationSourceProbe
 	}
+	if checkStatus == "" {
+		checkStatus = emailverify.Status(status)
+	}
 
+	// Only the request this check answers is cleared, and a manual verdict set
+	// while it ran is not overwritten.
 	query := `
 		UPDATE contacts
 		SET verification_status = $2,
@@ -632,11 +779,16 @@ func (r *contactRepository) UpdateContactVerification(ctx context.Context, conta
 		    verification_provider = $7,
 		    verification_sub_status = $8,
 		    verification_confidence = $9,
+		    verification_check_status = $10,
+		    verification_requested_at = CASE
+		        WHEN verification_requested_at IS NOT DISTINCT FROM $11::timestamptz THEN NULL
+		        ELSE verification_requested_at END,
 		    updated_at = NOW()
 		WHERE id = $1
+		  AND (verification_source <> 'manual' OR ($11::timestamptz IS NOT NULL AND verification_requested_at IS NOT NULL))
 	`
-	params := []any{contactID, status, res.Reason, res.IsCatchAll, checkedAt, source, provider, string(res.SubStatus), res.Confidence}
-	cmd, err := r.DB.Exec(ctx, query, params...)
+	params := []any{contactID, status, res.Reason, res.IsCatchAll, checkedAt, source, provider, string(res.SubStatus), res.Confidence, string(checkStatus), requestedAt}
+	cmd, err := resultDB(ctx, r.DB).Exec(ctx, query, params...)
 	if err != nil {
 		db.CaptureError(err, query, params, "exec")
 		return errx.InternalError()
@@ -652,58 +804,120 @@ type VerificationCandidate struct {
 	ID             uuid.UUID
 	OrganizationID uuid.UUID
 	Email          string
-	// Requested is true when a member asked for this check (the verdict was
-	// reset), so it is worth spending a paid credit on even when the
-	// organization has none to spare.
-	Requested bool
+	// RequestedAt is the member request this check answers; nil for the
+	// scheduler's own backlog.
+	RequestedAt *time.Time
 }
 
 // ListVerificationCandidates returns up to `limit` contacts due for a check.
-// Never-checked contacts come first (a reset counts as never checked), then
-// verdicts older than their shelf life: an unknown verdict is retried after
-// config.VerificationUnknownRecheckDays, everything else after
-// config.VerificationRecheckDays. Manual verdicts are never re-checked.
+// A member's request comes first and is answered whatever the verdict, its
+// age or the evidence behind it: they asked. Then never-checked contacts,
+// then verdicts older than their shelf life: an unknown verdict is retried
+// after config.VerificationUnknownRecheckDays, everything else after
+// config.VerificationRecheckDays. Manual verdicts are never re-checked unasked.
+//
+// A built-in verdict that predates a connected verifier is reopened once, so
+// connecting one actually reaches the addresses it was connected for.
 func (r *contactRepository) ListVerificationCandidates(ctx context.Context, limit int) ([]VerificationCandidate, *errx.Error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	query := `
-		SELECT c.id, c.organization_id, c.email, c.verification_checked_at IS NULL
+	// Requests take at most half a batch first, so one workspace's bulk
+	// re-verify cannot hold every other workspace's new contacts back.
+	requestedQuery := `
+		SELECT c.id, c.organization_id, c.email, c.verification_requested_at
 		FROM contacts c
-		WHERE c.organization_id IS NOT NULL
+		WHERE c.verification_requested_at IS NOT NULL
+		  AND c.organization_id IS NOT NULL
+		ORDER BY c.verification_requested_at ASC, c.id
+		LIMIT $1 OFFSET $2
+	`
+	out := make([]VerificationCandidate, 0, limit)
+	if xerr := r.scanVerificationCandidates(ctx, requestedQuery, []any{(limit + 1) / 2, 0}, &out); xerr != nil {
+		return nil, xerr
+	}
+	requested := len(out)
+
+	// Each reason a contact is due is its own index-bounded arm, so a pass
+	// with nothing due reads a few index pages rather than every contact.
+	const due = `
+		SELECT c.id, c.organization_id, c.email, c.verification_requested_at,
+		       c.verification_checked_at, c.created_at
+		FROM contacts c`
+	const eligible = `
+		  AND c.organization_id IS NOT NULL
+		  AND c.verification_requested_at IS NULL
 		  AND c.verification_source <> 'manual'
 		  -- Real mail seen recently excuses the address from a check.
 		  AND (c.verification_evidence_at IS NULL OR c.verification_evidence_at < NOW() - make_interval(days => $4))
-		  AND (
-		    c.verification_checked_at IS NULL
-		    OR (c.verification_status = 'unknown' AND c.verification_checked_at < NOW() - make_interval(days => $2))
-		    OR c.verification_checked_at < NOW() - make_interval(days => $3)
-		  )
 		ORDER BY c.verification_checked_at ASC NULLS FIRST, c.created_at ASC
+		LIMIT $1`
+	query := `
+		SELECT id, organization_id, email, verification_requested_at FROM (
+		  (` + due + `
+		   WHERE c.verification_checked_at IS NULL` + eligible + `)
+		  UNION
+		  (` + due + `
+		   WHERE c.verification_checked_at < NOW() - make_interval(days => LEAST($2::int, $3::int))
+		     AND ((c.verification_status = 'unknown' AND c.verification_checked_at < NOW() - make_interval(days => $2))
+		          OR c.verification_checked_at < NOW() - make_interval(days => $3))` + eligible + `)
+		  UNION
+		  -- A built-in verdict reached before the workspace connected a
+		  -- verifier was reached without it; re-check once rather than after
+		  -- the shelf life. Only the built-in probe's verdicts: one a paid
+		  -- verifier already produced is a real answer, and re-checking it
+		  -- because another verifier was connected spends a credit for
+		  -- nothing.
+		  (SELECT d.* FROM integration_connections ic
+		   CROSS JOIN LATERAL (` + due + `
+		     WHERE c.organization_id = ic.organization_id
+		       AND c.verification_provider = $6
+		       AND c.verification_checked_at < ic.created_at` + eligible + `) d
+		   WHERE ic.provider = ANY($5) AND ic.status <> 'disconnected')
+		) due
+		ORDER BY verification_checked_at ASC NULLS FIRST, created_at ASC
 		LIMIT $1
 	`
-	params := []any{limit, config.VerificationUnknownRecheckDays, config.VerificationRecheckDays, config.VerificationEvidenceFreshDays}
-	rows, err := r.DB.Query(ctx, query, params...)
+	providers := make([]string, 0, len(models.VerificationProviders))
+	for _, p := range models.VerificationProviders {
+		providers = append(providers, string(p))
+	}
+	params := []any{
+		limit - len(out), config.VerificationUnknownRecheckDays, config.VerificationRecheckDays,
+		config.VerificationEvidenceFreshDays, providers, emailverify.ProviderBuiltin,
+	}
+	if xerr := r.scanVerificationCandidates(ctx, query, params, &out); xerr != nil {
+		return nil, xerr
+	}
+	// Room the backlog left goes back to requests.
+	if len(out) < limit && requested == (limit+1)/2 {
+		if xerr := r.scanVerificationCandidates(ctx, requestedQuery, []any{limit - len(out), requested}, &out); xerr != nil {
+			return nil, xerr
+		}
+	}
+	return out, nil
+}
+
+func (r *contactRepository) scanVerificationCandidates(ctx context.Context, query string, params []any, out *[]VerificationCandidate) *errx.Error {
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, params...)
 	if err != nil {
 		db.CaptureError(err, query, params, "query")
-		return nil, errx.InternalError()
+		return errx.InternalError()
 	}
 	defer rows.Close()
-
-	out := make([]VerificationCandidate, 0, limit)
 	for rows.Next() {
 		var c VerificationCandidate
-		if err := rows.Scan(&c.ID, &c.OrganizationID, &c.Email, &c.Requested); err != nil {
+		if err := rows.Scan(&c.ID, &c.OrganizationID, &c.Email, &c.RequestedAt); err != nil {
 			db.CaptureError(err, "", nil, "ListVerificationCandidates scan")
-			return nil, errx.InternalError()
+			return errx.InternalError()
 		}
-		out = append(out, c)
+		*out = append(*out, c)
 	}
 	if err := rows.Err(); err != nil {
 		db.CaptureError(err, "", nil, "ListVerificationCandidates rows")
-		return nil, errx.InternalError()
+		return errx.InternalError()
 	}
-	return out, nil
+	return nil
 }
 
 // SetContactsVerification writes one verdict onto the org's listed contacts.
@@ -720,11 +934,14 @@ func (r *contactRepository) SetContactsVerification(ctx context.Context, orgID u
 		    verification_source = $7,
 		    is_catch_all = ($4 = 'catch_all'),
 		    verification_checked_at = NOW(),
+		    verification_check_status = '',
+		    -- A verdict a member set answers any re-check still waiting.
+		    verification_requested_at = NULL,
 		    updated_at = NOW()
 		WHERE organization_id = $1 AND id = ANY($2)
 	`
 	params := []any{orgID, ids, w.Status, w.SubStatus, w.Reason, w.Provider, w.Source}
-	cmd, err := r.DB.Exec(ctx, query, params...)
+	cmd, err := resultDB(ctx, r.DB).Exec(ctx, query, params...)
 	if err != nil {
 		db.CaptureError(err, query, params, "exec")
 		return 0, errx.InternalError()
@@ -732,26 +949,21 @@ func (r *contactRepository) SetContactsVerification(ctx context.Context, orgID u
 	return int(cmd.RowsAffected()), nil
 }
 
-// ResetContactsVerification returns the org's listed contacts to "never
-// checked" so the next scheduler pass picks them up first.
-func (r *contactRepository) ResetContactsVerification(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID) (int, *errx.Error) {
+// RequestContactsVerification queues a re-check of the org's listed contacts.
+// The verdict is left in place, so campaigns keep routing on it until the
+// new one lands.
+func (r *contactRepository) RequestContactsVerification(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID) (int, *errx.Error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
 	query := `
 		UPDATE contacts
-		SET verification_status = 'unknown',
-		    verification_sub_status = '',
-		    verification_reason = 'verification requested',
-		    verification_provider = '',
-		    verification_source = '',
-		    is_catch_all = false,
-		    verification_checked_at = NULL,
+		SET verification_requested_at = NOW(),
 		    updated_at = NOW()
 		WHERE organization_id = $1 AND id = ANY($2)
 	`
 	params := []any{orgID, ids}
-	cmd, err := r.DB.Exec(ctx, query, params...)
+	cmd, err := resultDB(ctx, r.DB).Exec(ctx, query, params...)
 	if err != nil {
 		db.CaptureError(err, query, params, "exec")
 		return 0, errx.InternalError()
@@ -771,7 +983,7 @@ func (r *contactRepository) UndeliverableLeadIDs(ctx context.Context, orgID, cam
 		  AND (c.verification_status = 'invalid' OR (c.verification_status = 'risky' AND NOT cp.risky_emails))
 	`
 	params := []any{campaignID, orgID}
-	rows, err := r.DB.Query(ctx, query, params...)
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, params...)
 	if err != nil {
 		db.CaptureError(err, query, params, "query")
 		return nil, errx.InternalError()
@@ -802,31 +1014,24 @@ func (r *contactRepository) VerificationCounts(ctx context.Context, orgID uuid.U
 			COUNT(*) FILTER (WHERE verification_status = 'risky'),
 			COUNT(*) FILTER (WHERE verification_status = 'invalid'),
 			COUNT(*) FILTER (WHERE verification_status NOT IN ('valid','risky','invalid')),
-			COUNT(*) FILTER (WHERE verification_checked_at IS NULL)
+			COUNT(*) FILTER (WHERE verification_checked_at IS NULL OR verification_requested_at IS NOT NULL)
 		FROM contacts
 		WHERE organization_id = $1
 	`
-	if err := r.DB.QueryRow(ctx, query, orgID).Scan(&c.Valid, &c.Risky, &c.Invalid, &c.Unknown, &c.Pending); err != nil {
+	if err := resultDB(ctx, r.DB).QueryRow(ctx, query, orgID).Scan(&c.Valid, &c.Risky, &c.Invalid, &c.Unknown, &c.Pending); err != nil {
 		db.CaptureError(err, query, []any{orgID}, "queryrow")
 		return c, errx.InternalError()
 	}
 	return c, nil
 }
 
-func (r *contactRepository) GetByEmailAndOrganization(ctx context.Context, organizationID uuid.UUID, email string) (*models.Contact, *errx.Error) {
-	query := `
-		SELECT
-			c.id, c.first_name, c.last_name, c.email, c.company, c.phone,
-			c.custom_fields, c.subscribed, c.updated_at, c.created_at
-		FROM contacts c
-		WHERE c.organization_id = $1
-		  AND LOWER(c.email) = LOWER($2)
-		ORDER BY c.updated_at DESC
-		LIMIT 1
-	`
+// lookupContactColumns and scanLookupContact are the payload both sender lookups return.
+const lookupContactColumns = `c.id, c.first_name, c.last_name, c.email, c.company, c.phone,
+			c.custom_fields, c.subscribed, c.updated_at, c.created_at`
 
+func (r *contactRepository) scanLookupContact(ctx context.Context, query string, args ...any) (*models.Contact, *errx.Error) {
 	var contact models.Contact
-	err := r.DB.QueryRow(ctx, query, organizationID, strings.TrimSpace(email)).Scan(
+	err := resultDB(ctx, r.DB).QueryRow(ctx, query, args...).Scan(
 		&contact.ID, &contact.FirstName, &contact.LastName, &contact.Email,
 		&contact.Company, &contact.Phone, &contact.CustomFields, &contact.Subscribed,
 		&contact.UpdatedAt, &contact.CreatedAt,
@@ -835,7 +1040,7 @@ func (r *contactRepository) GetByEmailAndOrganization(ctx context.Context, organ
 		if err == pgx.ErrNoRows {
 			return nil, nil
 		}
-		db.CaptureError(err, query, []any{organizationID, email}, "queryrow")
+		db.CaptureError(err, query, args, "queryrow")
 		return nil, errx.InternalError()
 	}
 	contact.Campaigns = []models.MiniCampaign{}
@@ -843,9 +1048,71 @@ func (r *contactRepository) GetByEmailAndOrganization(ctx context.Context, organ
 	return &contact, nil
 }
 
+func (r *contactRepository) GetByEmailAndOrganization(ctx context.Context, organizationID uuid.UUID, email string) (*models.Contact, *errx.Error) {
+	query := `
+		SELECT ` + lookupContactColumns + `
+		FROM contacts c
+		WHERE c.organization_id = $1
+		  AND LOWER(c.email) = LOWER($2)
+		ORDER BY c.updated_at DESC
+		LIMIT 1
+	`
+	return r.scanLookupContact(ctx, query, organizationID, strings.TrimSpace(email))
+}
+
+func (r *contactRepository) GetByThreadAndOrganization(ctx context.Context, organizationID uuid.UUID, thread models.ContactLookupThread) (*models.Contact, *errx.Error) {
+	threadID := strings.TrimSpace(thread.ID)
+	if threadID == "" {
+		return nil, nil
+	}
+	allowed := thread.AllowedAccounts
+	if allowed == nil {
+		allowed = []uuid.UUID{}
+	}
+	// A Message-ID may name a send from any workspace mailbox; the Gmail thread handle only one holding the thread.
+	query := `
+		WITH msgs AS (
+			SELECT ue.email_id, ue.message_id, ue.in_reply_to
+			FROM unibox_emails ue
+			JOIN email_accounts ea ON ea.id = ue.email_id
+			WHERE ea.organization_id = $1 AND ue.thread_id = $2
+			  AND ($3::uuid IS NULL OR ue.email_id = $3)
+			  AND (cardinality($4::uuid[]) = 0 OR ue.email_id = ANY($4))
+		),
+		ids AS (
+			SELECT DISTINCT x FROM (
+				SELECT BTRIM(message_id, '<> ') AS x FROM msgs
+				UNION ALL
+				SELECT BTRIM(ref, '<> ') FROM msgs, unnest(COALESCE(msgs.in_reply_to, '{}')) AS ref
+			) raw
+			WHERE x <> ''
+		),
+		matched AS (
+			SELECT t.id, 0 AS rank, t.created_at
+			FROM tasks t
+			WHERE t.task_type = 'campaign' AND t.message_id <> ''
+			  AND t.message_id IN (SELECT x FROM ids UNION ALL SELECT '<' || x || '>' FROM ids)
+			  AND t.email_account_id IN (SELECT id FROM email_accounts WHERE organization_id = $1)
+			UNION ALL
+			SELECT t.id, 1 AS rank, t.created_at
+			FROM tasks t
+			WHERE t.task_type = 'campaign' AND t.thread_id = $2
+			  AND t.email_account_id IN (SELECT email_id FROM msgs)
+		)
+		SELECT ` + lookupContactColumns + `
+		FROM matched m
+		JOIN campaign_tasks ct ON ct.task_id = m.id
+		JOIN contacts c ON c.id = ct.contact_id
+		WHERE c.organization_id = $1
+		ORDER BY m.rank, m.created_at DESC
+		LIMIT 1
+	`
+	return r.scanLookupContact(ctx, query, organizationID, threadID, thread.AccountID, allowed)
+}
+
 func (r *contactRepository) OwnerUserID(ctx context.Context, organizationID, contactID uuid.UUID) (*uuid.UUID, error) {
 	var userID uuid.UUID
-	err := r.DB.QueryRow(ctx,
+	err := resultDB(ctx, r.DB).QueryRow(ctx,
 		`SELECT user_id FROM contacts WHERE id = $1 AND organization_id = $2`,
 		contactID, organizationID,
 	).Scan(&userID)
@@ -869,7 +1136,7 @@ func (r *contactRepository) GetByIDsAndOrganization(ctx context.Context, organiz
 		FROM contacts c
 		WHERE c.organization_id = $1 AND c.id = ANY($2)
 	`
-	rows, err := r.DB.Query(ctx, query, organizationID, ids)
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, organizationID, ids)
 	if err != nil {
 		db.CaptureError(err, query, []any{organizationID, ids}, "query")
 		return nil, errx.InternalError()
@@ -898,14 +1165,146 @@ func (r *contactRepository) GetByIDsAndOrganization(ctx context.Context, organiz
 	return out, nil
 }
 
-func (r *contactRepository) Search(
-	ctx context.Context,
-	orgID string,
-	category,
-	cursor *string,
-	filters models.SearchContacts,
-	limit int32,
-) (*models.ContactsResult, *errx.Error) {
+// contactSortKind decides three things that have to agree: how a row's sort
+// value is written into the cursor, how the cursor's text is cast back for the
+// comparison, and what counts as a well-formed boundary.
+type contactSortKind int
+
+const (
+	sortText contactSortKind = iota
+	sortTimestamp
+	sortNumber
+)
+
+// contactSortTimeLayout mirrors the to_char pattern below, so Go validates
+// exactly the boundaries Postgres will accept.
+const contactSortTimeLayout = "2006-01-02 15:04:05.000000"
+
+// contactSort describes one sortable column of the contacts list: the SQL to
+// order and compare on, its kind, and whether the column admits NULL (which
+// decides where the NULL block sits in the order). Every column here is
+// currently NOT NULL; flipping `nullable` turns on the NULL-aware keyset
+// branches so a nullable sort cannot silently truncate the list.
+type contactSort struct {
+	expr     string
+	kind     contactSortKind
+	nullable bool
+}
+
+// render is the SELECT expression that puts a row's sort value in the cursor.
+// Timestamps get an explicit pattern rather than ::text so a token does not
+// depend on the server's DateStyle.
+func (s contactSort) render() string {
+	if s.kind == sortTimestamp {
+		return fmt.Sprintf("to_char(%s, 'YYYY-MM-DD HH24:MI:SS.US')", s.expr)
+	}
+	return "(" + s.expr + ")::text"
+}
+
+// bound casts a cursor's text boundary back to what expr compares in.
+func (s contactSort) bound(placeholder string) string {
+	switch s.kind {
+	case sortTimestamp:
+		return placeholder + "::text::timestamp"
+	case sortNumber:
+		return placeholder + "::text::bigint"
+	default:
+		return placeholder + "::text"
+	}
+}
+
+// wellFormed rejects a boundary the cast would choke on, so a hand-made cursor
+// is a 400 instead of a database error surfacing as a 500.
+func (s contactSort) wellFormed(v string) bool {
+	switch s.kind {
+	case sortTimestamp:
+		_, err := time.Parse(contactSortTimeLayout, v)
+		return err == nil
+	case sortNumber:
+		_, err := strconv.ParseInt(v, 10, 64)
+		return err == nil
+	default:
+		return true
+	}
+}
+
+// campaignCountLateral counts one contact's campaign memberships, joined only
+// when a filter or the sort actually needs it.
+const campaignCountLateral = `LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS campaign_count
+			FROM campaign_leads cl1
+			WHERE cl1.contact_id = c.id
+		) cl ON TRUE`
+
+var contactSorts = map[string]contactSort{
+	"first_name":     {expr: "c.first_name", kind: sortText},
+	"last_name":      {expr: "c.last_name", kind: sortText},
+	"email":          {expr: "c.email", kind: sortText},
+	"company":        {expr: "c.company", kind: sortText},
+	"phone":          {expr: "c.phone", kind: sortText},
+	"created_at":     {expr: "c.created_at", kind: sortTimestamp},
+	"updated_at":     {expr: "c.updated_at", kind: sortTimestamp},
+	"campaign_count": {expr: "COALESCE(cl.campaign_count,0)", kind: sortNumber},
+	// Contacts the provider sweep has not reached sort after every known host.
+	"mail_host": {expr: "NULLIF(c.mail_host, '')", kind: sortText, nullable: true},
+}
+
+// resolveContactSort turns a request's sort_by into the column the list orders
+// on. Search and SearchIDs both go through it, so "select all matching" walks
+// the rows in the order the list showed them.
+//
+// A custom field ("custom:<key>") sorts on its jsonb value as text, with a
+// blank value treated as missing so it sits with the rows that lack the field.
+// The key is a bound parameter, never written into the SQL: it is user data.
+// The placeholder is appended to args here, so the same expression serves the
+// cursor comparison, the sort_value column and ORDER BY. Anything unknown
+// falls back to created_at, the documented behaviour.
+func resolveContactSort(sortBy string, args *[]any, argIndex *int) (string, contactSort) {
+	if spec, ok := contactSorts[sortBy]; ok {
+		return sortBy, spec
+	}
+	if key, ok := models.ContactSortCustomField(sortBy); ok && utils.IsValidJSONKey(key) {
+		spec := contactSort{
+			expr:     fmt.Sprintf("NULLIF(c.custom_fields ->> $%d::text, '')", *argIndex),
+			kind:     sortText,
+			nullable: true,
+		}
+		*args = append(*args, key)
+		*argIndex++
+		return models.ContactSortCustomPrefix + key, spec
+	}
+	return "created_at", contactSorts["created_at"]
+}
+
+// contactFilter is a compiled contact search: the WHERE terms, the args they
+// bind, the next free placeholder, and (single-campaign Leads view only) the
+// placeholder the lead-progress subquery reuses.
+type contactFilter struct {
+	clauses        []string
+	args           []any
+	nextArg        int
+	singleCampaign string
+}
+
+// contactSearchMaxTerms bounds how many words one search box turns into ILIKE
+// terms; past a handful the extra scans cost more than they narrow.
+const contactSearchMaxTerms = 6
+
+// contactSearchTerms splits a contact search into the words that must each
+// match some field. An empty or whitespace-only query yields no terms, which
+// leaves the search unfiltered exactly as before.
+func contactSearchTerms(query string) []string {
+	terms := strings.Fields(query)
+	if len(terms) > contactSearchMaxTerms {
+		terms = terms[:contactSearchMaxTerms]
+	}
+	return terms
+}
+
+// buildContactFilter compiles a search request into WHERE terms. Search and
+// SearchIDs share it so a "select all" bulk action resolves exactly the rows
+// the list was showing, filter for filter.
+func (r *contactRepository) buildContactFilter(ctx context.Context, orgID string, filters models.SearchContacts) (*contactFilter, *errx.Error) {
 	var whereClauses []string
 	var args []any
 	argIndex := 1
@@ -920,17 +1319,20 @@ func (r *contactRepository) Search(
 	// -----------------------------
 	// Text search across core fields
 	// -----------------------------
-	if filters.Query != "" {
-		q := "%" + filters.Query + "%"
+	// Every word of the query has to match one of the fields, rather than the
+	// query as a whole matching one of them: no single column holds both
+	// halves of a person's name, so "Test Demo" found nothing while "Test"
+	// found the contact (issue #413).
+	for _, term := range contactSearchTerms(filters.Query) {
 		whereClauses = append(whereClauses, fmt.Sprintf(`
 			(c.first_name ILIKE $%d OR
 			 c.last_name ILIKE $%d OR
 			 c.email ILIKE $%d OR
 			 c.company ILIKE $%d OR
 			 c.phone ILIKE $%d)
-		`, argIndex, argIndex+1, argIndex+2, argIndex+3, argIndex+4))
-		args = append(args, q, q, q, q, q)
-		argIndex += 5
+		`, argIndex, argIndex, argIndex, argIndex, argIndex))
+		args = append(args, "%"+term+"%")
+		argIndex++
 	}
 
 	// -----------------------------
@@ -979,6 +1381,11 @@ func (r *contactRepository) Search(
 		args = append(args, filters.VerificationStatus)
 		argIndex++
 	}
+	if len(filters.MailHosts) > 0 {
+		whereClauses = append(whereClauses, fmt.Sprintf("c.mail_host = ANY($%d)", argIndex))
+		args = append(args, filters.MailHosts)
+		argIndex++
+	}
 
 	// -----------------------------
 	// Date filters
@@ -1022,16 +1429,14 @@ func (r *contactRepository) Search(
 		if len(filters.CampaignIDs) == 1 {
 			singleCampaignPlaceholder = placeholders[0]
 		}
-		campaignClause := fmt.Sprintf(`
-			c.id IN (
-				SELECT contact_id
-				FROM campaign_leads
-				WHERE campaign_id IN (%s)
-				GROUP BY contact_id
-				HAVING COUNT(DISTINCT campaign_id) = %d
-			)
-		`, strings.Join(placeholders, ","), len(filters.CampaignIDs))
-		whereClauses = append(whereClauses, campaignClause)
+		// One EXISTS per campaign ("in ALL of them"), each a primary-key probe
+		// the planner can run either way round: driving from the ordered
+		// contacts index for a broad campaign, or from the leads for a narrow
+		// one. A GROUP BY/HAVING over campaign_leads forces the second.
+		for _, ph := range placeholders {
+			whereClauses = append(whereClauses, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM campaign_leads cle WHERE cle.campaign_id = %s AND cle.contact_id = c.id)", ph))
+		}
 	}
 
 	// -----------------------------
@@ -1065,16 +1470,10 @@ func (r *contactRepository) Search(
 			args = append(args, id)
 			argIndex++
 		}
-		categoryClause := fmt.Sprintf(`
-			c.id IN (
-				SELECT contact_id
-				FROM contact_categories
-				WHERE category_id IN (%s)
-				GROUP BY contact_id
-				HAVING COUNT(DISTINCT category_id) = %d
-			)
-		`, strings.Join(placeholders, ","), len(filters.CategoryIDs))
-		whereClauses = append(whereClauses, categoryClause)
+		for _, ph := range placeholders {
+			whereClauses = append(whereClauses, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM contact_categories cce WHERE cce.category_id = %s AND cce.contact_id = c.id)", ph))
+		}
 	}
 
 	// -----------------------------
@@ -1102,67 +1501,139 @@ func (r *contactRepository) Search(
 	}
 
 	// -----------------------------
-	// Sort logic
-	// -----------------------------
-	sortBy := "c.created_at"
-	direction := "DESC"
-	allowedSorts := map[string]bool{
-		"first_name":     true,
-		"last_name":      true,
-		"email":          true,
-		"created_at":     true,
-		"updated_at":     true,
-		"campaign_count": true,
-	}
-
-	if filters.SortBy != "" && allowedSorts[filters.SortBy] {
-		if filters.SortBy == "campaign_count" {
-			sortBy = "campaign_count"
-		} else {
-			sortBy = "c." + filters.SortBy
-		}
-	}
-	if filters.Reverse {
-		direction = "ASC"
-	} else {
-		direction = "DESC"
-	}
-
-	// -----------------------------
-	// Cursor pagination
-	// -----------------------------
-	if cursor != nil && *cursor != "" {
-		cursorOp := ">"
-		if direction == "DESC" {
-			cursorOp = "<"
-		}
-		sortSub := fmt.Sprintf("(SELECT %s FROM contacts WHERE id = $%d)", sortBy, argIndex)
-		args = append(args, *cursor)
-		argIndex++
-
-		whereClauses = append(whereClauses, fmt.Sprintf(`
-			(
-				(%s %s %s)
-				OR (%s = %s AND c.id >= $%d)
-			)
-		`, sortBy, cursorOp, sortSub, sortBy, sortSub, argIndex))
-		args = append(args, *cursor)
-		argIndex++
-	}
-
-	// -----------------------------
 	// Campaign count filters (min/max)
 	// -----------------------------
-	campaignCountClauses := []string{}
 	if filters.MinCampaigns != nil {
-		campaignCountClauses = append(campaignCountClauses, fmt.Sprintf("COALESCE(cl.campaign_count,0) >= $%d", argIndex))
+		whereClauses = append(whereClauses, fmt.Sprintf("COALESCE(cl.campaign_count,0) >= $%d", argIndex))
 		args = append(args, *filters.MinCampaigns)
 		argIndex++
 	}
 	if filters.MaxCampaigns != nil {
-		campaignCountClauses = append(campaignCountClauses, fmt.Sprintf("COALESCE(cl.campaign_count,0) <= $%d", argIndex))
+		whereClauses = append(whereClauses, fmt.Sprintf("COALESCE(cl.campaign_count,0) <= $%d", argIndex))
 		args = append(args, *filters.MaxCampaigns)
 		argIndex++
+	}
+
+	return &contactFilter{
+		clauses:        whereClauses,
+		args:           args,
+		nextArg:        argIndex,
+		singleCampaign: singleCampaignPlaceholder,
+	}, nil
+}
+
+// leadRowJSON is the campaign_leads half of a Leads-list row: the fields read
+// together because they come from one lead row.
+type leadRowJSON struct {
+	Sender *string                 `json:"sender"`
+	CC     []models.CampaignLeadCC `json:"cc"`
+	Hold   *models.LeadHold        `json:"hold"`
+}
+
+// contactOutreachSelect is a search row's engagement across every campaign,
+// the same counts and times the contact 360 reports. One indexed aggregate per
+// returned row, so it costs a page, not the organization.
+var contactOutreachSelect = `(
+	SELECT json_build_object(
+		'sent',    COUNT(*) FILTER (WHERE a.sent_at IS NOT NULL AND ` + progressIsEmailStep("a") + `),
+		'opened',  COUNT(*) FILTER (WHERE a.opened_at IS NOT NULL AND NOT a.opened_machine),
+		'clicked', COUNT(*) FILTER (WHERE a.clicked_at IS NOT NULL),
+		'replied', COUNT(*) FILTER (WHERE a.replied_at IS NOT NULL),
+		'bounced', COUNT(*) FILTER (WHERE a.bounced_at IS NOT NULL),
+		'last_sent_at',    MAX(a.sent_at) FILTER (WHERE ` + progressIsEmailStep("a") + `),
+		'last_opened_at',  MAX(a.opened_at) FILTER (WHERE NOT a.opened_machine),
+		'last_clicked_at', MAX(a.clicked_at),
+		'last_replied_at', MAX(a.replied_at),
+		'last_bounced_at', MAX(a.bounced_at)
+	)
+	FROM campaign_contact_progress a
+	WHERE a.contact_id = c.id
+)`
+
+func (r *contactRepository) Search(
+	ctx context.Context,
+	orgID string,
+	category *string,
+	cursor *paging.SortCursor,
+	filters models.SearchContacts,
+	limit int32,
+) (*models.ContactsResult, *errx.Error) {
+	fq, ferr := r.buildContactFilter(ctx, orgID, filters)
+	if ferr != nil {
+		return nil, ferr
+	}
+	whereClauses := fq.clauses
+	args := fq.args
+	argIndex := fq.nextArg
+	singleCampaignPlaceholder := fq.singleCampaign
+
+	// -----------------------------
+	// Sort logic
+	// -----------------------------
+	// campaign_count is a computed column, so the cursor compares against the
+	// expression rather than the SELECT alias, which WHERE cannot see.
+	sortName, spec := resolveContactSort(filters.SortBy, &args, &argIndex)
+	direction := "DESC"
+	nulls := "NULLS FIRST"
+	if filters.Reverse {
+		direction = "ASC"
+		nulls = "NULLS LAST"
+	}
+	sortBy := spec.expr
+	// The ordering the cursor is taken under. A token minted under a different
+	// one points at a position that does not exist here.
+	sortKey := sortName + ":" + strings.ToLower(direction)
+
+	// -----------------------------
+	// Cursor pagination
+	// -----------------------------
+	// Keyset, not offset: the token carries the boundary row's own sort value
+	// alongside its id, so a row deleted or re-sorted between pages cannot move
+	// the boundary.
+	if cursor != nil {
+		if cursor.Sort != sortKey {
+			return nil, errx.New(errx.BadRequest, "invalid cursor")
+		}
+		if cursor.Value == nil && !spec.nullable {
+			return nil, errx.New(errx.BadRequest, "invalid cursor")
+		}
+		if cursor.Value != nil && !spec.wellFormed(*cursor.Value) {
+			return nil, errx.New(errx.BadRequest, "invalid cursor")
+		}
+		// The tiebreak follows the sort direction, so one index serves both ways
+		// round; the boundary row itself is included because it is this page's
+		// first row.
+		cmp, tie := "<", "<="
+		if direction == "ASC" {
+			cmp, tie = ">", ">="
+		}
+		var after string
+		if spec.nullable && cursor.Value == nil {
+			// The boundary sits in the NULL block: the rest of that block by
+			// id, plus every non-NULL row when NULLs come first. No value is
+			// bound here, because a parameter the clause never names is one
+			// Postgres cannot type.
+			idArg := fmt.Sprintf("$%d", argIndex)
+			args = append(args, cursor.ID)
+			argIndex++
+			after = fmt.Sprintf("(%s IS NULL AND c.id %s %s)", sortBy, tie, idArg)
+			if nulls == "NULLS FIRST" {
+				after += fmt.Sprintf(" OR %s IS NOT NULL", sortBy)
+			}
+		} else {
+			bound := spec.bound(fmt.Sprintf("$%d", argIndex))
+			args = append(args, cursor.Value)
+			argIndex++
+			idArg := fmt.Sprintf("$%d", argIndex)
+			args = append(args, cursor.ID)
+			argIndex++
+			after = fmt.Sprintf("(%[1]s %[2]s %[3]s OR (%[1]s = %[3]s AND c.id %[5]s %[4]s))", sortBy, cmp, bound, idArg, tie)
+			if spec.nullable && nulls == "NULLS LAST" {
+				// Past the non-NULL rows, the NULL block still follows.
+				after += fmt.Sprintf(" OR %s IS NULL", sortBy)
+			}
+		}
+		whereClauses = append(whereClauses, "("+after+")")
 	}
 
 	// -----------------------------
@@ -1171,13 +1642,6 @@ func (r *contactRepository) Search(
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
-	}
-	if len(campaignCountClauses) > 0 {
-		if whereSQL == "" {
-			whereSQL = "WHERE " + strings.Join(campaignCountClauses, " AND ")
-		} else {
-			whereSQL += " AND " + strings.Join(campaignCountClauses, " AND ")
-		}
 	}
 
 	// Per-campaign lead progress. Only computed in the single-campaign (Leads
@@ -1188,7 +1652,7 @@ func (r *contactRepository) Search(
 	if singleCampaignPlaceholder != "" {
 		leadProgressSelect = fmt.Sprintf(`(
 			SELECT json_build_object(
-				'sent',    COUNT(*) FILTER (WHERE p.sent_at IS NOT NULL),
+				'sent',    COUNT(*) FILTER (WHERE p.sent_at IS NOT NULL AND `+progressIsEmailStep("p")+`),
 				-- Human opens only; automated fetches (Apple MPP prefetch, UA-less
 				-- clients) are counted apart so they never read as engagement.
 				'opened',  COUNT(*) FILTER (WHERE p.opened_at IS NOT NULL AND NOT p.opened_machine),
@@ -1211,6 +1675,25 @@ func (r *contactRepository) Search(
 				-- Total email steps in the sequence, to tell "still sending" (active)
 				-- apart from "every step sent" (completed/done).
 				'total_steps', (SELECT COUNT(*) FROM sequences st WHERE st.campaign_id = %[1]s AND st.kind = 'email'),
+				-- The lead row: the mailbox its whole sequence sends from
+				-- (fixed when the first email went out, null until then), and
+				-- the live hold — an out-of-office auto-reply parking the
+				-- contact until they are back, or a member pausing them by
+				-- hand. Read live, so a dated hold stops counting the moment it
+				-- expires without anything having to write.
+				--
+				-- One subquery for both: they resolve the same primary-key row,
+				-- and this runs once per row of the Leads list.
+				'lead', (
+					SELECT json_build_object(
+						'sender', (SELECT ea.email FROM email_accounts ea WHERE ea.id = hl.email_account_id),
+						-- Contacts copied on every email to this lead.
+						'cc', %[5]s,
+						'hold', %[4]s
+					)
+					FROM campaign_leads hl
+					WHERE hl.campaign_id = %[1]s AND hl.contact_id = c.id
+				),
 				-- The step the contact is on now = the latest step actually sent.
 				-- Labelled the same way the canvas does: custom name, else
 				-- "Email N" (Nth email-kind step by position), else action label.
@@ -1242,23 +1725,35 @@ func (r *contactRepository) Search(
 			)
 			FROM campaign_contact_progress p
 			WHERE p.campaign_id = %[1]s AND p.contact_id = c.id
-		)`, singleCampaignPlaceholder, config.CampaignSendMaxAttempts, undeliverableClause(singleCampaignPlaceholder))
+		)`, singleCampaignPlaceholder, config.CampaignSendMaxAttempts, undeliverableClause(singleCampaignPlaceholder), effectiveLeadHoldJSON("hl"), leadCCJSONSQL(singleCampaignPlaceholder))
+	}
+
+	// campaign_count is only ever read by the min/max filters and the
+	// campaign_count sort; the response carries the campaign list itself. So the
+	// count is a lateral computed for the rows that survive, and it is left out
+	// entirely when nothing asks for it. Aggregating the whole campaign_leads
+	// table on every search was the list's dominant cost.
+	campaignCountJoin := ""
+	if filters.MinCampaigns != nil || filters.MaxCampaigns != nil || sortName == "campaign_count" {
+		campaignCountJoin = campaignCountLateral
 	}
 
 	// Main query.
 	//
-	// Both the `campaigns` and `categories` agg subqueries need the
-	// user_id so they can't leak rows from other users that happen to
-	// share a contact id (theoretically impossible thanks to the outer
-	// WHERE, but cheap defence-in-depth). They reuse the same $%d
-	// placeholder so we only append userID once.
+	// Both the `campaigns` and `categories` agg subqueries scope on the
+	// organization so they can't leak rows from another workspace that happens
+	// to share a contact id (theoretically impossible thanks to the outer
+	// WHERE, but cheap defence-in-depth). They reuse the same $%d placeholder
+	// so the org id is appended once. The categories one compared that id
+	// against categories.user_id until #436, which matched nothing, so every
+	// row in the contact list came back with no categories at all.
 	query := fmt.Sprintf(`
 		SELECT
 			c.id, c.first_name, c.last_name, c.email, c.company, c.phone,
 			c.custom_fields, c.subscribed, c.updated_at, c.created_at,
 			c.verification_status, c.verification_reason, c.is_catch_all, c.verification_checked_at,
 			c.verification_source, c.verification_provider, c.verification_sub_status, c.verification_confidence,
-			COALESCE(cl.campaign_count,0) AS campaign_count,
+			c.verification_requested_at, c.mail_host, c.esp_provider,
 			COALESCE(
 				(
 					SELECT json_agg(json_build_object('id', cam.id, 'name', cam.name))
@@ -1274,38 +1769,40 @@ func (r *contactRepository) Search(
 					FROM contact_categories cc
 					JOIN categories cat ON cc.category_id = cat.id
 					WHERE cc.contact_id = c.id
-					AND cat.user_id = $%d
+					AND cat.organization_id = $%d
 				), '[]'::json
 			) AS categories,
-			%s AS lead_progress
+			%s AS lead_progress,
+			`+contactOutreachSelect+` AS outreach,
+			%s AS sort_value
 		FROM contacts c
-		LEFT JOIN (
-			SELECT contact_id, COUNT(campaign_id) AS campaign_count
-			FROM campaign_leads
-			GROUP BY contact_id
-		) cl ON c.id = cl.contact_id
 		%s
-		ORDER BY %s %s, c.id ASC
+		%s
+		ORDER BY %s %s %s, c.id %s
 		LIMIT $%d
-	`, argIndex, argIndex, leadProgressSelect, whereSQL, sortBy, direction, argIndex+1)
+	`, argIndex, argIndex, leadProgressSelect, spec.render(), campaignCountJoin, whereSQL, sortBy, direction, nulls, direction, argIndex+1)
 
 	args = append(args, orgID, limit+1)
 
 	// Skip total count if cursor exists
 	var totalCount *int64
-	if cursor == nil || *cursor == "" {
+	if cursor == nil {
+		countJoin := ""
+		if filters.MinCampaigns != nil || filters.MaxCampaigns != nil {
+			countJoin = campaignCountLateral
+		}
 		countQuery := fmt.Sprintf(`
 			SELECT COUNT(*)
 			FROM contacts c
-			LEFT JOIN (
-				SELECT contact_id, COUNT(campaign_id) AS campaign_count
-				FROM campaign_leads
-				GROUP BY contact_id
-			) cl ON c.id = cl.contact_id
 			%s
-		`, whereSQL)
+			%s
+		`, countJoin, whereSQL)
+		// The count sees the filter terms only: no cursor on a first page, and
+		// the sort's own parameter (a custom field's key) is not referenced by
+		// the WHERE, so passing it would leave Postgres a placeholder it cannot
+		// type.
 		var tmp int64
-		if err := r.DB.QueryRow(ctx, countQuery, args[:argIndex-1]...).Scan(&tmp); err != nil {
+		if err := resultDB(ctx, r.DB).QueryRow(ctx, countQuery, fq.args...).Scan(&tmp); err != nil {
 			db.CaptureError(err, "countQuery", args, "queryrow")
 			return nil, errx.InternalError()
 		}
@@ -1315,7 +1812,7 @@ func (r *contactRepository) Search(
 	// -----------------------------
 	// Execute query
 	// -----------------------------
-	rows, err := r.DB.Query(ctx, query, args...)
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, args...)
 	if err != nil {
 		db.CaptureError(err, query, args, "query")
 		return nil, errx.InternalError()
@@ -1327,12 +1824,16 @@ func (r *contactRepository) Search(
 	// then produces [null], which crashes any downstream `.subscribed`
 	// access. Always return an array.
 	contacts := make([]models.Contact, 0, limit+1)
+	// The sort value of each row, kept alongside so the next cursor carries the
+	// boundary instead of re-reading it from a row that may be gone by then.
+	sortValues := make([]*string, 0, limit+1)
 	for rows.Next() {
 		var c models.Contact
-		var campaignCount int
 		var campaignsJSON []byte
 		var categoriesJSON []byte
 		var leadProgressJSON []byte
+		var outreachJSON []byte
+		var sortValue *string
 
 		if err := rows.Scan(
 			&c.ID, &c.FirstName, &c.LastName, &c.Email,
@@ -1340,7 +1841,9 @@ func (r *contactRepository) Search(
 			&c.UpdatedAt, &c.CreatedAt,
 			&c.VerificationStatus, &c.VerificationReason, &c.IsCatchAll, &c.VerificationCheckedAt,
 			&c.VerificationSource, &c.VerificationProvider, &c.VerificationSubStatus, &c.VerificationConfidence,
-			&campaignCount, &campaignsJSON, &categoriesJSON, &leadProgressJSON,
+			&c.VerificationRequestedAt, &c.MailHost, &c.ESPProvider,
+			&campaignsJSON, &categoriesJSON, &leadProgressJSON, &outreachJSON,
+			&sortValue,
 		); err != nil {
 			db.CaptureError(err, "", nil, "scan")
 			return nil, errx.InternalError()
@@ -1361,12 +1864,21 @@ func (r *contactRepository) Search(
 				TotalSteps int        `json:"total_steps"`
 				LastAt     *time.Time `json:"last_at"`
 				Step       *string    `json:"step"`
+				// The lead row's own fields, read together because they come
+				// from one campaign_leads row.
+				Lead *leadRowJSON `json:"lead"`
 
 				Undeliverable bool `json:"undeliverable"`
 			}
 			if err := json.Unmarshal(leadProgressJSON, &lp); err != nil {
-				sentry.CaptureException(err)
+				errs.CaptureException(err)
 				return nil, errx.InternalError()
+			}
+			// Absent only when the contact is not a lead of the campaign,
+			// which the outer query already excludes.
+			lead := lp.Lead
+			if lead == nil {
+				lead = &leadRowJSON{}
 			}
 			status := models.LeadStatusPending
 			switch {
@@ -1378,10 +1890,16 @@ func (r *contactRepository) Search(
 				status = models.LeadStatusReplied
 			case lp.Failed > 0:
 				status = models.LeadStatusFailed
+			case lead.Hold != nil && lead.Hold.Source == "send_recovery":
+				status = models.LeadStatusPaused
 			case lp.Sent > 0 && lp.TotalSteps > 0 && lp.Sent >= lp.TotalSteps:
 				// Every email step has been sent and the contact hasn't replied
 				// or bounced: the sequence is exhausted, so the lead is done.
 				status = models.LeadStatusCompleted
+			case lead.Hold != nil:
+				// Parked mid-sequence: an out-of-office auto-reply or a
+				// member's own pause. The lead keeps its place and resumes.
+				status = models.LeadStatusPaused
 			case lp.Sent > 0:
 				status = models.LeadStatusActive
 			case lp.Undeliverable:
@@ -1397,8 +1915,15 @@ func (r *contactRepository) Search(
 			if status == models.LeadStatusFailed && lp.FailReason != nil {
 				failureReason = *lp.FailReason
 			}
+			sender := ""
+			if lead.Sender != nil {
+				sender = *lead.Sender
+			}
 			c.CampaignLead = &models.ContactCampaignProgress{
 				Status:         status,
+				Hold:           lead.Hold,
+				CC:             lead.CC,
+				Sender:         sender,
 				Sent:           lp.Sent,
 				Opened:         lp.Opened,
 				MachineOpened:  lp.MachineOpn,
@@ -1411,13 +1936,21 @@ func (r *contactRepository) Search(
 			}
 		}
 
+		c.Outreach = &models.ContactOutreach{}
+		if len(outreachJSON) > 0 {
+			if err := json.Unmarshal(outreachJSON, c.Outreach); err != nil {
+				errs.CaptureException(err)
+				return nil, errx.InternalError()
+			}
+		}
+
 		if len(campaignsJSON) > 0 {
 			var campaigns []struct {
 				ID   string `json:"id"`
 				Name string `json:"name"`
 			}
 			if err := json.Unmarshal(campaignsJSON, &campaigns); err != nil {
-				sentry.CaptureException(err)
+				errs.CaptureException(err)
 				return nil, errx.InternalError()
 			}
 			c.Campaigns = make([]models.MiniCampaign, len(campaigns))
@@ -1430,7 +1963,7 @@ func (r *contactRepository) Search(
 
 		if len(categoriesJSON) > 0 {
 			if err := json.Unmarshal(categoriesJSON, &c.Categories); err != nil {
-				sentry.CaptureException(err)
+				errs.CaptureException(err)
 				return nil, errx.InternalError()
 			}
 		}
@@ -1439,15 +1972,16 @@ func (r *contactRepository) Search(
 		}
 
 		contacts = append(contacts, c)
+		sortValues = append(sortValues, sortValue)
 	}
 
-	// Next cursor
+	// Next cursor. The (limit+1)-th row is the first row of the NEXT page, so
+	// its position is the boundary and the id comparison is inclusive.
 	var nextCursor *string
 	var hasMore bool
 	if len(contacts) > int(limit) {
 		hasMore = true
-		nextID := contacts[limit].ID
-		nextCursor = paging.EncodeUUID(nextID)
+		nextCursor = paging.EncodeSort(sortKey, sortValues[limit], contacts[limit].ID)
 		contacts = contacts[:limit]
 	}
 
@@ -1466,6 +2000,77 @@ func (r *contactRepository) Search(
 // campaign membership derived from the campaign_leads count), and per-category
 // contact counts joined through the org's contacts. Independent of any search
 // filter, like the campaigns-overview drawer counts.
+// SearchIDs resolves a search request to the matching contact ids. It shares
+// buildContactFilter with Search, so the set is exactly the one the list
+// showed; ordering follows the same sort so a capped result is the first max
+// rows the user was looking at rather than an arbitrary slice.
+func (r *contactRepository) SearchIDs(ctx context.Context, orgID string, filters models.SearchContacts, max int) ([]uuid.UUID, *errx.Error) {
+	if _, err := uuid.Parse(orgID); err != nil {
+		return nil, errx.ErrUuid
+	}
+	if max <= 0 {
+		max = models.MaxContactBulkSelection
+	}
+
+	fq, ferr := r.buildContactFilter(ctx, orgID, filters)
+	if ferr != nil {
+		return nil, ferr
+	}
+	args := fq.args
+	argIndex := fq.nextArg
+
+	sortName, spec := resolveContactSort(filters.SortBy, &args, &argIndex)
+	direction, nulls := "DESC", "NULLS FIRST"
+	if filters.Reverse {
+		direction, nulls = "ASC", "NULLS LAST"
+	}
+	// Same rule as Search: the count lateral costs a scan, so it is joined only
+	// when a filter or the sort actually reads it.
+	campaignCountJoin := ""
+	if filters.MinCampaigns != nil || filters.MaxCampaigns != nil || sortName == "campaign_count" {
+		campaignCountJoin = campaignCountLateral
+	}
+
+	whereSQL := ""
+	if len(fq.clauses) > 0 {
+		whereSQL = "WHERE " + strings.Join(fq.clauses, " AND ")
+	}
+
+	// max+1 so the caller can report "more than max match" instead of silently
+	// acting on a truncated set.
+	query := fmt.Sprintf(`
+		SELECT c.id
+		FROM contacts c
+		%s
+		%s
+		ORDER BY %s %s %s, c.id %s
+		LIMIT $%d
+	`, campaignCountJoin, whereSQL, spec.expr, direction, nulls, direction, argIndex)
+	args = append(args, max+1)
+
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, args...)
+	if err != nil {
+		db.CaptureError(err, query, args, "query")
+		return nil, errx.InternalError()
+	}
+	defer rows.Close()
+
+	ids := make([]uuid.UUID, 0, 256)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			db.CaptureError(err, "", nil, "scan")
+			return nil, errx.InternalError()
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		db.CaptureError(err, query, args, "rows")
+		return nil, errx.InternalError()
+	}
+	return ids, nil
+}
+
 func (r *contactRepository) SearchCounts(ctx context.Context, orgID string) (*models.ContactsCounts, *errx.Error) {
 	counts := &models.ContactsCounts{Categories: []models.ContactCategoryCount{}}
 
@@ -1478,13 +2083,14 @@ func (r *contactRepository) SearchCounts(ctx context.Context, orgID string) (*mo
 			COUNT(*) FILTER (WHERE COALESCE(cl.campaign_count, 0) = 0)
 		FROM contacts c
 		LEFT JOIN (
-			SELECT contact_id, COUNT(campaign_id) AS campaign_count
-			FROM campaign_leads
-			GROUP BY contact_id
+			SELECT l.contact_id, COUNT(l.campaign_id) AS campaign_count
+			FROM campaign_leads l
+			JOIN contacts lc ON lc.id = l.contact_id AND lc.organization_id = $1
+			GROUP BY l.contact_id
 		) cl ON c.id = cl.contact_id
 		WHERE c.organization_id = $1
 	`
-	if err := r.DB.QueryRow(ctx, scalarQuery, orgID).Scan(
+	if err := resultDB(ctx, r.DB).QueryRow(ctx, scalarQuery, orgID).Scan(
 		&counts.Total, &counts.Subscribed, &counts.Unsubscribed,
 		&counts.InCampaign, &counts.NotContacted,
 	); err != nil {
@@ -1499,7 +2105,7 @@ func (r *contactRepository) SearchCounts(ctx context.Context, orgID string) (*mo
 		WHERE c.organization_id = $1
 		GROUP BY cc.category_id
 	`
-	rows, err := r.DB.Query(ctx, categoryQuery, orgID)
+	rows, err := resultDB(ctx, r.DB).Query(ctx, categoryQuery, orgID)
 	if err != nil {
 		db.CaptureError(err, categoryQuery, []any{orgID}, "query")
 		return nil, errx.InternalError()
@@ -1529,7 +2135,7 @@ func (r *contactRepository) DistinctCustomFieldKeys(ctx context.Context, orgID u
 		ORDER BY count(*) DESC, key ASC
 		LIMIT 200
 	`
-	rows, err := r.DB.Query(ctx, query, orgID)
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, orgID)
 	if err != nil {
 		db.CaptureError(err, query, []any{orgID}, "query")
 		return nil, err
@@ -1566,7 +2172,11 @@ func leadStatusClause(status, cp string) string {
 			cp, col,
 		)
 	}
-	sent, replied, bounced := has("sent_at"), has("replied_at"), has("bounced_at")
+	sent := fmt.Sprintf(
+		"EXISTS (SELECT 1 FROM campaign_contact_progress p WHERE p.campaign_id = %s AND p.contact_id = c.id AND p.sent_at IS NOT NULL AND %s)",
+		cp, progressIsEmailStep("p"),
+	)
+	replied, bounced := has("replied_at"), has("bounced_at")
 	// failed: a step the mailbox could not send after every retry (sent_at was
 	// walked back and the attempt cap is spent).
 	failed := fmt.Sprintf(
@@ -1577,11 +2187,13 @@ func leadStatusClause(status, cp string) string {
 	// allSent: every email step of the campaign has been sent to this contact.
 	allSent := fmt.Sprintf(
 		"((SELECT COUNT(*) FROM sequences st WHERE st.campaign_id = %[1]s AND st.kind = 'email') > 0 "+
-			"AND (SELECT COUNT(*) FROM campaign_contact_progress p WHERE p.campaign_id = %[1]s AND p.contact_id = c.id AND p.sent_at IS NOT NULL) "+
+			"AND (SELECT COUNT(*) FROM campaign_contact_progress p WHERE p.campaign_id = %[1]s AND p.contact_id = c.id AND p.sent_at IS NOT NULL AND "+progressIsEmailStep("p")+") "+
 			">= (SELECT COUNT(*) FROM sequences st WHERE st.campaign_id = %[1]s AND st.kind = 'email'))",
 		cp,
 	)
 	undeliverable := undeliverableClause(cp)
+	held := leadHeldClause(cp)
+	allSent = "(" + allSent + " AND NOT EXISTS (SELECT 1 FROM campaign_leads recovery WHERE recovery.campaign_id=" + cp + " AND recovery.contact_id=c.id AND recovery.send_outcome_pending_at IS NOT NULL))"
 	switch status {
 	case models.LeadStatusUnsubscribed:
 		return "NOT c.subscribed"
@@ -1593,23 +2205,41 @@ func leadStatusClause(status, cp string) string {
 		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND %s)", bounced, replied, failed)
 	case models.LeadStatusCompleted:
 		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND %s AND %s)", bounced, replied, failed, sent, allSent)
+	case models.LeadStatusPaused:
+		// Below completed and above everything still in flight: a lead with
+		// every step sent is done whether or not someone parked it, while one
+		// mid-sequence reads as held rather than as processing or queued.
+		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND NOT (%s AND %s) AND %s)", bounced, replied, failed, sent, allSent, held)
 	case models.LeadStatusActive:
-		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND %s AND NOT %s)", bounced, replied, failed, sent, allSent)
+		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND %s AND NOT %s AND NOT %s)", bounced, replied, failed, sent, allSent, held)
 	case models.LeadStatusUndeliverable:
-		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND NOT %s AND %s)", bounced, replied, failed, sent, undeliverable)
+		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND NOT %s AND NOT %s AND %s)", bounced, replied, failed, sent, held, undeliverable)
 	case models.LeadStatusPending:
-		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND NOT %s AND NOT %s)", bounced, replied, failed, sent, undeliverable)
+		return fmt.Sprintf("(c.subscribed AND NOT %s AND NOT %s AND NOT %s AND NOT %s AND NOT %s AND NOT %s)", bounced, replied, failed, sent, held, undeliverable)
 	default:
 		return ""
 	}
+}
+
+// leadHeldClause is the "this lead's flow is parked right now" predicate for a
+// contact-scoped query, built on the one definition of live in liveHold. The
+// Leads-view status filter, the scope-chip counts and the row-level status all
+// have to agree to the second, and a dated hold stops counting the moment it
+// expires without anything having to write. `cp` is the bound campaign-id
+// placeholder.
+func leadHeldClause(cp string) string {
+	return fmt.Sprintf(
+		"EXISTS (SELECT 1 FROM campaign_leads hl WHERE hl.campaign_id = %s AND hl.contact_id = c.id AND %s)",
+		cp, effectiveLeadHold("hl"),
+	)
 }
 
 // CampaignLeadCounts returns per-status lead totals for one campaign (the
 // campaign Leads view scope chips). A single aggregate over the campaign's
 // leads joined to their contact and a rolled-up view of their progress, so the
 // buckets follow the same unsubscribed > bounced > replied > failed >
-// completed > processing > undeliverable > queued priority as the row-level
-// derived status.
+// completed > paused > processing > undeliverable > queued priority as the
+// row-level derived status.
 // Scoped to the org through the contacts join.
 // leadEngagementClause builds the WHERE predicate for one engagement filter
 // value inside ONE campaign (`cp` is that campaign's bound placeholder). An
@@ -1624,7 +2254,7 @@ func leadEngagementClause(engagement, cp string) string {
 			cp, cond,
 		)
 	}
-	sent := has("p.sent_at IS NOT NULL")
+	sent := has("p.sent_at IS NOT NULL AND " + progressIsEmailStep("p"))
 	opened := has("p.opened_at IS NOT NULL AND NOT p.opened_machine")
 	clicked := has("p.clicked_at IS NOT NULL")
 	replied := has("p.replied_at IS NOT NULL")
@@ -1652,8 +2282,10 @@ func leadEngagementClause(engagement, cp string) string {
 func (r *contactRepository) CampaignLeadCounts(ctx context.Context, orgID, campaignID string) (*models.CampaignLeadCounts, *errx.Error) {
 	// A lead is "done" (completed) when every email step has been sent and it
 	// hasn't replied or bounced; "processing" when some but not all steps sent.
-	const done = "ts.total_steps > 0 AND COALESCE(pr.sent_steps, 0) >= ts.total_steps"
+	done := "(ts.total_steps > 0 AND COALESCE(pr.sent_steps, 0) >= ts.total_steps) AND NOT " + recoveryPausedLeadSQL("cl")
 	const live = "c.subscribed AND NOT COALESCE(pr.has_bounced, false) AND NOT COALESCE(pr.has_replied, false) AND NOT COALESCE(pr.has_failed, false)"
+	// The same definition of live the row status and the status filter read.
+	held := effectiveLeadHold("cl")
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) AS total,
@@ -1662,34 +2294,40 @@ func (r *contactRepository) CampaignLeadCounts(ctx context.Context, orgID, campa
 			COUNT(*) FILTER (WHERE c.subscribed AND NOT COALESCE(pr.has_bounced, false) AND COALESCE(pr.has_replied, false)) AS replied,
 			COUNT(*) FILTER (WHERE c.subscribed AND NOT COALESCE(pr.has_bounced, false) AND NOT COALESCE(pr.has_replied, false) AND COALESCE(pr.has_failed, false)) AS failed,
 			COUNT(*) FILTER (WHERE %[2]s AND COALESCE(pr.has_sent, false) AND (%[1]s)) AS completed,
-			COUNT(*) FILTER (WHERE %[2]s AND COALESCE(pr.has_sent, false) AND NOT (%[1]s)) AS processing,
-			COUNT(*) FILTER (WHERE %[2]s AND NOT COALESCE(pr.has_sent, false) AND %[3]s) AS undeliverable,
-			COUNT(*) FILTER (WHERE %[2]s AND NOT COALESCE(pr.has_sent, false) AND NOT %[3]s) AS queued,
+			COUNT(*) FILTER (WHERE %[2]s AND NOT (COALESCE(pr.has_sent, false) AND (%[1]s)) AND %[4]s) AS paused,
+			COUNT(*) FILTER (WHERE %[2]s AND COALESCE(pr.has_sent, false) AND NOT (%[1]s) AND NOT %[4]s) AS processing,
+			COUNT(*) FILTER (WHERE %[2]s AND NOT COALESCE(pr.has_sent, false) AND NOT %[4]s AND %[3]s) AS undeliverable,
+			COUNT(*) FILTER (WHERE %[2]s AND NOT COALESCE(pr.has_sent, false) AND NOT %[4]s AND NOT %[3]s) AS queued,
 			COUNT(*) FILTER (WHERE COALESCE(pr.has_sent, false)) AS contacted,
 			COUNT(*) FILTER (WHERE COALESCE(pr.has_opened, false)) AS opened,
 			COUNT(*) FILTER (WHERE COALESCE(pr.has_clicked, false)) AS clicked,
-			COUNT(*) FILTER (WHERE COALESCE(pr.has_replied, false)) AS replied_any
+			COUNT(*) FILTER (WHERE COALESCE(pr.has_replied, false)) AS replied_any,
+			COUNT(*) FILTER (WHERE c.esp_provider = 'gmail') AS provider_gmail,
+			COUNT(*) FILTER (WHERE c.esp_provider = 'outlook') AS provider_outlook,
+			COUNT(*) FILTER (WHERE c.esp_provider = 'other' OR (c.esp_provider = '' AND c.esp_resolved_at IS NOT NULL)) AS provider_other,
+			COUNT(*) FILTER (WHERE c.esp_provider = '' AND c.esp_resolved_at IS NULL) AS provider_undetected
 		FROM campaign_leads cl
 		JOIN contacts c ON c.id = cl.contact_id AND c.organization_id = $2
 		CROSS JOIN (SELECT COUNT(*) AS total_steps FROM sequences st WHERE st.campaign_id = $1 AND st.kind = 'email') ts
 		LEFT JOIN LATERAL (
 			SELECT
-				bool_or(p.sent_at IS NOT NULL)    AS has_sent,
+				bool_or(p.sent_at IS NOT NULL AND %[5]s) AS has_sent,
 				bool_or(p.replied_at IS NOT NULL) AS has_replied,
 				bool_or(p.bounced_at IS NOT NULL) AS has_bounced,
 				bool_or(p.opened_at IS NOT NULL AND NOT p.opened_machine) AS has_opened,
 				bool_or(p.clicked_at IS NOT NULL) AS has_clicked,
 				bool_or(p.sent_at IS NULL AND p.failed_at IS NOT NULL AND p.send_attempts >= $3) AS has_failed,
-				COUNT(*) FILTER (WHERE p.sent_at IS NOT NULL) AS sent_steps
+				COUNT(*) FILTER (WHERE p.sent_at IS NOT NULL AND %[5]s) AS sent_steps
 			FROM campaign_contact_progress p
 			WHERE p.campaign_id = cl.campaign_id AND p.contact_id = cl.contact_id
 		) pr ON true
 		WHERE cl.campaign_id = $1
-	`, done, live, undeliverableClause("$1"))
+	`, done, live, undeliverableClause("$1"), held, progressIsEmailStep("p"))
 	out := &models.CampaignLeadCounts{}
-	if err := r.DB.QueryRow(ctx, query, campaignID, orgID, config.CampaignSendMaxAttempts).Scan(
-		&out.Total, &out.Unsubscribed, &out.Bounced, &out.Replied, &out.Failed, &out.Completed, &out.Processing, &out.Undeliverable, &out.Queued,
+	if err := resultDB(ctx, r.DB).QueryRow(ctx, query, campaignID, orgID, config.CampaignSendMaxAttempts).Scan(
+		&out.Total, &out.Unsubscribed, &out.Bounced, &out.Replied, &out.Failed, &out.Completed, &out.Paused, &out.Processing, &out.Undeliverable, &out.Queued,
 		&out.Contacted, &out.Opened, &out.Clicked, &out.RepliedAny,
+		&out.Providers.Google, &out.Providers.Microsoft, &out.Providers.Other, &out.Providers.Undetected,
 	); err != nil {
 		if err == pgx.ErrNoRows {
 			return out, nil
@@ -1701,7 +2339,7 @@ func (r *contactRepository) CampaignLeadCounts(ctx context.Context, orgID, campa
 }
 
 func (r *contactRepository) Update(ctx context.Context, userID, contactID string, orgID uuid.UUID, data *models.UpdateContact) (*models.Contact, *errx.Error) {
-	tx, err := r.DB.Begin(ctx)
+	tx, err := beginResultTx(ctx, r.DB)
 	if err != nil {
 		db.CaptureError(err, "", nil, "begin")
 		return nil, errx.InternalError()
@@ -1711,11 +2349,15 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 	// Validate contact existence and fetch current data
 	var c models.Contact
 	var campaignsJSON []byte
+	// The owner is read for the email-uniqueness check: the unique index is
+	// (user_id, lower(email)), which an org-scoped check alone does not cover
+	// for a member who owns contacts in more than one workspace.
+	var ownerID uuid.UUID
 
 	query := `
 		SELECT 
 			c.id, c.first_name, c.last_name, c.email, c.company, c.phone,
-			c.custom_fields, c.subscribed, c.updated_at, c.created_at,
+			c.custom_fields, c.subscribed, c.updated_at, c.created_at, c.user_id,
 			COALESCE(
 				(
 					SELECT json_agg(json_build_object('id', cam.id, 'name', cam.name))
@@ -1741,7 +2383,7 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 	).Scan(
 		&c.ID, &c.FirstName, &c.LastName, &c.Email,
 		&c.Company, &c.Phone, &c.CustomFields, &c.Subscribed,
-		&c.UpdatedAt, &c.CreatedAt, &campaignsJSON,
+		&c.UpdatedAt, &c.CreatedAt, &ownerID, &campaignsJSON,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, errx.ErrNotFound
@@ -1761,7 +2403,7 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 			Name string `json:"name"`
 		}
 		if err := json.Unmarshal(campaignsJSON, &campaigns); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return nil, errx.InternalError()
 		}
 		c.Campaigns = make([]models.MiniCampaign, len(campaigns))
@@ -1779,6 +2421,67 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 	var setClauses []string
 	var args []interface{}
 	argIndex := 1
+
+	// The address is the contact's identity: a changed one is checked for a
+	// collision here rather than left to the unique index, which surfaces as a
+	// 500, and it invalidates every verdict and observation the old mailbox
+	// earned (reset below, with the evidence rows dropped after the update).
+	emailChanged := false
+	if data.Email != nil {
+		next, ok := email.Normalize(*data.Email)
+		if !ok {
+			return nil, errx.ErrEmail
+		}
+		// Two different comparisons. A stored address that predates
+		// normalization can differ from `next` only in case, which is still a
+		// write (the row is normalized) but not a different mailbox, so it must
+		// not throw away a verdict the address earned.
+		if next != c.Email {
+			setClauses = append(setClauses, fmt.Sprintf("email = $%d", argIndex))
+			args = append(args, next)
+			argIndex++
+		}
+		if next != strings.ToLower(c.Email) {
+			var taken bool
+			dupQ := `SELECT EXISTS (
+				SELECT 1 FROM contacts
+				WHERE LOWER(email) = $1 AND id <> $2 AND (organization_id = $3 OR user_id = $4)
+			)`
+			dupP := []any{next, contactID, orgID, ownerID}
+			if err := tx.QueryRow(ctx, dupQ, dupP...).Scan(&taken); err != nil {
+				db.CaptureError(err, dupQ, dupP, "queryrow")
+				return nil, errx.InternalError()
+			}
+			if taken {
+				return nil, errx.ErrContactEmailTaken
+			}
+			emailChanged = true
+			setClauses = append(setClauses,
+				"verification_status = 'unknown'",
+				"verification_sub_status = ''",
+				"verification_reason = ''",
+				"verification_source = ''",
+				"verification_provider = ''",
+				"is_catch_all = false",
+				"verification_checked_at = NULL",
+				"verification_check_status = ''",
+				"verification_confidence = 0",
+				"verification_evidence_at = NULL",
+				// The ledger the verdict is scored from is wiped below, and
+				// this is the watermark that keeps it wiped: the delivery
+				// credit job re-derives 'delivered' rows from every step ever
+				// sent, so without it the old mailbox's deliveries come back on
+				// the next pass and hand the new address a verdict it never
+				// earned.
+				"verification_evidence_reset_at = NOW()",
+				// The inbox host belongs to the old domain; clearing it puts
+				// the contact back in front of the provider sweep.
+				"mail_host = ''",
+				"esp_provider = ''",
+				"esp_resolved_at = NULL",
+			)
+		}
+	}
 
 	// Update fields if provided
 	if data.FirstName != nil {
@@ -1850,11 +2553,28 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 			if err == pgx.ErrNoRows {
 				return nil, errx.ErrNotFound
 			}
+			// The collision check above is a read, so two edits moving two
+			// contacts onto one address can both pass it and the index
+			// decides. The loser gets the same answer it would have got a
+			// moment earlier rather than a 500.
+			if isUniqueViolation(err) {
+				return nil, errx.ErrContactEmailTaken
+			}
 			db.CaptureError(err, query, args, "queryrow")
 			return nil, errx.InternalError()
 		}
 	} else {
 		updatedContact = c // No fields updated, use existing contact
+	}
+
+	// The evidence ledger is a record of what a mailbox did, so it follows the
+	// address rather than the row. Leaving it would let the scorer hand the new
+	// address a verdict earned by the old one.
+	if emailChanged {
+		if _, err := tx.Exec(ctx, `DELETE FROM contact_verification_evidence WHERE contact_id = $1`, contactID); err != nil {
+			db.CaptureError(err, "", nil, "verification evidence wipe")
+			return nil, errx.InternalError()
+		}
 	}
 
 	// Campaigns are organization assets: scoping membership by the caller made a
@@ -1940,6 +2660,9 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 				return nil, errx.InternalError()
 			}
 			campaignsAdded = append(campaignsAdded, added...)
+			// No claim to make here: toInsert is the difference against the
+			// contact's current membership, so it never names a campaign they
+			// are already a lead of.
 		}
 	}
 
@@ -1975,7 +2698,7 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 			Name string `json:"name"`
 		}
 		if err := json.Unmarshal(newCampaignsJSON, &campaigns); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return nil, errx.InternalError()
 		}
 		for _, c := range campaigns {
@@ -1996,14 +2719,14 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 		if perr != nil {
 			return nil, perr
 		}
-		// Drop everything not in the (user-owned) wanted set, then insert the
-		// rest; RETURNING on both sides is what feeds the timeline.
+		// Drop everything not in the (workspace-owned) wanted set, then insert
+		// the rest; RETURNING on both sides is what feeds the timeline.
 		drows, err := tx.Query(ctx, `
 			DELETE FROM contact_categories
 			WHERE contact_id = $1
-			  AND category_id NOT IN (SELECT id FROM categories WHERE id = ANY($2) AND user_id = $3)
+			  AND category_id NOT IN (SELECT id FROM categories WHERE id = ANY($2) AND organization_id = $3)
 			RETURNING category_id
-		`, contactID, ids, userID)
+		`, contactID, ids, orgID)
 		if err != nil {
 			db.CaptureError(err, "", nil, "categories wipe")
 			return nil, errx.InternalError()
@@ -2019,10 +2742,10 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 				INSERT INTO contact_categories (contact_id, category_id)
 				SELECT $1, cat.id
 				FROM   categories cat
-				WHERE  cat.id = ANY($2) AND cat.user_id = $3
+				WHERE  cat.id = ANY($2) AND cat.organization_id = $3
 				ON CONFLICT (contact_id, category_id) DO NOTHING
 				RETURNING category_id
-			`, contactID, ids, userID)
+			`, contactID, ids, orgID)
 			if err != nil {
 				db.CaptureError(err, "", nil, "categories insert")
 				return nil, errx.InternalError()
@@ -2045,10 +2768,10 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 				INSERT INTO contact_categories (contact_id, category_id)
 				SELECT $1, cat.id
 				FROM   categories cat
-				WHERE  cat.id = ANY($2) AND cat.user_id = $3
+				WHERE  cat.id = ANY($2) AND cat.organization_id = $3
 				ON CONFLICT (contact_id, category_id) DO NOTHING
 				RETURNING category_id
-			`, contactID, ids, userID)
+			`, contactID, ids, orgID)
 			if err != nil {
 				db.CaptureError(err, "", nil, "categories add")
 				return nil, errx.InternalError()
@@ -2095,18 +2818,18 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 					SELECT json_agg(json_build_object('id', cat.id, 'title', cat.title, 'color', cat.color) ORDER BY cat.position ASC, cat.title ASC)
 					FROM contact_categories cc
 					JOIN categories cat ON cc.category_id = cat.id
-					WHERE cc.contact_id = $1 AND cat.user_id = $2
+					WHERE cc.contact_id = $1 AND cat.organization_id = $2
 				),
 				'[]'::json
 			)
-		`, contactID, userID).Scan(&catJSON); err != nil {
+		`, contactID, orgID).Scan(&catJSON); err != nil {
 			db.CaptureError(err, "", nil, "categories reload")
 			return nil, errx.InternalError()
 		}
 		updatedContact.Categories = make([]models.MiniCategory, 0)
 		if len(catJSON) > 0 {
 			if err := json.Unmarshal(catJSON, &updatedContact.Categories); err != nil {
-				sentry.CaptureException(err)
+				errs.CaptureException(err)
 				return nil, errx.InternalError()
 			}
 		}
@@ -2138,7 +2861,7 @@ func (r *contactRepository) Update(ctx context.Context, userID, contactID string
 }
 
 func (r *contactRepository) BulkUpdate(ctx context.Context, userID string, orgID uuid.UUID, data *models.BulkEditContactsData) ([]models.Contact, *errx.Error) {
-	tx, err := r.DB.Begin(ctx)
+	tx, err := beginResultTx(ctx, r.DB)
 	if err != nil {
 		db.CaptureError(err, "", nil, "begin")
 		return nil, errx.InternalError()
@@ -2227,6 +2950,12 @@ func (r *contactRepository) BulkUpdate(ctx context.Context, userID string, orgID
 			models.ActivityCampaignAdded, logCampaignLinks, orgID, data.Contacts, data.AddCampaigns); xerr != nil {
 			return nil, xerr
 		}
+		// Claims leads a linked segment had enrolled, so detaching that
+		// segment later leaves hand-picked leads alone.
+		if _, err := tx.Exec(ctx, claimLeadsManualSQL, data.AddCampaigns, data.Contacts, orgID); err != nil {
+			db.CaptureError(err, "", nil, "campaign_leads claim")
+			return nil, errx.InternalError()
+		}
 	}
 
 	if len(data.RemoveCategories) > 0 {
@@ -2250,10 +2979,10 @@ func (r *contactRepository) BulkUpdate(ctx context.Context, userID string, orgID
 		         WHERE c.organization_id = $1
 		           AND c.id = ANY($2)
 		           AND cat.id = ANY($3::uuid[])
-		           AND cat.user_id = $4
+		           AND cat.organization_id = $1
 		         ON CONFLICT DO NOTHING
 		         RETURNING contact_id, category_id`,
-			models.ActivityCategoryAdded, logCategoryLinks, orgID, data.Contacts, data.AddCategories, userID); xerr != nil {
+			models.ActivityCategoryAdded, logCategoryLinks, orgID, data.Contacts, data.AddCategories); xerr != nil {
 			return nil, xerr
 		}
 	}
@@ -2328,7 +3057,7 @@ func (r *contactRepository) BulkUpdate(ctx context.Context, userID string, orgID
 					SELECT json_agg(json_build_object('id', cam.id, 'name', cam.name))
 					FROM campaign_leads cl
 					JOIN campaigns cam ON cl.campaign_id = cam.id
-					WHERE cl.contact_id =c.id AND cam.organization_id = $3
+					WHERE cl.contact_id =c.id AND cam.organization_id = $2
 				),
 				'[]'::json
 			) AS campaigns,
@@ -2337,17 +3066,16 @@ func (r *contactRepository) BulkUpdate(ctx context.Context, userID string, orgID
 					SELECT json_agg(json_build_object('id', cat.id, 'title', cat.title, 'color', cat.color) ORDER BY cat.position ASC, cat.title ASC)
 					FROM contact_categories cc
 					JOIN categories cat ON cc.category_id = cat.id
-					WHERE cc.contact_id = c.id AND cat.user_id = $2
+					WHERE cc.contact_id = c.id AND cat.organization_id = $2
 				),
 				'[]'::json
 			) AS categories
 		FROM contacts c
-		WHERE c.organization_id = $3 AND c.id = ANY($1)
+		WHERE c.organization_id = $2 AND c.id = ANY($1)
 	`
 
 	params := []any{
 		data.Contacts,
-		userID,
 		orgID,
 	}
 	rows, err := tx.Query(
@@ -2385,7 +3113,7 @@ func (r *contactRepository) BulkUpdate(ctx context.Context, userID string, orgID
 				Name string `json:"name"`
 			}
 			if err := json.Unmarshal(campaignsJSON, &campaigns); err != nil {
-				sentry.CaptureException(err)
+				errs.CaptureException(err)
 				return nil, errx.InternalError()
 			}
 			c.Campaigns = make([]models.MiniCampaign, len(campaigns))
@@ -2402,7 +3130,7 @@ func (r *contactRepository) BulkUpdate(ctx context.Context, userID string, orgID
 		c.Categories = make([]models.MiniCategory, 0)
 		if len(categoriesJSON) > 0 {
 			if err := json.Unmarshal(categoriesJSON, &c.Categories); err != nil {
-				sentry.CaptureException(err)
+				errs.CaptureException(err)
 				return nil, errx.InternalError()
 			}
 		}
@@ -2472,8 +3200,16 @@ func (r *contactRepository) Delete(ctx context.Context, userID string, orgID uui
 // otherwise mint a category per row.
 const MaxImportCategoryNames = 100
 
-func (r *contactRepository) ResolveCategoryNames(ctx context.Context, userID uuid.UUID, names []string) (map[string]uuid.UUID, *errx.Error) {
-	out := make(map[string]uuid.UUID, len(names))
+// ValidateImportCategoryNames runs ResolveCategoryNames' checks without
+// writing, so an import can be refused before it starts.
+func ValidateImportCategoryNames(names []string) *errx.Error {
+	_, _, xerr := importCategoryNames(names)
+	return xerr
+}
+
+// importCategoryNames dedupes titles case-insensitively, returning the
+// lowered titles in order and each one's first spelling.
+func importCategoryNames(names []string) ([]string, map[string]string, *errx.Error) {
 	wanted := make([]string, 0, len(names))
 	seen := make(map[string]string, len(names)) // lowered -> original casing
 	for _, raw := range names {
@@ -2482,8 +3218,8 @@ func (r *contactRepository) ResolveCategoryNames(ctx context.Context, userID uui
 			continue
 		}
 		if len(title) > 50 {
-			return nil, errx.New(errx.BadRequest,
-				"category name "+strconv.Quote(title)+" is longer than 50 characters")
+			return nil, nil, errx.New(errx.BadRequest,
+				"label name "+strconv.Quote(title)+" is longer than 50 characters")
 		}
 		lower := strings.ToLower(title)
 		if _, dup := seen[lower]; dup {
@@ -2492,19 +3228,33 @@ func (r *contactRepository) ResolveCategoryNames(ctx context.Context, userID uui
 		seen[lower] = title
 		wanted = append(wanted, lower)
 	}
-	if len(wanted) == 0 {
-		return out, nil
-	}
 	if len(wanted) > MaxImportCategoryNames {
-		return nil, errx.New(errx.BadRequest, fmt.Sprintf(
+		return nil, nil, errx.New(errx.BadRequest, fmt.Sprintf(
 			"the categories column has %d distinct values; at most %d can be created in one import",
 			len(wanted), MaxImportCategoryNames))
 	}
+	return wanted, seen, nil
+}
 
-	rows, err := r.DB.Query(ctx, `
+func (r *contactRepository) ResolveCategoryNames(ctx context.Context, orgID, userID uuid.UUID, names []string) (map[string]uuid.UUID, *errx.Error) {
+	out := make(map[string]uuid.UUID, len(names))
+	wanted, seen, xerr := importCategoryNames(names)
+	if xerr != nil {
+		return nil, xerr
+	}
+	if len(wanted) == 0 {
+		return out, nil
+	}
+
+	// Ordered, and the first match wins: the migration that made this registry
+	// workspace-wide deliberately did not merge two members' identically named
+	// categories, so a title can resolve to more than one row. Without an order
+	// an import would file the same name under a different category run to run.
+	rows, err := resultDB(ctx, r.DB).Query(ctx, `
 		SELECT id, LOWER(title) FROM categories
-		WHERE user_id = $1 AND LOWER(title) = ANY($2::text[])
-	`, userID, wanted)
+		WHERE organization_id = $1 AND LOWER(title) = ANY($2::text[])
+		ORDER BY "position" ASC, created_at ASC, id ASC
+	`, orgID, wanted)
 	if err != nil {
 		db.CaptureError(err, "", nil, "ResolveCategoryNames query")
 		return nil, errx.InternalError()
@@ -2517,7 +3267,9 @@ func (r *contactRepository) ResolveCategoryNames(ctx context.Context, userID uui
 			db.CaptureError(err, "", nil, "ResolveCategoryNames scan")
 			return nil, errx.InternalError()
 		}
-		out[lower] = id
+		if _, taken := out[lower]; !taken {
+			out[lower] = id
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -2535,21 +3287,21 @@ func (r *contactRepository) ResolveCategoryNames(ctx context.Context, userID uui
 		return out, nil
 	}
 
-	// Positions continue after whatever the user already has, so the new
-	// categories land at the end of their list instead of colliding.
+	// Positions continue after whatever the workspace already has, so the new
+	// categories land at the end of the list instead of colliding.
 	var nextPos int32
-	if err := r.DB.QueryRow(ctx,
-		`SELECT COALESCE(MAX(position), -1) + 1 FROM categories WHERE user_id = $1`,
-		userID).Scan(&nextPos); err != nil {
+	if err := resultDB(ctx, r.DB).QueryRow(ctx,
+		`SELECT COALESCE(MAX(position), -1) + 1 FROM categories WHERE organization_id = $1`,
+		orgID).Scan(&nextPos); err != nil {
 		db.CaptureError(err, "", nil, "ResolveCategoryNames position")
 		return nil, errx.InternalError()
 	}
 	for _, lower := range missing {
 		id := uuid.New()
-		if _, err := r.DB.Exec(ctx, `
-			INSERT INTO categories (id, user_id, title, color, position)
-			VALUES ($1, $2, $3, $4, $5)
-		`, id, userID, seen[lower], defaultGroupColor(nextPos), nextPos); err != nil {
+		if _, err := resultDB(ctx, r.DB).Exec(ctx, `
+			INSERT INTO categories (id, organization_id, user_id, title, color, position)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, id, orgID, userID, seen[lower], defaultGroupColor(nextPos), nextPos); err != nil {
 			db.CaptureError(err, "", nil, "ResolveCategoryNames insert")
 			return nil, errx.InternalError()
 		}
@@ -2576,7 +3328,7 @@ func (r *contactRepository) GetByEmailsAndUser(ctx context.Context, userID uuid.
 		return out, nil
 	}
 
-	rows, err := r.DB.Query(ctx, `
+	rows, err := resultDB(ctx, r.DB).Query(ctx, `
 		SELECT id, first_name, last_name, email, company, phone, custom_fields, subscribed, updated_at, created_at
 		FROM contacts
 		WHERE user_id = $1 AND LOWER(email) = ANY($2)
@@ -2601,6 +3353,140 @@ func (r *contactRepository) GetByEmailsAndUser(ctx context.Context, userID uuid.
 		out[strings.ToLower(c.Email)] = c
 	}
 	return out, nil
+}
+
+func (r *contactRepository) ImportLookup(ctx context.Context, orgID, userID uuid.UUID, emails []string) (map[string]uuid.UUID, map[string]bool, *errx.Error) {
+	existing := make(map[string]uuid.UUID, len(emails))
+	elsewhere := map[string]bool{}
+	norm := make([]string, 0, len(emails))
+	for _, e := range emails {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			norm = append(norm, e)
+		}
+	}
+	if len(norm) == 0 {
+		return existing, elsewhere, nil
+	}
+	// The workspace's own contact wins; of two members' copies of one address
+	// the importer's, then the oldest, so reruns resolve to the same row.
+	query := `
+		SELECT DISTINCT ON (LOWER(email)) LOWER(email), id, organization_id = $1
+		FROM contacts
+		WHERE LOWER(email) = ANY($3::text[]) AND (organization_id = $1 OR user_id = $2)
+		ORDER BY LOWER(email), (organization_id = $1) DESC, (user_id = $2) DESC, created_at ASC, id ASC`
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, orgID, userID, norm)
+	if err != nil {
+		db.CaptureError(err, query, nil, "ImportLookup query")
+		return nil, nil, errx.InternalError()
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var addr string
+		var id uuid.UUID
+		var here bool
+		if err := rows.Scan(&addr, &id, &here); err != nil {
+			db.CaptureError(err, query, nil, "ImportLookup scan")
+			return nil, nil, errx.InternalError()
+		}
+		if here {
+			existing[addr] = id
+		} else {
+			elsewhere[addr] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		db.CaptureError(err, query, nil, "ImportLookup rows")
+		return nil, nil, errx.InternalError()
+	}
+	return existing, elsewhere, nil
+}
+
+// ContactImportUpdate is one imported row applied to an existing contact.
+type ContactImportUpdate struct {
+	ID      uuid.UUID
+	Contact models.AddContact
+}
+
+func (r *contactRepository) ImportUpdate(ctx context.Context, orgID uuid.UUID, rows []ContactImportUpdate) ([]bool, *errx.Error) {
+	found := make([]bool, len(rows))
+	if len(rows) == 0 {
+		return found, nil
+	}
+	batch := &pgx.Batch{}
+	for _, row := range rows {
+		c := row.Contact
+		fields := c.CustomFields
+		if fields == nil {
+			fields = map[string]string{}
+		}
+		fields, xerr := normalizeCustomFields(fields)
+		if xerr != nil {
+			return nil, xerr
+		}
+		// The same bound Add holds a new contact to.
+		if data, err := json.Marshal(c); err != nil {
+			return nil, errx.ErrContactSerialize
+		} else if len(data) > config.MaxContactSize {
+			return nil, errx.ErrContactSize
+		}
+		v, xerr := verificationFromRequest(c.VerificationStatus, c.VerificationProvider)
+		if xerr != nil {
+			return nil, xerr
+		}
+		var vStatus, vSub, vReason, vProvider string
+		if v != nil {
+			vStatus, vSub, vReason, vProvider = v.Status, v.SubStatus, v.Reason, v.Provider
+		}
+		batch.Queue(`
+			UPDATE contacts SET
+			  first_name = COALESCE(NULLIF($3, ''), first_name),
+			  last_name = COALESCE(NULLIF($4, ''), last_name),
+			  company = COALESCE(NULLIF($5, ''), company),
+			  phone = COALESCE(NULLIF($6, ''), phone),
+			  custom_fields = custom_fields || $7::jsonb,
+			  subscribed = COALESCE($8::boolean, subscribed),
+			  verification_status = CASE WHEN $9::text <> '' THEN $9 ELSE verification_status END,
+			  verification_sub_status = CASE WHEN $9::text <> '' THEN $10 ELSE verification_sub_status END,
+			  verification_reason = CASE WHEN $9::text <> '' THEN $11 ELSE verification_reason END,
+			  verification_provider = CASE WHEN $9::text <> '' THEN $12 ELSE verification_provider END,
+			  verification_source = CASE WHEN $9::text <> '' THEN 'imported' ELSE verification_source END,
+			  is_catch_all = CASE WHEN $9::text <> '' THEN ($10::text = 'catch_all') ELSE is_catch_all END,
+			  verification_checked_at = CASE WHEN $9::text <> '' THEN NOW() ELSE verification_checked_at END,
+			  updated_at = NOW()
+			WHERE id = $1 AND organization_id = $2`,
+			row.ID, orgID,
+			strings.TrimSpace(c.FirstName), strings.TrimSpace(c.LastName),
+			strings.TrimSpace(c.Company), strings.TrimSpace(c.Phone),
+			fields, c.Subscribed,
+			vStatus, vSub, vReason, vProvider,
+		)
+	}
+
+	tx, err := beginResultTx(ctx, r.DB)
+	if err != nil {
+		db.CaptureError(err, "", nil, "begin")
+		return nil, errx.InternalError()
+	}
+	defer tx.Rollback(ctx)
+	br := tx.SendBatch(ctx, batch)
+	for i := range rows {
+		tag, err := br.Exec()
+		if err != nil {
+			br.Close()
+			db.CaptureError(err, "", nil, "ImportUpdate exec")
+			return nil, errx.InternalError()
+		}
+		found[i] = tag.RowsAffected() > 0
+	}
+	if err := br.Close(); err != nil {
+		db.CaptureError(err, "", nil, "ImportUpdate close")
+		return nil, errx.InternalError()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		db.CaptureError(err, "", nil, "ImportUpdate commit")
+		return nil, errx.InternalError()
+	}
+	return found, nil
 }
 
 // ExportAll fetches every contact matching the given selection so it
@@ -2645,7 +3531,7 @@ func (r *contactRepository) ExportAll(ctx context.Context, orgID string, filters
 	}
 
 	out := make([]models.Contact, 0, 256)
-	var cursor *string
+	var cursor *paging.SortCursor
 	pageSize := int32(500)
 	for {
 		page, xerr := r.Search(ctx, orgID, nil, cursor, search, pageSize)
@@ -2666,14 +3552,13 @@ func (r *contactRepository) ExportAll(ctx context.Context, orgID string, filters
 		if !page.Pagination.HasMore || page.Pagination.NextCursor == nil {
 			break
 		}
-		// NextCursor is now an opaque token; decode it back to the id the next
-		// Search call keys on.
-		id, derr := paging.DecodeUUID(*page.Pagination.NextCursor)
-		if derr != nil {
+		// NextCursor is an opaque token; decode it back to the keyset boundary
+		// the next Search call resumes from.
+		next, derr := paging.DecodeSortCursor(*page.Pagination.NextCursor)
+		if derr != nil || next == nil {
 			break
 		}
-		s := id.String()
-		cursor = &s
+		cursor = next
 	}
 	return out, nil
 }
@@ -2681,7 +3566,7 @@ func (r *contactRepository) ExportAll(ctx context.Context, orgID string, filters
 func (r *contactRepository) GetContactCount(ctx context.Context, userID string) (int, *errx.Error) {
 	query := `SELECT COUNT(*) FROM contacts WHERE user_id = $1`
 	var count int
-	err := r.DB.QueryRow(ctx, query, userID).Scan(&count)
+	err := resultDB(ctx, r.DB).QueryRow(ctx, query, userID).Scan(&count)
 	if err != nil {
 		db.CaptureError(err, query, []any{userID}, "queryrow")
 		return 0, errx.InternalError()
@@ -2705,14 +3590,16 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 	var campaignsJSON, categoriesJSON []byte
 	// Scope the contact row to the org so teammates can open each other's
 	// contacts. Without an org (e.g. an API key with no selected org) fall
-	// back to the legacy user scope. Campaigns are org assets, so the badge
-	// subselect follows the same scope (issue #187); the category subselect
-	// stays user-scoped because categories has no organization_id column.
-	rowScope := "c.user_id = $1"
-	campScope := "cam.user_id = $1"
+	// back to the legacy user scope. Campaigns and categories are org assets,
+	// so their badge subselects follow the same scope (issues #187, #436).
+	// $1 is the contact and $2 is whichever of the two scopes applies, so the
+	// statement never carries a parameter nothing references (Postgres cannot
+	// infer a type for one of those and rejects the whole query).
+	rowScope, campScope, catScope := "c.user_id = $2", "cam.user_id = $2", "cat.user_id = $2"
+	scopeArg := any(userID)
 	if orgID != nil {
-		rowScope = "c.organization_id = $3"
-		campScope = "cam.organization_id = $3"
+		rowScope, campScope, catScope = "c.organization_id = $2", "cam.organization_id = $2", "cat.organization_id = $2"
+		scopeArg = *orgID
 	}
 	mainQuery := fmt.Sprintf(`
 		SELECT
@@ -2732,17 +3619,14 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 					SELECT json_agg(json_build_object('id', cat.id, 'title', cat.title, 'color', cat.color) ORDER BY cat.position ASC, cat.title ASC)
 					FROM   contact_categories cc
 					JOIN   categories cat ON cat.id = cc.category_id
-					WHERE  cc.contact_id = c.id AND cat.user_id = $1
+					WHERE  cc.contact_id = c.id AND %s
 				), '[]'::json
 			) AS categories
 		FROM contacts c
-		WHERE c.id = $2 AND %s
-	`, campScope, rowScope)
-	mainArgs := []any{userID, contactID}
-	if orgID != nil {
-		mainArgs = append(mainArgs, *orgID)
-	}
-	err := r.DB.QueryRow(ctx, mainQuery, mainArgs...).Scan(
+		WHERE c.id = $1 AND %s
+	`, campScope, catScope, rowScope)
+	mainArgs := []any{contactID, scopeArg}
+	err := resultDB(ctx, r.DB).QueryRow(ctx, mainQuery, mainArgs...).Scan(
 		&detail.ID, &detail.FirstName, &detail.LastName, &detail.Email,
 		&detail.Company, &detail.Phone, &detail.CustomFields, &detail.Subscribed,
 		&detail.UpdatedAt, &detail.CreatedAt,
@@ -2766,7 +3650,7 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 			Name string `json:"name"`
 		}
 		if err := json.Unmarshal(campaignsJSON, &raw); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return nil, errx.InternalError()
 		}
 		detail.Campaigns = make([]models.MiniCampaign, len(raw))
@@ -2777,7 +3661,7 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 	detail.Categories = []models.MiniCategory{}
 	if len(categoriesJSON) > 0 {
 		if err := json.Unmarshal(categoriesJSON, &detail.Categories); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return nil, errx.InternalError()
 		}
 	}
@@ -2785,19 +3669,20 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 	// 2. Engagement aggregates. campaign_contact_progress is the canonical
 	//    sent/opened/clicked/replied/bounced ledger keyed by (campaign,
 	//    contact, sequence). Counts come from non-null timestamp columns,
-	//    "last X" comes from MAX() of each.
+	//    "last X" comes from MAX() of each. Opens count people only: a machine
+	//    open is a delivery signal, not engagement, here as in analytics.
 	engQuery := `
 		SELECT
-			COUNT(*) FILTER (WHERE sent_at    IS NOT NULL) AS sent,
-			COUNT(*) FILTER (WHERE opened_at  IS NOT NULL) AS opened,
+			COUNT(*) FILTER (WHERE sent_at    IS NOT NULL AND ` + progressIsEmailStep("p") + `) AS sent,
+			COUNT(*) FILTER (WHERE opened_at  IS NOT NULL AND NOT opened_machine) AS opened,
 			COUNT(*) FILTER (WHERE clicked_at IS NOT NULL) AS clicked,
 			COUNT(*) FILTER (WHERE replied_at IS NOT NULL) AS replied,
 			COUNT(*) FILTER (WHERE bounced_at IS NOT NULL) AS bounced,
-			MAX(sent_at), MAX(opened_at), MAX(clicked_at), MAX(replied_at), MAX(bounced_at)
-		FROM campaign_contact_progress
+			MAX(sent_at) FILTER (WHERE ` + progressIsEmailStep("p") + `), MAX(opened_at) FILTER (WHERE NOT opened_machine), MAX(clicked_at), MAX(replied_at), MAX(bounced_at)
+		FROM campaign_contact_progress p
 		WHERE contact_id = $1
 	`
-	if err := r.DB.QueryRow(ctx, engQuery, contactID).Scan(
+	if err := resultDB(ctx, r.DB).QueryRow(ctx, engQuery, contactID).Scan(
 		&detail.Engagement.TotalSent, &detail.Engagement.TotalOpened,
 		&detail.Engagement.TotalClicked, &detail.Engagement.TotalReplied,
 		&detail.Engagement.TotalBounced,
@@ -2811,6 +3696,40 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 
 	// 3. Org-scoped extras. Only run when we have an org id.
 	if orgID != nil {
+		// How the contact reads: a person's opens grouped by client and
+		// device. Opens with nothing known about them are left out.
+		readsQuery := `
+			SELECT o.client, o.client_type, o.device_hidden, o.device_type, o.os, o.browser,
+			       COUNT(*), MAX(o.opened_at)
+			FROM email_opens o
+			JOIN campaigns cam ON cam.id = o.campaign_id
+			WHERE o.contact_id = $1 AND cam.organization_id = $2 AND NOT o.machine
+			  AND (o.client <> '' OR o.device_hidden OR o.device_type <> '')
+			GROUP BY 1, 2, 3, 4, 5, 6
+			ORDER BY MAX(o.opened_at) DESC
+			LIMIT 4
+		`
+		rrows, qerr := resultDB(ctx, r.DB).Query(ctx, readsQuery, contactID, *orgID)
+		if qerr != nil {
+			db.CaptureError(qerr, readsQuery, []any{contactID, *orgID}, "GetDetail reads on")
+			return nil, errx.InternalError()
+		}
+		for rrows.Next() {
+			var ro models.ContactReadingOrigin
+			if err := rrows.Scan(&ro.Client, &ro.ClientType, &ro.DeviceHidden, &ro.DeviceType, &ro.OS, &ro.Browser,
+				&ro.Opens, &ro.LastOpenedAt); err != nil {
+				rrows.Close()
+				db.CaptureError(err, "", nil, "GetDetail reads on scan")
+				return nil, errx.InternalError()
+			}
+			detail.Engagement.ReadsOn = append(detail.Engagement.ReadsOn, ro)
+		}
+		rrows.Close()
+		if rerr := rrows.Err(); rerr != nil {
+			db.CaptureError(rerr, readsQuery, nil, "GetDetail reads on rows")
+			return nil, errx.InternalError()
+		}
+
 		// Complaints don't live in campaign_contact_progress — they
 		// arrive via deliverability_events. Count rows of type
 		// "complaint" pointing at this contact (either by contact_id
@@ -2822,23 +3741,28 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 			  AND event_type = 'complaint'
 			  AND (contact_id = $2 OR LOWER(recipient_email) = LOWER($3))
 		`
-		if err := r.DB.QueryRow(ctx, complaintQuery, *orgID, contactID, detail.Email).Scan(
+		if err := resultDB(ctx, r.DB).QueryRow(ctx, complaintQuery, *orgID, contactID, detail.Email).Scan(
 			&detail.Engagement.TotalComplained,
 		); err != nil {
 			db.CaptureError(err, complaintQuery, []any{*orgID, contactID, detail.Email}, "GetDetail complaints")
 			return nil, errx.InternalError()
 		}
 
-		// Suppression — there's at most one row per (org, email)
-		// thanks to the unique constraint.
+		// Suppression: the contact's own address row wins over a row for its
+		// whole domain, so the card names the entry that actually blocks mail.
 		suppQuery := `
-			SELECT reason, source, expires_at, created_at
+			SELECT id, kind, email, reason, source, expires_at, created_at
 			FROM suppressed_recipients
-			WHERE organization_id = $1 AND LOWER(email) = LOWER($2)
+			WHERE organization_id = $1
+			  AND (expires_at IS NULL OR expires_at > NOW())
+			  AND ((kind = 'email' AND email = LOWER($2))
+			    OR (kind = 'domain' AND email = split_part(LOWER($2), '@', 2)))
+			ORDER BY (kind = 'email') DESC
+			LIMIT 1
 		`
 		var s models.ContactSuppression
-		err := r.DB.QueryRow(ctx, suppQuery, *orgID, detail.Email).Scan(
-			&s.Reason, &s.Source, &s.ExpiresAt, &s.CreatedAt,
+		err := resultDB(ctx, r.DB).QueryRow(ctx, suppQuery, *orgID, detail.Email).Scan(
+			&s.ID, &s.Kind, &s.Value, &s.Reason, &s.Source, &s.ExpiresAt, &s.CreatedAt,
 		)
 		switch {
 		case err == nil:
@@ -2859,15 +3783,22 @@ func (r *contactRepository) GetDetail(ctx context.Context, userID uuid.UUID, org
 // pagination on (created_at, task_id) so we can scroll through the
 // full history without blowing up offset.
 //
-// We deliberately scope by the contact's owning user via the
-// campaign join — this keeps multi-tenant safety even though the
-// tasks table itself has no user_id column.
-func (r *contactRepository) ListSentEmails(ctx context.Context, userID, contactID uuid.UUID, limit int, beforeSentAt *time.Time, beforeTaskID *uuid.UUID) (*models.ContactSentEmailsResult, *errx.Error) {
+// We deliberately scope by the owning organization via the campaign join —
+// this keeps multi-tenant safety even though the tasks table itself has no
+// organization_id column. It was the campaign's user_id until the rest of the
+// contact 360 moved to org scope, which both showed one member their own sends
+// only and, for someone in two workspaces, mixed the other one's in.
+//
+// opened_at is a person's open, as it is in campaign analytics and the
+// contact's engagement summary: a fetch by a mail client's prefetch or a
+// security gateway is reported separately as machine_opened_at, so this list
+// never claims a recipient read mail they never opened (issue #392).
+func (r *contactRepository) ListSentEmails(ctx context.Context, orgID, contactID uuid.UUID, limit int, beforeSentAt *time.Time, beforeTaskID *uuid.UUID) (*models.ContactSentEmailsResult, *errx.Error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 
-	args := []any{userID, contactID}
+	args := []any{orgID, contactID}
 	cursorClause := ""
 	if beforeSentAt != nil && beforeTaskID != nil {
 		cursorClause = "AND (t.created_at, t.id) < ($3, $4)"
@@ -2882,7 +3813,9 @@ func (r *contactRepository) ListSentEmails(ctx context.Context, userID, contactI
 			cam.id, cam.name,
 			seq.id, seq.name,
 			COALESCE(et.subject, seq.subject, '') AS subject,
-			ccp.opened_at, ccp.clicked_at, ccp.replied_at, ccp.bounced_at
+			CASE WHEN ccp.opened_machine THEN NULL ELSE ccp.opened_at END AS opened_at,
+			CASE WHEN ccp.opened_machine THEN ccp.opened_at END AS machine_opened_at,
+			ccp.clicked_at, ccp.replied_at, ccp.bounced_at
 		FROM tasks t
 		JOIN campaign_tasks ct ON ct.task_id = t.id
 		LEFT JOIN email_accounts ea ON ea.id = t.email_account_id
@@ -2894,13 +3827,13 @@ func (r *contactRepository) ListSentEmails(ctx context.Context, userID, contactI
 			  AND ccp.contact_id  = ct.contact_id
 			  AND ccp.sequence_id = ct.sequence_id
 		WHERE ct.contact_id = $2
-		  AND cam.user_id   = $1
+		  AND cam.organization_id = $1
 		  %s
 		ORDER BY t.created_at DESC, t.id DESC
 		LIMIT $%d
 	`, cursorClause, len(args))
 
-	rows, err := r.DB.Query(ctx, query, args...)
+	rows, err := resultDB(ctx, r.DB).Query(ctx, query, args...)
 	if err != nil {
 		db.CaptureError(err, query, args, "ListSentEmails")
 		return nil, errx.InternalError()
@@ -2916,7 +3849,7 @@ func (r *contactRepository) ListSentEmails(ctx context.Context, userID, contactI
 			&e.CampaignID, &e.CampaignName,
 			&e.SequenceID, &e.SequenceName,
 			&e.Subject,
-			&e.OpenedAt, &e.ClickedAt, &e.RepliedAt, &e.BouncedAt,
+			&e.OpenedAt, &e.MachineOpenedAt, &e.ClickedAt, &e.RepliedAt, &e.BouncedAt,
 		); err != nil {
 			db.CaptureError(err, "", nil, "ListSentEmails scan")
 			return nil, errx.InternalError()
@@ -2928,7 +3861,8 @@ func (r *contactRepository) ListSentEmails(ctx context.Context, userID, contactI
 	var nextCursor *string
 	if len(out) > limit {
 		hasMore = true
-		nextCursor = paging.EncodeUUID(out[limit].TaskID)
+		// The last row returned: the next page starts strictly below it.
+		nextCursor = paging.EncodeUUID(out[limit-1].TaskID)
 		out = out[:limit]
 	}
 
@@ -2941,11 +3875,26 @@ func (r *contactRepository) ListSentEmails(ctx context.Context, userID, contactI
 	}, nil
 }
 
+// timelineKeyset is the predicate that pages one source of the contact
+// timeline: rows whose (time, source rank, id) tuple sorts strictly before
+// the cursor, which the query receives as three consecutive parameters
+// starting at $first. Every source uses it so SQL and the merged sort agree.
+func timelineKeyset(atCol string, source models.ContactTimelineSource, idCol string, first int) string {
+	return fmt.Sprintf("(%s, %d, %s) < ($%d::timestamptz, $%d::int, $%d::uuid)",
+		atCol, source, idCol, first, first+1, first+2)
+}
+
+// timelineCampaignScope keeps contact and tenant checks together for campaign-backed events.
+func timelineCampaignScope(alias string) string {
+	return alias + ".contact_id = $1 AND cam.organization_id = $2"
+}
+
 // ListTimeline merges per-contact events from several source tables
 // into a single, reverse-chronological feed.
 //
 // Sources:
 //   - campaign_contact_progress       → sent / opened / clicked / replied / bounced
+//   - email_link_clicks, email_opens  → per-event clicks and opens
 //   - reply_intents                   → received replies (with intent classification)
 //   - deliverability_events           → bounce / complaint
 //   - suppressed_recipients           → suppression added
@@ -2954,26 +3903,29 @@ func (r *contactRepository) ListSentEmails(ctx context.Context, userID, contactI
 //   - contact_activities              → creation and campaign / category membership
 //   - website_page_hits               → page views from the tracking snippet
 //
-// We pull up to (limit) candidates from each source ordered by time
-// DESC, then merge-sort in Go. This avoids a 5-way UNION with
-// matching column lists (each source has a different shape), and the
-// per-source limit caps the read at roughly 5*limit rows.
+// We pull one row past the page from each source, newest first, then
+// merge-sort in Go. This avoids a 10-way UNION with matching column lists
+// (each source has a different shape), and the per-source limit caps the
+// read at roughly 10*limit rows. The lookahead row is what makes has_more
+// right when a single source fills the page on its own.
 //
-// The `before` cursor is a wall-clock time; everything strictly older
-// than it is eligible. The caller paginates by setting `before` to
-// the oldest returned event's `At` on the next call.
-func (r *contactRepository) ListTimeline(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, contactID uuid.UUID, limit int, before *time.Time) (*models.ContactTimelineResult, *errx.Error) {
+// The feed is ordered by (at, source, id) and a page resumes strictly after
+// the cursor on that tuple, so two events at the same instant, from the
+// same table or different ones, land on one side of a page boundary or the
+// other and are never skipped or repeated. A nil cursor is the first page.
+func (r *contactRepository) ListTimeline(ctx context.Context, orgID, contactID uuid.UUID, limit int, cursor *models.ContactTimelineKey) (*models.ContactTimelineResult, *errx.Error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
+	fetch := limit + 1
 
 	// We resolve the contact's email up front because some org-scoped
 	// joins (suppression, deliverability fallback, reply_intents) key
 	// off email rather than contact_id.
 	var contactEmail string
-	if err := r.DB.QueryRow(ctx,
-		`SELECT email FROM contacts WHERE id = $1 AND user_id = $2`,
-		contactID, userID,
+	if err := resultDB(ctx, r.DB).QueryRow(ctx,
+		`SELECT email FROM contacts WHERE id = $1 AND organization_id = $2`,
+		contactID, orgID,
 	).Scan(&contactEmail); err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, errx.ErrNotFound
@@ -2982,27 +3934,42 @@ func (r *contactRepository) ListTimeline(ctx context.Context, userID uuid.UUID, 
 		return nil, errx.InternalError()
 	}
 
-	// "before" defaults to "now + 1 minute" so the first page picks
-	// up everything. Using a future bound keeps the SQL uniform — every
-	// query passes the same predicate.
-	bound := time.Now().Add(time.Minute)
-	if before != nil {
-		bound = *before
+	// The position the page resumes after. The first page starts a minute
+	// in the future at the lowest rank, which admits every event the same
+	// way a real cursor would, so every query passes the same predicate.
+	after := models.ContactTimelineKey{At: time.Now().Add(time.Minute)}
+	if cursor != nil {
+		after = *cursor
 	}
+	afterSource := int(after.Source)
 
 	events := make([]models.ContactTimelineEvent, 0, limit*2)
 
-	// 1. Engagement events from campaign_contact_progress. One progress
-	//    row can emit up to 5 events (sent/opened/clicked/replied/bounced).
-	progressQuery := `
+	// 1. Engagement stamps from campaign_contact_progress, unnested to one
+	//    row per stamp so the limit and the cursor apply to events, not to
+	//    leads: a lead whose newest stamp is past the cursor must not push
+	//    an older lead's eligible stamp off the page. The coarse opened and
+	//    clicked stamps are emitted only when no logged open or click stands
+	//    for them (a stamp written before per-event logging); otherwise
+	//    sources 9 and 10 carry the event with its origin. A logged event
+	//    represents the stamp when it landed within a minute of it, the
+	//    stamp being written as the event is logged.
+	progressQuery := fmt.Sprintf(`
 		SELECT
-			ccp.sent_at, ccp.opened_at, ccp.clicked_at, ccp.replied_at, ccp.bounced_at,
+			ev.source, ev.at, ccp.sequence_id, ccp.opened_machine,
 			cam.id, cam.name,
 			seq.id, seq.name, seq.subject,
 			ea.id, ea.email, ea.name
 		FROM campaign_contact_progress ccp
 		JOIN campaigns cam ON cam.id = ccp.campaign_id
 		JOIN sequences seq ON seq.id = ccp.sequence_id
+		CROSS JOIN LATERAL (VALUES
+			(%[1]d, ccp.sent_at),
+			(%[2]d, ccp.opened_at),
+			(%[3]d, ccp.clicked_at),
+			(%[4]d, ccp.replied_at),
+			(%[5]d, ccp.bounced_at)
+		) AS ev(source, at)
 		LEFT JOIN LATERAL (
 			SELECT ea.id, ea.email, ea.name
 			FROM   tasks t
@@ -3011,32 +3978,49 @@ func (r *contactRepository) ListTimeline(ctx context.Context, userID uuid.UUID, 
 			WHERE  ct.campaign_id = ccp.campaign_id
 			  AND  ct.contact_id  = ccp.contact_id
 			  AND  ct.sequence_id = ccp.sequence_id
-			ORDER  BY t.created_at DESC
+			-- The task holding the step's reservation is the one that put the
+			-- email on the wire; a step can carry several task rows (a retry, a
+			-- tick that skipped as a duplicate) and only that one names the
+			-- mailbox the recipient saw.
+			ORDER  BY COALESCE(t.id = ccp.dispatch_task_id, false) DESC, t.created_at DESC
 			LIMIT  1
 		) ea ON TRUE
-		WHERE ccp.contact_id = $1
-		  AND cam.user_id    = $2
-		  AND COALESCE(ccp.sent_at, ccp.opened_at, ccp.clicked_at, ccp.replied_at, ccp.bounced_at) < $3
-		ORDER BY GREATEST(
-			COALESCE(ccp.sent_at,    'epoch'),
-			COALESCE(ccp.opened_at,  'epoch'),
-			COALESCE(ccp.clicked_at, 'epoch'),
-			COALESCE(ccp.replied_at, 'epoch'),
-			COALESCE(ccp.bounced_at, 'epoch')
-		) DESC
-		LIMIT $4
-	`
-	prows, err := r.DB.Query(ctx, progressQuery, contactID, userID, bound, limit)
+		WHERE `+timelineCampaignScope("ccp")+`
+		  AND ev.at IS NOT NULL
+		  AND (ev.at, ev.source, ccp.sequence_id) < ($3::timestamptz, $4::int, $5::uuid)
+		  AND NOT (ev.source = %[2]d AND EXISTS (
+				SELECT 1 FROM email_opens o
+				WHERE o.campaign_id = ccp.campaign_id AND o.contact_id = ccp.contact_id AND o.sequence_id = ccp.sequence_id
+				  AND o.opened_at BETWEEN ccp.opened_at - INTERVAL '1 minute' AND ccp.opened_at + INTERVAL '1 minute'
+		  ))
+		  AND NOT (ev.source = %[3]d AND EXISTS (
+				SELECT 1 FROM email_link_clicks lc
+				WHERE lc.campaign_id = ccp.campaign_id AND lc.contact_id = ccp.contact_id AND lc.sequence_id = ccp.sequence_id
+				  AND lc.clicked_at BETWEEN ccp.clicked_at - INTERVAL '1 minute' AND ccp.clicked_at + INTERVAL '1 minute'
+		  ))
+		ORDER BY ev.at DESC, ev.source DESC, ccp.sequence_id DESC
+		LIMIT $6
+	`,
+		models.TimelineSourceProgressSent,
+		models.TimelineSourceProgressOpened,
+		models.TimelineSourceProgressClicked,
+		models.TimelineSourceProgressReplied,
+		models.TimelineSourceProgressBounced,
+	)
+	prows, err := resultDB(ctx, r.DB).Query(ctx, progressQuery, contactID, orgID, after.At, afterSource, after.ID, fetch)
 	if err != nil {
-		db.CaptureError(err, progressQuery, []any{contactID, userID, bound, limit}, "ListTimeline progress")
+		db.CaptureError(err, progressQuery, []any{contactID, orgID, after.At, afterSource, after.ID, fetch}, "ListTimeline progress")
 		return nil, errx.InternalError()
 	}
 	for prows.Next() {
-		var sentAt, openedAt, clickedAt, repliedAt, bouncedAt *time.Time
+		var source int
+		var at time.Time
+		var seqKey uuid.UUID
+		var openedMachine bool
 		var campID, seqID, eaID *uuid.UUID
 		var campName, seqName, seqSubject, eaEmail, eaName *string
 		if err := prows.Scan(
-			&sentAt, &openedAt, &clickedAt, &repliedAt, &bouncedAt,
+			&source, &at, &seqKey, &openedMachine,
 			&campID, &campName,
 			&seqID, &seqName, &seqSubject,
 			&eaID, &eaEmail, &eaName,
@@ -3045,277 +4029,496 @@ func (r *contactRepository) ListTimeline(ctx context.Context, userID uuid.UUID, 
 			db.CaptureError(err, "", nil, "ListTimeline progress scan")
 			return nil, errx.InternalError()
 		}
-		baseSubject := seqSubject
-		makeEvent := func(t *time.Time, ty models.ContactTimelineEventType) {
-			if t == nil || !t.Before(bound) {
-				return
-			}
-			ev := models.ContactTimelineEvent{
-				Type:              ty,
-				At:                *t,
-				EmailAccountID:    eaID,
-				EmailAccountEmail: eaEmail,
-				EmailAccountName:  eaName,
-				CampaignID:        campID,
-				CampaignName:      campName,
-				SequenceID:        seqID,
-				SequenceName:      seqName,
-			}
-			if baseSubject != nil && *baseSubject != "" {
-				ev.Subject = baseSubject
-			}
-			events = append(events, ev)
+		ev := models.ContactTimelineEvent{
+			At:                at,
+			Key:               models.ContactTimelineKey{At: at, Source: models.ContactTimelineSource(source), ID: seqKey},
+			EmailAccountID:    eaID,
+			EmailAccountEmail: eaEmail,
+			EmailAccountName:  eaName,
+			CampaignID:        campID,
+			CampaignName:      campName,
+			SequenceID:        seqID,
+			SequenceName:      seqName,
 		}
-		makeEvent(sentAt, models.TimelineEmailSent)
-		makeEvent(openedAt, models.TimelineEmailOpened)
-		makeEvent(clickedAt, models.TimelineEmailClicked)
-		makeEvent(repliedAt, models.TimelineEmailReplied)
-		makeEvent(bouncedAt, models.TimelineEmailBounced)
+		if seqSubject != nil && *seqSubject != "" {
+			ev.Subject = seqSubject
+		}
+		switch ev.Key.Source {
+		case models.TimelineSourceProgressSent:
+			ev.Type = models.TimelineEmailSent
+		case models.TimelineSourceProgressOpened:
+			ev.Type = models.TimelineEmailOpened
+			machine := openedMachine
+			ev.Machine = &machine
+		case models.TimelineSourceProgressClicked:
+			ev.Type = models.TimelineEmailClicked
+		case models.TimelineSourceProgressReplied:
+			ev.Type = models.TimelineEmailReplied
+		case models.TimelineSourceProgressBounced:
+			ev.Type = models.TimelineEmailBounced
+		default:
+			continue
+		}
+		events = append(events, ev)
 	}
 	prows.Close()
+	if err := prows.Err(); err != nil {
+		db.CaptureError(err, progressQuery, nil, "ListTimeline progress rows")
+		return nil, errx.InternalError()
+	}
 
-	if orgID != nil {
-		// 2. Reply intents (inbound replies with classification).
-		replyQuery := `
-			SELECT ri.created_at, ri.intent, ri.campaign_id, cam.name, ri.task_id
+	// 9. Per-link clicks: which link, where it went, and whether a person or
+	//    a scanner clicked it. Same campaign scope as the progress feed.
+	clickQuery := `
+		SELECT lc.id, lc.task_id, lc.clicked_at, lc.destination, lc.label, lc.user_agent, lc.machine, lc.machine_reason,
+		       lc.client, lc.device_type, lc.os, lc.browser, lc.browser_version, lc.country_code, lc.region, lc.city,
+		       lc.client_type, lc.device_hidden,
+		       cam.id, cam.name,
+		       seq.id, seq.name, seq.subject,
+		       ea.id, ea.email, ea.name
+		FROM email_link_clicks lc
+		JOIN campaigns cam ON cam.id = lc.campaign_id
+		JOIN sequences seq ON seq.id = lc.sequence_id
+		LEFT JOIN LATERAL (
+			SELECT ea.id, ea.email, ea.name
+			FROM   tasks t
+			JOIN   email_accounts ea ON ea.id = t.email_account_id
+			WHERE  t.id = lc.task_id
+		) ea ON TRUE
+		WHERE ` + timelineCampaignScope("lc") + `
+		  AND ` + timelineKeyset("lc.clicked_at", models.TimelineSourceLinkClick, "lc.id", 3) + `
+		ORDER BY lc.clicked_at DESC, lc.id DESC
+		LIMIT $6
+	`
+	crows, err := resultDB(ctx, r.DB).Query(ctx, clickQuery, contactID, orgID, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, clickQuery, []any{contactID, orgID, after.At, afterSource, after.ID, fetch}, "ListTimeline link clicks")
+		return nil, errx.InternalError()
+	}
+	for crows.Next() {
+		var link models.ContactLinkClick
+		var origin models.EngagementOrigin
+		var taskID uuid.UUID
+		var at time.Time
+		var machine bool
+		var reason string
+		var campID, seqID, eaID *uuid.UUID
+		var campName, seqName, seqSubject, eaEmail, eaName *string
+		if err := crows.Scan(
+			&link.ID, &taskID, &at, &link.URL, &link.Label, &link.UserAgent, &machine, &reason,
+			&origin.Client, &origin.DeviceType, &origin.OS, &origin.Browser, &origin.BrowserVersion,
+			&origin.CountryCode, &origin.Region, &origin.City,
+			&origin.ClientType, &origin.DeviceHidden,
+			&campID, &campName,
+			&seqID, &seqName, &seqSubject,
+			&eaID, &eaEmail, &eaName,
+		); err != nil {
+			crows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline link clicks scan")
+			return nil, errx.InternalError()
+		}
+		fillUTM(&link)
+		ev := models.ContactTimelineEvent{
+			Type:              models.TimelineEmailClicked,
+			At:                at,
+			Key:               models.ContactTimelineKey{At: at, Source: models.TimelineSourceLinkClick, ID: link.ID},
+			EmailAccountID:    eaID,
+			EmailAccountEmail: eaEmail,
+			EmailAccountName:  eaName,
+			CampaignID:        campID,
+			CampaignName:      campName,
+			SequenceID:        seqID,
+			SequenceName:      seqName,
+			Machine:           &machine,
+			Link:              &link,
+			TaskID:            &taskID,
+		}
+		if !origin.Empty() {
+			o := origin
+			ev.Origin = &o
+		}
+		if seqSubject != nil && *seqSubject != "" {
+			ev.Subject = seqSubject
+		}
+		if reason != "" {
+			r := reason
+			ev.MachineReason = &r
+		}
+		events = append(events, ev)
+	}
+	crows.Close()
+	if err := crows.Err(); err != nil {
+		db.CaptureError(err, clickQuery, nil, "ListTimeline link clicks rows")
+		return nil, errx.InternalError()
+	}
+
+	// 10. Per-event opens: each one with what it came from, machine ones
+	//     labelled. Same campaign scope as the progress feed.
+	openQuery := `
+		SELECT o.id, o.task_id, o.opened_at, o.user_agent, o.machine, o.machine_reason,
+		       o.client, o.device_type, o.os, o.browser, o.browser_version, o.country_code, o.region, o.city,
+		       o.client_type, o.device_hidden,
+		       cam.id, cam.name,
+		       seq.id, seq.name, seq.subject,
+		       ea.id, ea.email, ea.name
+		FROM email_opens o
+		JOIN campaigns cam ON cam.id = o.campaign_id
+		JOIN sequences seq ON seq.id = o.sequence_id
+		LEFT JOIN LATERAL (
+			SELECT ea.id, ea.email, ea.name
+			FROM   tasks t
+			JOIN   email_accounts ea ON ea.id = t.email_account_id
+			WHERE  t.id = o.task_id
+		) ea ON TRUE
+		WHERE ` + timelineCampaignScope("o") + `
+		  AND ` + timelineKeyset("o.opened_at", models.TimelineSourceOpen, "o.id", 3) + `
+		ORDER BY o.opened_at DESC, o.id DESC
+		LIMIT $6
+	`
+	orows, err := resultDB(ctx, r.DB).Query(ctx, openQuery, contactID, orgID, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, openQuery, []any{contactID, orgID, after.At, afterSource, after.ID, fetch}, "ListTimeline opens")
+		return nil, errx.InternalError()
+	}
+	for orows.Next() {
+		var id, taskID uuid.UUID
+		var origin models.EngagementOrigin
+		var at time.Time
+		var machine bool
+		var reason, userAgent string
+		var campID, seqID, eaID *uuid.UUID
+		var campName, seqName, seqSubject, eaEmail, eaName *string
+		if err := orows.Scan(
+			&id, &taskID, &at, &userAgent, &machine, &reason,
+			&origin.Client, &origin.DeviceType, &origin.OS, &origin.Browser, &origin.BrowserVersion,
+			&origin.CountryCode, &origin.Region, &origin.City,
+			&origin.ClientType, &origin.DeviceHidden,
+			&campID, &campName,
+			&seqID, &seqName, &seqSubject,
+			&eaID, &eaEmail, &eaName,
+		); err != nil {
+			orows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline opens scan")
+			return nil, errx.InternalError()
+		}
+		ev := models.ContactTimelineEvent{
+			Type:              models.TimelineEmailOpened,
+			At:                at,
+			Key:               models.ContactTimelineKey{At: at, Source: models.TimelineSourceOpen, ID: id},
+			EmailAccountID:    eaID,
+			EmailAccountEmail: eaEmail,
+			EmailAccountName:  eaName,
+			CampaignID:        campID,
+			CampaignName:      campName,
+			SequenceID:        seqID,
+			SequenceName:      seqName,
+			Machine:           &machine,
+			TaskID:            &taskID,
+		}
+		if !origin.Empty() {
+			o := origin
+			ev.Origin = &o
+		}
+		if seqSubject != nil && *seqSubject != "" {
+			ev.Subject = seqSubject
+		}
+		if reason != "" {
+			r := reason
+			ev.MachineReason = &r
+		}
+		events = append(events, ev)
+	}
+	orows.Close()
+	if err := orows.Err(); err != nil {
+		db.CaptureError(err, openQuery, nil, "ListTimeline opens rows")
+		return nil, errx.InternalError()
+	}
+
+	// 2. Reply intents (inbound replies with classification).
+	replyQuery := `
+			SELECT ri.id, ri.created_at, ri.intent, ri.campaign_id, cam.name, ri.task_id
 			FROM reply_intents ri
 			LEFT JOIN campaigns cam ON cam.id = ri.campaign_id
 			WHERE ri.organization_id = $1
 			  AND LOWER(ri.contact_email) = LOWER($2)
-			  AND ri.created_at < $3
-			ORDER BY ri.created_at DESC
-			LIMIT $4
+			  AND ` + timelineKeyset("ri.created_at", models.TimelineSourceReplyIntent, "ri.id", 3) + `
+			ORDER BY ri.created_at DESC, ri.id DESC
+			LIMIT $6
 		`
-		rrows, err := r.DB.Query(ctx, replyQuery, *orgID, contactEmail, bound, limit)
-		if err != nil {
-			db.CaptureError(err, replyQuery, nil, "ListTimeline replies")
+	rrows, err := resultDB(ctx, r.DB).Query(ctx, replyQuery, orgID, contactEmail, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, replyQuery, nil, "ListTimeline replies")
+		return nil, errx.InternalError()
+	}
+	for rrows.Next() {
+		var ev models.ContactTimelineEvent
+		var id uuid.UUID
+		var intent string
+		if err := rrows.Scan(&id, &ev.At, &intent, &ev.CampaignID, &ev.CampaignName, &ev.TaskID); err != nil {
+			rrows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline replies scan")
 			return nil, errx.InternalError()
 		}
-		for rrows.Next() {
-			var ev models.ContactTimelineEvent
-			var intent string
-			if err := rrows.Scan(&ev.At, &intent, &ev.CampaignID, &ev.CampaignName, &ev.TaskID); err != nil {
-				rrows.Close()
-				db.CaptureError(err, "", nil, "ListTimeline replies scan")
-				return nil, errx.InternalError()
-			}
-			ev.Type = models.TimelineReplyReceived
-			ev.Intent = &intent
-			events = append(events, ev)
-		}
-		rrows.Close()
+		ev.Type = models.TimelineReplyReceived
+		ev.Key = models.ContactTimelineKey{At: ev.At, Source: models.TimelineSourceReplyIntent, ID: id}
+		ev.Intent = &intent
+		events = append(events, ev)
+	}
+	rrows.Close()
+	if err := rrows.Err(); err != nil {
+		db.CaptureError(err, replyQuery, nil, "ListTimeline replies rows")
+		return nil, errx.InternalError()
+	}
 
-		// 3. Deliverability events (bounce / complaint / unsubscribe).
-		delivQuery := `
-			SELECT de.created_at, de.event_type, de.provider, de.reason,
+	// 3. Deliverability events (bounce / complaint / unsubscribe).
+	delivQuery := `
+			SELECT de.id, de.created_at, de.event_type, de.provider, de.reason,
 			       de.campaign_id, cam.name, de.task_id
 			FROM deliverability_events de
 			LEFT JOIN campaigns cam ON cam.id = de.campaign_id
 			WHERE de.organization_id = $1
 			  AND (de.contact_id = $2 OR LOWER(de.recipient_email) = LOWER($3))
-			  AND de.created_at < $4
-			ORDER BY de.created_at DESC
-			LIMIT $5
+			  AND ` + timelineKeyset("de.created_at", models.TimelineSourceDeliverability, "de.id", 4) + `
+			ORDER BY de.created_at DESC, de.id DESC
+			LIMIT $7
 		`
-		drows, err := r.DB.Query(ctx, delivQuery, *orgID, contactID, contactEmail, bound, limit)
-		if err != nil {
-			db.CaptureError(err, delivQuery, nil, "ListTimeline deliv")
+	drows, err := resultDB(ctx, r.DB).Query(ctx, delivQuery, orgID, contactID, contactEmail, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, delivQuery, nil, "ListTimeline deliv")
+		return nil, errx.InternalError()
+	}
+	for drows.Next() {
+		var ev models.ContactTimelineEvent
+		var id uuid.UUID
+		var eventType, provider, reason string
+		if err := drows.Scan(&id, &ev.At, &eventType, &provider, &reason, &ev.CampaignID, &ev.CampaignName, &ev.TaskID); err != nil {
+			drows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline deliv scan")
 			return nil, errx.InternalError()
 		}
-		for drows.Next() {
-			var ev models.ContactTimelineEvent
-			var eventType, provider, reason string
-			if err := drows.Scan(&ev.At, &eventType, &provider, &reason, &ev.CampaignID, &ev.CampaignName, &ev.TaskID); err != nil {
-				drows.Close()
-				db.CaptureError(err, "", nil, "ListTimeline deliv scan")
-				return nil, errx.InternalError()
-			}
-			ev.Type = models.TimelineDeliverability
-			ev.Source = &eventType
-			ev.Provider = &provider
-			if reason != "" {
-				ev.Reason = &reason
-			}
-			events = append(events, ev)
+		ev.Type = models.TimelineDeliverability
+		ev.Key = models.ContactTimelineKey{At: ev.At, Source: models.TimelineSourceDeliverability, ID: id}
+		ev.Source = &eventType
+		ev.Provider = &provider
+		if reason != "" {
+			ev.Reason = &reason
 		}
-		drows.Close()
+		events = append(events, ev)
+	}
+	drows.Close()
+	if err := drows.Err(); err != nil {
+		db.CaptureError(err, delivQuery, nil, "ListTimeline deliv rows")
+		return nil, errx.InternalError()
+	}
 
-		// 4. Suppression — emit one event at create time. We treat
-		//    later updates as the same event for now.
-		suppQuery := `
-			SELECT created_at, reason, source
+	// 4. Suppression: one event per matching entry (the address itself
+	//    and its domain), at create time. Later updates are the same event.
+	suppQuery := `
+			SELECT id, created_at, reason, source
 			FROM suppressed_recipients
 			WHERE organization_id = $1
-			  AND LOWER(email) = LOWER($2)
-			  AND created_at < $3
-			ORDER BY created_at DESC
-			LIMIT 1
+			  AND ((kind = 'email' AND email = LOWER($2))
+			    OR (kind = 'domain' AND email = split_part(LOWER($2), '@', 2)))
+			  AND ` + timelineKeyset("created_at", models.TimelineSourceSuppression, "id", 3) + `
+			ORDER BY created_at DESC, id DESC
+			LIMIT $6
 		`
+	srows, err := resultDB(ctx, r.DB).Query(ctx, suppQuery, orgID, contactEmail, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, suppQuery, nil, "ListTimeline suppression")
+		return nil, errx.InternalError()
+	}
+	for srows.Next() {
+		var id uuid.UUID
 		var sAt time.Time
 		var sReason, sSource string
-		if err := r.DB.QueryRow(ctx, suppQuery, *orgID, contactEmail, bound).Scan(&sAt, &sReason, &sSource); err == nil {
-			ev := models.ContactTimelineEvent{
-				Type:   models.TimelineSuppressed,
-				At:     sAt,
-				Source: &sSource,
-			}
-			if sReason != "" {
-				ev.Reason = &sReason
-			}
-			events = append(events, ev)
-		} else if err != pgx.ErrNoRows {
-			db.CaptureError(err, suppQuery, nil, "ListTimeline suppression")
+		if err := srows.Scan(&id, &sAt, &sReason, &sSource); err != nil {
+			srows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline suppression scan")
 			return nil, errx.InternalError()
 		}
+		ev := models.ContactTimelineEvent{
+			Type:   models.TimelineSuppressed,
+			At:     sAt,
+			Key:    models.ContactTimelineKey{At: sAt, Source: models.TimelineSourceSuppression, ID: id},
+			Source: &sSource,
+		}
+		if sReason != "" {
+			ev.Reason = &sReason
+		}
+		events = append(events, ev)
+	}
+	srows.Close()
+	if err := srows.Err(); err != nil {
+		db.CaptureError(err, suppQuery, nil, "ListTimeline suppression rows")
+		return nil, errx.InternalError()
+	}
 
-		// 5. Notes.
-		notesQuery := `
-			SELECT created_at, user_id, content
+	// 5. Notes.
+	notesQuery := `
+			SELECT id, created_at, user_id, content
 			FROM contact_notes
 			WHERE contact_id = $1
 			  AND organization_id = $2
-			  AND created_at < $3
-			ORDER BY created_at DESC
-			LIMIT $4
+			  AND ` + timelineKeyset("created_at", models.TimelineSourceNote, "id", 3) + `
+			ORDER BY created_at DESC, id DESC
+			LIMIT $6
 		`
-		nrows, err := r.DB.Query(ctx, notesQuery, contactID, *orgID, bound, limit)
-		if err != nil {
-			db.CaptureError(err, notesQuery, nil, "ListTimeline notes")
+	nrows, err := resultDB(ctx, r.DB).Query(ctx, notesQuery, contactID, orgID, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, notesQuery, nil, "ListTimeline notes")
+		return nil, errx.InternalError()
+	}
+	for nrows.Next() {
+		var ev models.ContactTimelineEvent
+		var id, uid uuid.UUID
+		var content string
+		if err := nrows.Scan(&id, &ev.At, &uid, &content); err != nil {
+			nrows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline notes scan")
 			return nil, errx.InternalError()
 		}
-		for nrows.Next() {
-			var ev models.ContactTimelineEvent
-			var uid uuid.UUID
-			var content string
-			if err := nrows.Scan(&ev.At, &uid, &content); err != nil {
-				nrows.Close()
-				db.CaptureError(err, "", nil, "ListTimeline notes scan")
-				return nil, errx.InternalError()
-			}
-			ev.Type = models.TimelineNote
-			ev.UserID = &uid
-			ev.Content = &content
-			events = append(events, ev)
-		}
-		nrows.Close()
+		ev.Type = models.TimelineNote
+		ev.Key = models.ContactTimelineKey{At: ev.At, Source: models.TimelineSourceNote, ID: id}
+		ev.UserID = &uid
+		ev.Content = &content
+		events = append(events, ev)
+	}
+	nrows.Close()
+	if err := nrows.Err(); err != nil {
+		db.CaptureError(err, notesQuery, nil, "ListTimeline notes rows")
+		return nil, errx.InternalError()
+	}
 
-		// 6. Meetings booked through a connected scheduling provider. The event
-		//    time is when the booking arrived; scheduled_for carries the call
-		//    window so the UI can render "Meeting on <date>".
-		meetingQuery := `
-			SELECT created_at, status, source, event_name, scheduled_for, join_url, canceled_reason
+	// 6. Meetings booked through a connected scheduling provider. The event
+	//    time is when the booking arrived; scheduled_for carries the call
+	//    window so the UI can render "Meeting on <date>".
+	meetingQuery := `
+			SELECT id, created_at, status, source, event_name, scheduled_for, join_url, canceled_reason
 			FROM meeting_bookings
 			WHERE contact_id = $1
 			  AND organization_id = $2
-			  AND created_at < $3
-			ORDER BY created_at DESC
-			LIMIT $4
+			  AND ` + timelineKeyset("created_at", models.TimelineSourceMeeting, "id", 3) + `
+			ORDER BY created_at DESC, id DESC
+			LIMIT $6
 		`
-		mrows, err := r.DB.Query(ctx, meetingQuery, contactID, *orgID, bound, limit)
-		if err != nil {
-			db.CaptureError(err, meetingQuery, nil, "ListTimeline meetings")
+	mrows, err := resultDB(ctx, r.DB).Query(ctx, meetingQuery, contactID, orgID, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, meetingQuery, nil, "ListTimeline meetings")
+		return nil, errx.InternalError()
+	}
+	for mrows.Next() {
+		var ev models.ContactTimelineEvent
+		var id uuid.UUID
+		var status, source, eventName, joinURL, canceledReason string
+		var scheduledFor *time.Time
+		if err := mrows.Scan(&id, &ev.At, &status, &source, &eventName, &scheduledFor, &joinURL, &canceledReason); err != nil {
+			mrows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline meetings scan")
 			return nil, errx.InternalError()
 		}
-		for mrows.Next() {
-			var ev models.ContactTimelineEvent
-			var status, source, eventName, joinURL, canceledReason string
-			var scheduledFor *time.Time
-			if err := mrows.Scan(&ev.At, &status, &source, &eventName, &scheduledFor, &joinURL, &canceledReason); err != nil {
-				mrows.Close()
-				db.CaptureError(err, "", nil, "ListTimeline meetings scan")
-				return nil, errx.InternalError()
-			}
-			switch status {
-			case "rescheduled":
-				ev.Type = models.TimelineMeetingRescheduled
-			case "canceled":
-				ev.Type = models.TimelineMeetingCanceled
-			default:
-				ev.Type = models.TimelineMeetingBooked
-			}
-			if eventName != "" {
-				ev.Subject = &eventName
-			}
-			if source != "" {
-				ev.Source = &source
-			}
-			if joinURL != "" {
-				ev.JoinURL = &joinURL
-			}
-			if canceledReason != "" {
-				ev.Reason = &canceledReason
-			}
-			ev.ScheduledFor = scheduledFor
-			st := status
-			ev.MeetingState = &st
-			events = append(events, ev)
+		ev.Key = models.ContactTimelineKey{At: ev.At, Source: models.TimelineSourceMeeting, ID: id}
+		switch status {
+		case "rescheduled":
+			ev.Type = models.TimelineMeetingRescheduled
+		case "canceled":
+			ev.Type = models.TimelineMeetingCanceled
+		default:
+			ev.Type = models.TimelineMeetingBooked
 		}
-		mrows.Close()
+		if eventName != "" {
+			ev.Subject = &eventName
+		}
+		if source != "" {
+			ev.Source = &source
+		}
+		if joinURL != "" {
+			ev.JoinURL = &joinURL
+		}
+		if canceledReason != "" {
+			ev.Reason = &canceledReason
+		}
+		ev.ScheduledFor = scheduledFor
+		st := status
+		ev.MeetingState = &st
+		events = append(events, ev)
+	}
+	mrows.Close()
+	if err := mrows.Err(); err != nil {
+		db.CaptureError(err, meetingQuery, nil, "ListTimeline meetings rows")
+		return nil, errx.InternalError()
+	}
 
-		// 7. Lifecycle: creation (with its first-touch source) and campaign /
-		//    category membership changes, from contact_activities. Names were
-		//    resolved when the row was written, so a renamed or deleted
-		//    campaign still reads correctly.
-		lifeQuery := `
-			SELECT created_at, user_id, activity_type, metadata
+	// 7. Lifecycle: creation (with its first-touch source) and campaign /
+	//    category membership changes, from contact_activities. Names were
+	//    resolved when the row was written, so a renamed or deleted
+	//    campaign still reads correctly.
+	lifeQuery := `
+			SELECT id, created_at, user_id, activity_type, metadata
 			FROM contact_activities
 			WHERE contact_id = $1
 			  AND organization_id = $2
 			  AND activity_type IN ('contact_created', 'campaign_added', 'campaign_removed', 'category_added', 'category_removed', 'form_submitted')
-			  AND created_at < $3
-			ORDER BY created_at DESC
-			LIMIT $4
+			  AND ` + timelineKeyset("created_at", models.TimelineSourceActivity, "id", 3) + `
+			ORDER BY created_at DESC, id DESC
+			LIMIT $6
 		`
-		lrows, err := r.DB.Query(ctx, lifeQuery, contactID, *orgID, bound, limit)
-		if err != nil {
-			db.CaptureError(err, lifeQuery, nil, "ListTimeline lifecycle")
+	lrows, err := resultDB(ctx, r.DB).Query(ctx, lifeQuery, contactID, orgID, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, lifeQuery, nil, "ListTimeline lifecycle")
+		return nil, errx.InternalError()
+	}
+	for lrows.Next() {
+		var ev models.ContactTimelineEvent
+		var rowID uuid.UUID
+		var typ string
+		var meta map[string]any
+		if err := lrows.Scan(&rowID, &ev.At, &ev.UserID, &typ, &meta); err != nil {
+			lrows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline lifecycle scan")
 			return nil, errx.InternalError()
 		}
-		for lrows.Next() {
-			var ev models.ContactTimelineEvent
-			var typ string
-			var meta map[string]any
-			if err := lrows.Scan(&ev.At, &ev.UserID, &typ, &meta); err != nil {
-				lrows.Close()
-				db.CaptureError(err, "", nil, "ListTimeline lifecycle scan")
-				return nil, errx.InternalError()
+		ev.Type = models.ContactTimelineEventType(typ)
+		ev.Key = models.ContactTimelineKey{At: ev.At, Source: models.TimelineSourceActivity, ID: rowID}
+		str := func(k string) *string {
+			if v, ok := meta[k].(string); ok && v != "" {
+				return &v
 			}
-			ev.Type = models.ContactTimelineEventType(typ)
-			str := func(k string) *string {
-				if v, ok := meta[k].(string); ok && v != "" {
-					return &v
-				}
-				return nil
-			}
-			id := func(k string) *uuid.UUID {
-				if v, ok := meta[k].(string); ok {
-					if u, perr := uuid.Parse(v); perr == nil {
-						return &u
-					}
-				}
-				return nil
-			}
-			switch ev.Type {
-			case models.TimelineContactCreated:
-				ev.Source = str("source")
-				ev.SourceDetail = str("source_detail")
-			case models.TimelineCampaignAdded, models.TimelineCampaignRemoved:
-				ev.CampaignID = id("campaign_id")
-				ev.CampaignName = str("campaign_name")
-			case models.TimelineCategoryAdded, models.TimelineCategoryRemoved:
-				ev.CategoryID = id("category_id")
-				ev.CategoryTitle = str("category_title")
-			case models.TimelineFormSubmitted:
-				ev.FormID = id("form_id")
-				ev.FormName = str("form_name")
-			}
-			events = append(events, ev)
+			return nil
 		}
-		lrows.Close()
+		id := func(k string) *uuid.UUID {
+			if v, ok := meta[k].(string); ok {
+				if u, perr := uuid.Parse(v); perr == nil {
+					return &u
+				}
+			}
+			return nil
+		}
+		switch ev.Type {
+		case models.TimelineContactCreated:
+			ev.Source = str("source")
+			ev.SourceDetail = str("source_detail")
+		case models.TimelineCampaignAdded, models.TimelineCampaignRemoved:
+			ev.CampaignID = id("campaign_id")
+			ev.CampaignName = str("campaign_name")
+		case models.TimelineCategoryAdded, models.TimelineCategoryRemoved:
+			ev.CategoryID = id("category_id")
+			ev.CategoryTitle = str("category_title")
+		case models.TimelineFormSubmitted:
+			ev.FormID = id("form_id")
+			ev.FormName = str("form_name")
+		}
+		events = append(events, ev)
+	}
+	lrows.Close()
+	if err := lrows.Err(); err != nil {
+		db.CaptureError(err, lifeQuery, nil, "ListTimeline lifecycle rows")
+		return nil, errx.InternalError()
+	}
 
-		// 8. Website page views from any browser tied to the contact through
-		//    an email-link ticket.
-		hitQuery := `
+	// 8. Website page views from any browser tied to the contact through
+	//    an email-link ticket.
+	hitQuery := `
 			SELECT h.id, h.visitor_id, h.session_key, h.occurred_at,
 			       h.url, h.path, h.title, h.referrer, h.referrer_domain, h.landing,
 			       h.utm_source, h.utm_medium, h.utm_campaign, h.utm_term, h.utm_content,
@@ -3325,54 +4528,78 @@ func (r *contactRepository) ListTimeline(ctx context.Context, userID uuid.UUID, 
 			FROM website_page_hits h
 			WHERE h.organization_id = $1
 			  AND h.visitor_id IN (SELECT id FROM website_visitors WHERE contact_id = $2)
-			  AND h.occurred_at < $3
-			ORDER BY h.occurred_at DESC
-			LIMIT $4
+			  AND ` + timelineKeyset("h.occurred_at", models.TimelineSourcePageHit, "h.id", 3) + `
+			ORDER BY h.occurred_at DESC, h.id DESC
+			LIMIT $6
 		`
-		hrows, err := r.DB.Query(ctx, hitQuery, *orgID, contactID, bound, limit)
-		if err != nil {
-			db.CaptureError(err, hitQuery, nil, "ListTimeline page hits")
+	hrows, err := resultDB(ctx, r.DB).Query(ctx, hitQuery, orgID, contactID, after.At, afterSource, after.ID, fetch)
+	if err != nil {
+		db.CaptureError(err, hitQuery, nil, "ListTimeline page hits")
+		return nil, errx.InternalError()
+	}
+	for hrows.Next() {
+		var h models.WebsitePageHit
+		if err := hrows.Scan(
+			&h.ID, &h.VisitorID, &h.SessionKey, &h.OccurredAt,
+			&h.URL, &h.Path, &h.Title, &h.Referrer, &h.ReferrerDomain, &h.Landing,
+			&h.UTMSource, &h.UTMMedium, &h.UTMCampaign, &h.UTMTerm, &h.UTMContent,
+			&h.DeviceType, &h.OS, &h.Browser, &h.BrowserVersion, &h.DeviceBrand,
+			&h.Language, &h.Timezone, &h.ScreenWidth, &h.ScreenHeight,
+			&h.CountryCode, &h.Region, &h.City,
+		); err != nil {
+			hrows.Close()
+			db.CaptureError(err, "", nil, "ListTimeline page hits scan")
 			return nil, errx.InternalError()
 		}
-		for hrows.Next() {
-			var h models.WebsitePageHit
-			if err := hrows.Scan(
-				&h.ID, &h.VisitorID, &h.SessionKey, &h.OccurredAt,
-				&h.URL, &h.Path, &h.Title, &h.Referrer, &h.ReferrerDomain, &h.Landing,
-				&h.UTMSource, &h.UTMMedium, &h.UTMCampaign, &h.UTMTerm, &h.UTMContent,
-				&h.DeviceType, &h.OS, &h.Browser, &h.BrowserVersion, &h.DeviceBrand,
-				&h.Language, &h.Timezone, &h.ScreenWidth, &h.ScreenHeight,
-				&h.CountryCode, &h.Region, &h.City,
-			); err != nil {
-				hrows.Close()
-				db.CaptureError(err, "", nil, "ListTimeline page hits scan")
-				return nil, errx.InternalError()
-			}
-			hit := h
-			ev := models.ContactTimelineEvent{Type: models.TimelinePageHit, At: h.OccurredAt, PageHit: &hit}
-			subject := h.Title
-			if subject == "" {
-				subject = h.Path
-			}
-			ev.Subject = &subject
-			events = append(events, ev)
+		hit := h
+		ev := models.ContactTimelineEvent{
+			Type:    models.TimelinePageHit,
+			At:      h.OccurredAt,
+			Key:     models.ContactTimelineKey{At: h.OccurredAt, Source: models.TimelineSourcePageHit, ID: h.ID},
+			PageHit: &hit,
 		}
-		hrows.Close()
+		subject := h.Title
+		if subject == "" {
+			subject = h.Path
+		}
+		ev.Subject = &subject
+		events = append(events, ev)
 	}
+	hrows.Close()
+	if err := hrows.Err(); err != nil {
+		db.CaptureError(err, hitQuery, nil, "ListTimeline page hits rows")
+		return nil, errx.InternalError()
+	}
+	// Merge sort: newest first, ties broken exactly as each source query
+	// broke them, so the page boundary is the same position everywhere.
+	sort.Slice(events, func(i, j int) bool { return events[j].Key.Before(events[i].Key) })
 
-	// Merge sort: newest first.
-	sort.Slice(events, func(i, j int) bool { return events[i].At.After(events[j].At) })
-
-	hasMore := false
+	res := &models.ContactTimelineResult{Data: events}
 	if len(events) > limit {
-		hasMore = true
-		events = events[:limit]
+		res.Data = events[:limit]
+		last := res.Data[limit-1].Key
+		res.HasMore = true
+		res.Pagination = models.Pagination{
+			NextCursor: paging.EncodeMerged(last.At, int(last.Source), last.ID),
+			HasMore:    true,
+		}
 	}
+	return res, nil
+}
 
-	return &models.ContactTimelineResult{
-		Data:    events,
-		HasMore: hasMore,
-	}, nil
+// fillUTM reads the UTM parameters off a clicked link's destination, whether
+// the send path stamped them or the author wrote them by hand.
+func fillUTM(link *models.ContactLinkClick) {
+	u, err := url.Parse(link.URL)
+	if err != nil {
+		return
+	}
+	q := u.Query()
+	link.UTMSource = q.Get("utm_source")
+	link.UTMMedium = q.Get("utm_medium")
+	link.UTMCampaign = q.Get("utm_campaign")
+	link.UTMTerm = q.Get("utm_term")
+	link.UTMContent = q.Get("utm_content")
 }
 
 // verificationFromRequest normalises a verdict a caller supplied with a

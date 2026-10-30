@@ -1,13 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"log"
-	"net/http"
+	"math"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/app/cipher"
 	"github.com/warmbly/warmbly/internal/app/worker"
+	wsmtp "github.com/warmbly/warmbly/internal/client/smtpimap/smtp"
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/infrastructure/cache"
 	"github.com/warmbly/warmbly/internal/infrastructure/codec"
@@ -25,7 +25,9 @@ import (
 	"github.com/warmbly/warmbly/internal/infrastructure/kafka"
 	"github.com/warmbly/warmbly/internal/infrastructure/kms"
 	"github.com/warmbly/warmbly/internal/infrastructure/storage"
+	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/observability"
+	"github.com/warmbly/warmbly/internal/pkg/nodeagent"
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
@@ -48,8 +50,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Sentry
-	if err := observability.InitSentry(ctx, cfg, "worker"); err != nil {
+	// Error reporting
+	if err := observability.Init(ctx, cfg, "worker"); err != nil {
 		log.Fatal(err)
 	}
 
@@ -98,7 +100,7 @@ func main() {
 	// backend API (same base URL + token as the DEK store) rather than touching
 	// Postgres directly, per the worker no-direct-SQL rule in CLAUDE.md.
 	internalBaseURL := strings.TrimRight(os.Getenv("ENCRYPTED_KEYS_BACKEND_URL"), "/")
-	internalToken := os.Getenv("ENCRYPTED_KEYS_WORKER_TOKEN")
+	internalToken := config.NodeAPIToken()
 	emailMessageMapRepo, err := repository.NewHTTPEmailMessageMapRepository(internalBaseURL, internalToken)
 	if err != nil {
 		log.Fatal(err)
@@ -167,8 +169,10 @@ func main() {
 		log.Println("WARNING: BOX_GOOGLE_CLIENT_ID/SECRET not set; Gmail mailbox token refresh will fail on expiry")
 	}
 
+	agent := newNodeAgent(workerID, bindIP)
 	// WorkerService
 	workerService := &worker.WorkerService{
+		OnMailboxMissing:          agent.RequestReload,
 		ID:                        workerID.String(),
 		CipherService:             cipherService,
 		Bus:                       bus,
@@ -191,6 +195,7 @@ func main() {
 	// the rolling 1m counters into a WorkerHealth event, publishes via the
 	// event bus so the consumer can write a row into worker_health_samples.
 	go workerService.Heartbeat(ctx)
+	go workerService.ListenValidations(ctx)
 	go workerService.RunHealth(ctx, 30*time.Second)
 
 	// heartbeatDone closes once the farewell beat has been sent. Main waits on
@@ -199,7 +204,7 @@ func main() {
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		runInternalHeartbeat(ctx, workerID, bindIP)
+		agent.Run(ctx)
 	}()
 
 	// Graceful shutdown
@@ -213,7 +218,14 @@ func main() {
 	}()
 
 	log.Printf("Worker %s started, listening on topic %s", workerID, workerTopic)
-	if err := bus.Subscribe(ctx, []string{workerTopic}, "worker-"+workerID.String(), workerService.Receive); err != nil {
+	lanes := worker.CommandConcurrency()
+	if _, ok := bus.(eventbus.KeyedSubscriber); !ok {
+		lanes = 1
+	}
+	log.Printf("Worker command concurrency: %d ordered mailbox lanes", lanes)
+	// A send runs past the bus's default handler budget, so the command subscription carries its own.
+	commandCtx := eventbus.WithHandlerTimeout(ctx, worker.CommandBudget)
+	if err := eventbus.SubscribeKeyed(commandCtx, bus, []string{workerTopic}, "worker-"+workerID.String(), lanes, workerService.ResolveCommandKey, workerService.Receive); err != nil {
 		log.Println("event bus subscribe ended:", err)
 	}
 
@@ -228,80 +240,67 @@ func main() {
 	log.Println("Worker stopped")
 }
 
-func runInternalHeartbeat(ctx context.Context, workerID uuid.UUID, bindIP string) {
-	baseURL := strings.TrimRight(os.Getenv("ENCRYPTED_KEYS_BACKEND_URL"), "/")
-	token := os.Getenv("ENCRYPTED_KEYS_WORKER_TOKEN")
-	if baseURL == "" || token == "" {
-		return
-	}
+// newNodeAgent builds the shared fleet agent. It replaces the worker's own
+// heartbeat loop: identity, usage reporting and self-update are node concerns,
+// identical for every role, so they live in one place.
+func newNodeAgent(workerID uuid.UUID, bindIP string) *nodeagent.Agent {
 	reportedIP := os.Getenv("WORKER_PUBLIC_IP")
 	if reportedIP == "" && bindIP != "default route" {
 		reportedIP = bindIP
 	}
-	if reportedIP == "" {
-		reportedIP = "unknown"
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	// reqCtx is separate from ctx so the farewell beat still sends after ctx is
-	// cancelled by the shutdown signal.
-	send := func(reqCtx context.Context, booted, stopping bool) {
-		payload := map[string]any{
-			"worker_id":   workerID.String(),
-			"bind_ip":     reportedIP,
-			"tier":        os.Getenv("WORKER_TIER"),
-			"egress_kind": os.Getenv("WORKER_EGRESS_KIND"),
-		}
-		if booted {
-			// Mailboxes live in memory only, so a fresh process holds none.
-			// The backend reloads this worker's mailboxes on this beat
-			// instead of leaving them to the reconciler's next pass.
-			payload["booted"] = true
-		}
-		if stopping {
-			payload["stopping"] = true
-		}
-		body, _ := json.Marshal(payload)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/api/v1/internal/worker/heartbeat", bytes.NewReader(body))
-		if err != nil {
-			log.Println("failed to build internal heartbeat:", err)
-			return
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Println("failed internal heartbeat:", err)
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			log.Println("internal heartbeat returned status", resp.StatusCode)
-		}
-	}
-
-	send(ctx, true, false)
-	ticker := time.NewTicker(90 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			// Farewell beat on a fresh context: ctx is already cancelled, and
-			// without this the row stays selectable until the heartbeat ages
-			// out, so placement keeps picking a worker that has exited.
-			byeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			send(byeCtx, false, true)
-			cancel()
-			return
-		case <-ticker.C:
-			send(ctx, false, false)
-		}
-	}
+	return nodeagent.New(nodeagent.Config{
+		WarmupSendProtocol: 2,
+		NodeID:             workerID,
+		Role:               models.NodeRoleWorker,
+		Name:               os.Getenv("WARMBLY_NODE_NAME"),
+		Region:             nodeRegion(),
+		Address:            reportedIP,
+		CapacityTarget:     workerCapacityTarget(),
+		Version:            buildVersion(),
+		BaseURL:            os.Getenv("ENCRYPTED_KEYS_BACKEND_URL"),
+		Token:              config.NodeAPIToken(),
+		// Written for the host-side updater installed by `warmbly join`.
+		TargetVersionPath: os.Getenv("WARMBLY_TARGET_VERSION_PATH"),
+		Condition:         wsmtp.EgressCondition,
+	})
 }
 
-// uuidNamespaceURL is the RFC 4122 URL namespace, matching the value used by
-// scripts/install-worker.sh when deriving the per-IP worker ID. Keep these in
-// sync: the installer and the worker must agree on the derivation.
+const defaultWorkerCapacityTarget = 100.0
+
+// workerCapacityTarget reads this machine's assigned-mailbox target.
+func workerCapacityTarget() float64 {
+	raw := strings.TrimSpace(os.Getenv("WARMBLY_WORKER_CAPACITY"))
+	if raw == "" {
+		return defaultWorkerCapacityTarget
+	}
+	n, err := strconv.ParseFloat(raw, 64)
+	if err != nil || n <= 0 || math.IsNaN(n) || math.IsInf(n, 0) || n > 99_999_999.99 {
+		return defaultWorkerCapacityTarget
+	}
+	return n
+}
+
+// nodeRegion reads the sign-in geography hint. WARMBLY_NODE_REGION is what the
+// join script writes and what every role uses; WORKER_REGION is the older
+// worker-only name, kept as a fallback so a machine configured by hand before
+// the join flow existed keeps reporting its region.
+func nodeRegion() string {
+	if v := os.Getenv("WARMBLY_NODE_REGION"); v != "" {
+		return v
+	}
+	return os.Getenv("WORKER_REGION")
+}
+
+// buildVersion is the image tag this build reports. Set by the join script
+// from the tag it pulled; empty means unknown, which the control plane must
+// not read as "needs updating".
+func buildVersion() string {
+	return os.Getenv("WARMBLY_VERSION")
+}
+
+// uuidNamespaceURL is the RFC 4122 URL namespace used to derive the per-IP
+// worker ID. Changing it re-identifies every WORKER_BIND_IP node and orphans
+// the mailboxes assigned to their old ids.
 var uuidNamespaceURL = uuid.MustParse("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
 
 // workerIDFromIP returns the deterministic UUIDv5 for the given IPv4 string.

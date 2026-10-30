@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/warmbly/warmbly/internal/app/auth"
+	"github.com/warmbly/warmbly/internal/app/delegation"
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
@@ -51,8 +54,14 @@ func (h *Handler) OIDCCallback(c *gin.Context) {
 	})
 }
 
-// GoogleCallback is where Google sends the browser back.
+// GoogleCallback is where Google sends the browser back. An administrator's
+// sign-in proving a Workspace domain shares this client and redirect, and is
+// handed to the dashboard window that opened it rather than signing anyone in.
 func (h *Handler) GoogleCallback(c *gin.Context) {
+	if strings.HasPrefix(c.Query("state"), delegation.GoogleStatePrefix) {
+		h.renderOAuthCallback(c, "google")
+		return
+	}
 	h.ssoCallback(c, auth.SSOCallback{
 		Provider: models.IdentityProviderGoogle,
 		Code:     c.Query("code"),
@@ -93,7 +102,16 @@ func (h *Handler) ssoCallback(c *gin.Context, in auth.SSOCallback) {
 	// A provider-side refusal arrives as error=, not as a failed exchange.
 	// A closed consent screen is not a failure, so it returns quietly.
 	if e := formOrQuery(c, "error"); e != "" {
-		if e == "access_denied" || e == "user_cancelled_authorize" {
+		cancelled := e == "access_denied" || e == "user_cancelled_authorize"
+		if auth.IsReauthState(in.State) {
+			if cancelled {
+				c.Redirect(http.StatusFound, base+"/reauth/complete?cancelled=1")
+				return
+			}
+			c.Redirect(http.StatusFound, base+"/reauth/complete?error="+url.QueryEscape(e))
+			return
+		}
+		if cancelled {
 			c.Redirect(http.StatusFound, base+"/auth/login")
 			return
 		}
@@ -104,13 +122,23 @@ func (h *Handler) ssoCallback(c *gin.Context, in auth.SSOCallback) {
 	in.IPAddress = c.ClientIP()
 	in.UserAgent = c.Request.UserAgent()
 
-	handoff, err := h.AuthService.SSOCallbackComplete(c.Request.Context(), in)
+	res, err := h.AuthService.SSOCallbackComplete(c.Request.Context(), in)
+	// A re-authentication runs in a window the dashboard opened, so it lands
+	// on the page that reports back to that window, never on sign-in.
+	if res != nil && res.Reauth {
+		if err != nil {
+			c.Redirect(http.StatusFound, base+"/reauth/complete?error="+url.QueryEscape(err.Message))
+			return
+		}
+		c.Redirect(http.StatusFound, base+"/reauth/complete?code="+url.QueryEscape(res.Code))
+		return
+	}
 	if err != nil {
 		c.Redirect(http.StatusFound, base+"/auth/login?sso_error="+url.QueryEscape(err.Message))
 		return
 	}
 
-	c.Redirect(http.StatusFound, base+"/auth/sso?code="+url.QueryEscape(handoff))
+	c.Redirect(http.StatusFound, base+"/auth/sso?code="+url.QueryEscape(res.Code))
 }
 
 // formOrQuery reads a parameter from either the posted form or the query
@@ -134,11 +162,33 @@ type ssoExchangeRequest struct {
 func (h *Handler) SSOExchange(c *gin.Context) {
 	var req ssoExchangeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
 	result, err := h.AuthService.SSOExchange(c.Request.Context(), req.Code, req.Binding)
+	if err != nil {
+		errx.Handle(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// SSOLink takes the password for a federated sign-in that resolved to an
+// existing password account, attaches the identity and issues the session.
+// Public like /2fa/verify: the pending token is the proof of the completed
+// provider flow, and the password budget is enforced in the service.
+func (h *Handler) SSOLink(c *gin.Context) {
+	var data auth.SSOLinkData
+	if err := c.ShouldBindJSON(&data); err != nil {
+		errx.Handle(c, errx.InvalidBody(err))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), authRequestTimeout)
+	defer cancel()
+
+	result, err := h.AuthService.SSOLinkConfirm(ctx, &data, c.ClientIP(), c.Request.UserAgent())
 	if err != nil {
 		errx.Handle(c, err)
 		return

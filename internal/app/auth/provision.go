@@ -2,18 +2,22 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/mail"
 	"strings"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 
 	"github.com/warmbly/warmbly/internal/app/orgrisk"
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/observability/analytics"
+	"github.com/warmbly/warmbly/internal/pkg/displayname"
 	"github.com/warmbly/warmbly/internal/pkg/signuprisk"
+	"github.com/warmbly/warmbly/internal/repository"
 )
 
 // createAccount provisions a user, their organization and their trial. Both
@@ -30,54 +34,93 @@ type SignupOrigin struct {
 	UserAgent string
 }
 
-func (s *authService) createAccount(ctx context.Context, address, passwordHash, referralCode, invite string, origin SignupOrigin) (*models.User, *errx.Error) {
+// SignupAttribution is everything the signup link carried: who sent the person
+// (a referral code or a team invitation) and where they came from. All three
+// are captured at RegistrationStart, held on the registration session across
+// the emailed code, and applied once the account and its organization exist.
+type SignupAttribution struct {
+	ReferralCode string
+	Invite       string
+	Acquisition  models.OrgAcquisition
+}
+
+func (s *authService) createAccount(ctx context.Context, address, passwordHash string, attr SignupAttribution, origin SignupOrigin) (*models.User, *errx.Error) {
 	email, perr := mail.ParseAddress(address)
 	if perr != nil {
 		return nil, errx.ErrEmail
 	}
+	// The single write path for a new account, so the stored form is decided
+	// here even though every caller already folded it.
+	email.Address = normalizeEmail(email.Address)
 
 	// Whether the invitation is the only thing that permitted this signup.
 	// When it is, a failed accept cannot fall through to a personal workspace:
 	// that would turn an invite-gated signup into an unrelated account.
-	inviteRequired := s.inviteIsLoadBearing(ctx, invite)
+	inviteRequired := s.inviteIsLoadBearing(ctx, attr.Invite)
 
-	u, xerr := s.userRepository.CreateUser(ctx, email, passwordHash)
-	if xerr != nil {
-		sentry.CaptureException(xerr)
-		return nil, errx.InternalError()
+	var u *models.User
+	var member *models.OrganizationMember
+	if attr.Invite != "" && s.organizationService != nil {
+		var xerr *errx.Error
+		u, member, xerr = s.organizationService.CreateInvitedUser(ctx, attr.Invite, email, passwordHash)
+		if xerr != nil && (inviteRequired || xerr != errx.ErrInvitationInvalid) {
+			return nil, xerr
+		}
+	} else if inviteRequired {
+		return nil, errx.ErrInvitationInvalid
+	}
+	if u == nil {
+		var xerr error
+		u, xerr = s.userRepository.CreateUser(ctx, email, passwordHash)
+		if xerr != nil {
+			if errors.Is(xerr, repository.ErrUserEmailTaken) {
+				return nil, errx.ErrAccountExists
+			}
+			errs.CaptureException(xerr)
+			return nil, errx.InternalError()
+		}
 	}
 
 	if err := s.userService.SaveUser(ctx, u); err != nil {
-		return nil, err
+		if member == nil {
+			return nil, err
+		}
+		errs.CaptureException(err)
 	}
 
 	s.recordSignupOrigin(ctx, u.ID, u.Email, origin)
 
-	// An invited account joins the inviting org and stops there: no second
-	// workspace, no trial of its own. A token that died between start and
-	// confirm only falls through to a personal org when open registration
-	// would have accepted the signup anyway.
-	if invite != "" && s.organizationService != nil {
-		if _, err := s.organizationService.AcceptInvitation(ctx, invite, u.ID, u.Email); err == nil {
-			return u, nil
+	// An invited signup needs neither a personal workspace nor its own trial.
+	if member != nil {
+		s.notifyOperatorSignup(u, "")
+		var joined *models.Organization
+		if org, oerr := s.organizationService.Get(ctx, member.OrganizationID); oerr == nil {
+			joined = org
 		}
-		if inviteRequired {
-			return nil, errx.ErrInvitationInvalid
-		}
+		s.countSignup(u, joined, attr, origin)
+		return u, nil
 	}
 
 	// Auto-create organization for new user
 	var org *models.Organization
 	if s.organizationService != nil {
-		orgName := u.FirstName + "'s Organization"
-		if u.FirstName == "" {
-			orgName = "My Organization"
-		}
+		orgName := displayname.DefaultWorkspace(u.FirstName)
 		var orgErr *errx.Error
-		org, orgErr = s.organizationService.Create(ctx, u.ID, orgName)
+		org, orgErr = s.organizationService.Create(ctx, u.ID, orgName, "")
 		if orgErr != nil {
-			sentry.CaptureException(orgErr)
+			errs.CaptureException(orgErr)
 			// Don't fail registration if org creation fails
+		}
+	}
+
+	// Where the workspace came from, written once and never updated.
+	// Best-effort: attribution is a reporting nicety and must never be the
+	// reason a signup fails.
+	if s.acquisition != nil && org != nil && !attr.Acquisition.Empty() {
+		acq := attr.Acquisition
+		acq.OrganizationID = org.ID
+		if err := s.acquisition.RecordOrganizationAcquisition(ctx, &acq); err != nil {
+			errs.CaptureException(err)
 		}
 	}
 
@@ -92,20 +135,113 @@ func (s *authService) createAccount(ctx context.Context, address, passwordHash, 
 	// Start 2-week free trial for new user (linked to organization)
 	if s.trialService != nil && org != nil {
 		if err := s.trialService.StartFreeTrialWithOrg(ctx, u.ID, org.ID); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			// Don't fail registration if trial creation fails
+		} else if s.productAnalytics != nil {
+			// Counted here rather than in the browser because this is where
+			// the trial actually starts; a self-host with billing off never
+			// reaches this line and so never reports one.
+			s.productAnalytics.Capture("trial_started", s.analyticsRequest(u, org, origin), nil)
 		}
 	}
 
 	// Attribute the signup to a referrer if a referral code rode along.
 	// Best-effort: a bad or self-referral code never fails registration.
-	if s.referral != nil && org != nil && referralCode != "" {
-		if xerr := s.referral.AttributeSignup(ctx, referralCode, org.ID, u.ID); xerr != nil {
-			sentry.CaptureException(xerr)
+	if s.referral != nil && org != nil && attr.ReferralCode != "" {
+		if xerr := s.referral.AttributeSignup(ctx, attr.ReferralCode, org.ID, u.ID); xerr != nil {
+			errs.CaptureException(xerr)
 		}
 	}
 
+	workspace := ""
+	if org != nil {
+		workspace = org.Name
+	}
+	s.notifyOperatorSignup(u, workspace)
+	s.countSignup(u, org, attr, origin)
+
 	return u, nil
+}
+
+// analyticsRequest names the new account and workspace on a server-side
+// event, under the same user id the dashboard identifies the browser with,
+// so the signup and the session that led to it are one person in PostHog.
+// The request's address and user agent ride along so the event is geolocated
+// and attributed to the right device.
+func (s *authService) analyticsRequest(u *models.User, org *models.Organization, origin SignupOrigin) analytics.Request {
+	req := analytics.Request{
+		IP:        origin.IP,
+		UserAgent: origin.UserAgent,
+		Host:      s.analyticsHost,
+	}
+	if u != nil {
+		req.UserID = u.ID.String()
+		req.Email = u.Email
+		req.Name = strings.TrimSpace(u.FirstName + " " + u.LastName)
+	}
+	if org != nil {
+		req.OrganizationID = org.ID.String()
+		req.OrganizationName = org.Name
+	}
+	return req
+}
+
+// countSignup records the finished signup in product analytics. The channel
+// it came from goes on the event and, write-once, on the person: where
+// somebody came from does not change later, and it is what a funnel from the
+// marketing site to a paying workspace is built on.
+func (s *authService) countSignup(u *models.User, org *models.Organization, attr SignupAttribution, origin SignupOrigin) {
+	if s.productAnalytics == nil {
+		return
+	}
+	acq := attr.Acquisition.Normalize()
+	channel := map[string]any{}
+	if acq.UTMSource != "" {
+		channel["utm_source"] = acq.UTMSource
+	}
+	if acq.UTMMedium != "" {
+		channel["utm_medium"] = acq.UTMMedium
+	}
+	if acq.UTMCampaign != "" {
+		channel["utm_campaign"] = acq.UTMCampaign
+	}
+	if acq.LandingPath != "" {
+		channel["landing_path"] = acq.LandingPath
+	}
+	if acq.ReferrerHost != "" {
+		channel["referrer_host"] = acq.ReferrerHost
+	}
+	props := map[string]any{
+		"invited":  attr.Invite != "",
+		"referred": attr.ReferralCode != "",
+	}
+	for k, v := range channel {
+		props[k] = v
+	}
+
+	req := s.analyticsRequest(u, org, origin)
+	if len(channel) > 0 {
+		req.SetOnce = channel
+	}
+	s.productAnalytics.Capture("signup_completed", req, props)
+}
+
+// notifyOperatorSignup raises the operator alert for a finished signup. Both
+// the invited and the self-serve path go through it so neither can be missed.
+func (s *authService) notifyOperatorSignup(u *models.User, workspace string) {
+	if s.opsNotify == nil || u == nil {
+		return
+	}
+	s.opsNotify.NotifyOperator(
+		"user.registered",
+		"New signup: "+u.Email,
+		"A new account finished signing up.",
+		map[string]string{
+			"Email":     u.Email,
+			"Name":      displayname.FullName(u.FirstName, u.LastName),
+			"Workspace": workspace,
+		},
+	)
 }
 
 // signupAllowed enforces DISABLE_REGISTRATION.
@@ -131,7 +267,7 @@ func (s *authService) signupAllowed(ctx context.Context, address, invite string)
 	if s.policy.Registration != config.RegistrationClosed {
 		empty, err := s.userRepository.IsEmpty(ctx)
 		if err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return errx.InternalError()
 		}
 		if empty {
@@ -209,7 +345,7 @@ func (s *authService) federatedSignupAllowed(ctx context.Context, address string
 	if s.policy.Registration != config.RegistrationClosed {
 		empty, err := s.userRepository.IsEmpty(ctx)
 		if err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return errx.InternalError()
 		}
 		if empty {

@@ -6,18 +6,53 @@
 // The standard merge fields and their sample values live in one catalog
 // (@/lib/templateVars); imported for local use (renderPreview's default context)
 // and re-exported so existing imports keep working.
-import { VARIABLES, SAMPLE } from "@/lib/templateVars";
+import { VARIABLES, SAMPLE, HTML_CHUNK_RE } from "@/lib/templateVars";
 export { VARIABLES, SAMPLE };
 
 // Derive plain text from the editor HTML so both alternatives ship populated.
-export function htmlToPlain(html: string): string {
+//
+// `links` is on because the text/plain half of an email is unusable without the
+// destinations, and off for text that will be fed back into an editor: an
+// autolinked "x.test" whose href is "http://x.test" would gain the address on
+// every round trip and grow a tail (the AI-block prompt is stored that way).
+export function htmlToPlain(html: string, { links = true }: { links?: boolean } = {}): string {
     const withBreaks = html
+        // An image has no text of its own, so the plain-text alternative would
+        // silently lose whatever it carried. Its alt text stands in for it.
+        .replace(/<img\b[^>]*>/gi, (tag) => {
+            const alt = tag.match(/\balt\s*=\s*"([^"]*)"/i) ?? tag.match(/\balt\s*=\s*'([^']*)'/i);
+            const text = (alt?.[1] ?? "").trim();
+            return text ? `[${text}]` : "";
+        })
         .replace(/<\s*br\s*\/?>/gi, "\n")
         .replace(/<\/\s*(p|div|h[1-6]|li|tr)\s*>/gi, "\n");
-    if (typeof document === "undefined") return withBreaks.replace(/<[^>]+>/g, "");
-    const tmp = document.createElement("div");
-    tmp.innerHTML = withBreaks;
-    return (tmp.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
+    if (typeof DOMParser === "undefined") return withBreaks.replace(/<[^>]+>/g, "");
+    // DOMParser builds an inert document. Assigning innerHTML on a live
+    // element instead would fetch every src and fire every onerror in the
+    // body, which for a pasted HTML email is someone else's markup.
+    const doc = new DOMParser().parseFromString(withBreaks, "text/html");
+    // A <style> block's CSS is text to textContent, so without this the whole
+    // stylesheet of a designed email became the plain-text alternative. A
+    // hidden preheader is written to be read once, in the inbox list.
+    doc.querySelectorAll("style, script, title, noscript, template, [hidden]").forEach((el) => el.remove());
+    doc.querySelectorAll<HTMLElement>("[style]").forEach((el) => {
+        if (/display\s*:\s*none/i.test(el.getAttribute("style") ?? "")) el.remove();
+    });
+    // A link's destination is the only way the text-only half of the email can
+    // be followed, and a button or a linked image is nothing but its
+    // destination. This is what the server renders for a body written in HTML
+    // (internal/pkg/mailhtml), so the two halves agree.
+    if (links) {
+        doc.querySelectorAll("a[href]").forEach((a) => {
+            const href = (a.getAttribute("href") ?? "").trim();
+            // A merge token resolves per recipient and is not an address yet.
+            if (!/^(https?:|mailto:)/i.test(href)) return;
+            const label = (a.textContent ?? "").replace(/\s+/g, " ").trim();
+            if (!label) a.textContent = href;
+            else if (label !== href && `mailto:${label}` !== href) a.append(` (${href})`);
+        });
+    }
+    return (doc.body.textContent || "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // promptToHtml wraps a plain template string (a stored AI-block instruction) into
@@ -74,16 +109,16 @@ function evalCond(expr: string, ctx: PreviewCtx): boolean {
     const notM = expr.match(/^not\s+([\s\S]+)$/);
     if (notM) return !evalCond(notM[1].replace(/^\(|\)$/g, ""), ctx);
     // Fields may contain spaces/dashes (custom fields), so widen the class.
-    let m = expr.match(/^eq\s+\.([A-Za-z0-9_ -]+?)\s+"([^"]*)"$/);
+    let m = expr.match(/^eq\s+\.([A-Za-z0-9_ .-]+?)\s+"([^"]*)"$/);
     if (m) return (ctx[m[1]] ?? "") === m[2];
-    m = expr.match(/^ne\s+\.([A-Za-z0-9_ -]+?)\s+"([^"]*)"$/);
+    m = expr.match(/^ne\s+\.([A-Za-z0-9_ .-]+?)\s+"([^"]*)"$/);
     if (m) return (ctx[m[1]] ?? "") !== m[2];
     const logical = expr.match(/^(and|or)\s+(.*)$/s);
     if (logical) {
         const vals = splitGroups(logical[2]).map((p) => evalCond(p.replace(/^\(|\)$/g, ""), ctx));
         return logical[1] === "and" ? vals.every(Boolean) : vals.some(Boolean);
     }
-    m = expr.match(/^\.([A-Za-z0-9_ -]+)$/);
+    m = expr.match(/^\.([A-Za-z0-9_ .-]+)$/);
     if (m) return truthy(ctx[m[1]]);
     return false;
 }
@@ -134,9 +169,31 @@ function renderConditionals(s: string, ctx: PreviewCtx): string {
 
 export function renderPreview(s: string, ctx: PreviewCtx = SAMPLE): string {
     let out = renderConditionals(s, ctx);
-    out = out.replace(/\{\{\s*\.([A-Za-z0-9_]+)\s*\}\}/g, (_, k: string) => ctx[k] ?? "");
+    out = out.replace(
+        /\{\{\s*\.([A-Za-z0-9_ .-]+?)\s*(?:\|\s*default\s+"([^"]*)")?\s*\}\}/g,
+        (_, k: string, fallback?: string) => ctx[k] || fallback || "",
+    );
     out = out.replace(/\{([^{}|]+(?:\|[^{}]+)+)\}/g, (_, g: string) => g.split("|")[0]);
     return out;
+}
+
+// linkifyUnsubscribe mirrors the send path (internal/tasks/optout.go): the
+// unsubscribe variable resolves to a signed URL a recipient should never have
+// to read, so a loose one in the body becomes an anchor. Only the local
+// fallback preview needs this; a server preview arrives already linkified. An
+// occurrence the author put in their own <a href> sits inside a tag and is
+// left alone, and one used as an anchor's text becomes that anchor's label.
+export function linkifyUnsubscribe(html: string, url: string = SAMPLE.UnsubscribeLink, text = "Unsubscribe"): string {
+    if (!url || !html.includes(url)) return html;
+    let depth = 0;
+    return html.replace(HTML_CHUNK_RE, (chunk) => {
+        if (chunk.startsWith("<")) {
+            if (/^<a[\s/>]/i.test(chunk)) depth++;
+            else if (/^<\/a[\s>]/i.test(chunk)) depth = Math.max(0, depth - 1);
+            return chunk;
+        }
+        return chunk.split(url).join(depth > 0 ? text : `<a href="${url}">${text}</a>`);
+    });
 }
 
 // templateIssue returns a friendly message when a template is obviously

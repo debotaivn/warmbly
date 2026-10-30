@@ -28,11 +28,6 @@ const (
 	// string, so a full key is "wmbly_" + 43 = 49 chars.
 	KeyLength = 32
 
-	// CacheKeyTTL is how long a (key_hash → key_id) lookup is cached.
-	// We still hit the DB on every request to pick up revocations, so the
-	// cache only saves a single index seek.
-	CacheKeyTTL = 300
-
 	// Display prefix shown in lists: "wmbly_" + first 2 random chars.
 	displayPrefixLen = 8
 	// Display suffix shown in lists: last 4 random chars.
@@ -55,6 +50,9 @@ type APIKeyService interface {
 	List(ctx context.Context, orgID uuid.UUID, limit int, cursor *uuid.UUID) (*models.APIKeysResult, *errx.Error)
 	Update(ctx context.Context, orgID, keyID uuid.UUID, data *models.UpdateAPIKey) (*models.APIKey, *errx.Error)
 	Revoke(ctx context.Context, orgID, keyID uuid.UUID, reason string) *errx.Error
+	Delete(ctx context.Context, orgID, keyID uuid.UUID) *errx.Error
+	// RevokeUserCredentials revokes every active key userID created, in every workspace.
+	RevokeUserCredentials(ctx context.Context, userID uuid.UUID) error
 
 	// Validation
 	ValidateKey(ctx context.Context, rawKey string) (*models.APIKey, *errx.Error)
@@ -232,16 +230,33 @@ func (s *apiKeyService) Update(ctx context.Context, orgID, keyID uuid.UUID, data
 }
 
 func (s *apiKeyService) Revoke(ctx context.Context, orgID, keyID uuid.UUID, reason string) *errx.Error {
-	xerr := s.repo.Revoke(ctx, orgID, keyID, reason)
+	// Keys are looked up in the database on every request, so a revoke takes effect on the next one.
+	return s.repo.Revoke(ctx, orgID, keyID, reason)
+}
+
+// userCredentialsRevokedReason is recorded on a key its creator ended with a password change or reset.
+const userCredentialsRevokedReason = "revoked by its creator with a password change or reset"
+
+func (s *apiKeyService) RevokeUserCredentials(ctx context.Context, userID uuid.UUID) error {
+	if _, xerr := s.repo.RevokeCreatedBy(ctx, userID, userCredentialsRevokedReason); xerr != nil {
+		return xerr
+	}
+	return nil
+}
+
+// Delete removes a revoked or expired key from the workspace for good, along
+// with its usage logs. An active key has to be revoked first: revoking is what
+// records that the credential was ended and why, and a delete that also cut
+// off live access would end it with nothing saying so.
+func (s *apiKeyService) Delete(ctx context.Context, orgID, keyID uuid.UUID) *errx.Error {
+	key, xerr := s.repo.GetByID(ctx, orgID, keyID)
 	if xerr != nil {
 		return xerr
 	}
-	// Best-effort cache invalidation so a revoked key stops authenticating
-	// even within the CacheKeyTTL window. The cache key is the hash, which
-	// we don't have on hand, so we drop the by-id mapping if we cache it
-	// later. For now the GetByHash query filters status='active', so the
-	// revoke takes effect on the next request regardless of cache state.
-	return nil
+	if key.CanAuthenticate() {
+		return errx.New(errx.Conflict, "this key is still active; revoke it before deleting it")
+	}
+	return s.repo.Delete(ctx, orgID, keyID)
 }
 
 func (s *apiKeyService) ValidateKey(ctx context.Context, rawKey string) (*models.APIKey, *errx.Error) {
@@ -249,29 +264,7 @@ func (s *apiKeyService) ValidateKey(ctx context.Context, rawKey string) (*models
 		return nil, errx.ErrAuth
 	}
 
-	hash := hashKey(rawKey)
-
-	cacheKey := fmt.Sprintf("apikey:%s", hash)
-	if s.cache != nil {
-		if cached, err := s.cache.Get(ctx, cacheKey).Result(); err == nil && cached != "" {
-			if _, err := uuid.Parse(cached); err == nil {
-				if key, xerr := s.repo.GetByHash(ctx, hash); xerr == nil {
-					return key, nil
-				}
-			}
-		}
-	}
-
-	key, xerr := s.repo.GetByHash(ctx, hash)
-	if xerr != nil {
-		return nil, xerr
-	}
-
-	if s.cache != nil {
-		s.cache.Set(ctx, cacheKey, key.ID.String(), CacheKeyTTL)
-	}
-
-	return key, nil
+	return s.repo.GetByHash(ctx, hashKey(rawKey))
 }
 
 // ValidateKeyIP returns true when the request IP is allowed by the key's

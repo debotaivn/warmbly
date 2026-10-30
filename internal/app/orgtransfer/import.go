@@ -3,11 +3,13 @@ package orgtransfer
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 
@@ -15,7 +17,10 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warmbly/warmbly/internal/app/cipher"
+	"github.com/warmbly/warmbly/internal/app/mailcred"
+	"github.com/warmbly/warmbly/internal/infrastructure/storage"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/displayname"
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
@@ -28,6 +33,11 @@ const (
 	// maxManifestBytes bounds the manifest read from an untrusted archive.
 	maxManifestBytes = 64 << 20
 )
+
+// ErrForeignRows refuses an archive naming records another workspace on this
+// instance owns: an import only writes and references the destination's own.
+var ErrForeignRows = errors.New("this archive holds records that already belong to another workspace on this instance, so nothing was imported. " +
+	"Import it into the workspace it was exported from, or into a workspace on another instance")
 
 // ImportFrom applies an archive to a destination workspace.
 //
@@ -120,6 +130,14 @@ func (s *service) ImportFrom(
 		return nil, err
 	}
 
+	rules := &ruleEnv{orgID: orgID, heldApps: map[uuid.UUID]string{}}
+	if pu, ok := s.blobs.(storage.PublicURLer); ok {
+		rules.logos = pu
+	}
+	if rules.developerBlocked, err = s.repo.DeveloperBlocked(ctx, tx, orgID, opts.ActorUserID); err != nil {
+		return nil, err
+	}
+
 	byName := manifestTables(manifest)
 	applied := 0
 	for i := range Tables {
@@ -146,9 +164,15 @@ func (s *service) ImportFrom(
 			actor:      opts.ActorUserID,
 			conflict:   opts.Conflict,
 			selected:   selected,
+			rules:      rules,
 		})
 		if err != nil {
 			return nil, err
+		}
+		if t.Name == "oauth_applications" {
+			if err := holdImportedApps(ctx, tx, orgID, rules.heldApps); err != nil {
+				return nil, fmt.Errorf("hold imported apps: %w", err)
+			}
 		}
 		if n > 0 {
 			result.RowCounts[t.Name] = n
@@ -157,7 +181,7 @@ func (s *service) ImportFrom(
 	}
 
 	report(93, "restoring attachments")
-	if warn := s.restoreBlobs(ctx, entries, manifest); len(warn) > 0 {
+	if warn := s.restoreBlobs(ctx, tx, orgID, entries, manifest); len(warn) > 0 {
 		result.Warnings = append(result.Warnings, warn...)
 	}
 
@@ -189,6 +213,8 @@ type importContext struct {
 	// selected is the set of groups this run applies, used to decide which
 	// references the import can actually satisfy.
 	selected map[models.OrgDataGroup]bool
+	// rules re-apply write rules to the tables in importRules.
+	rules *ruleEnv
 }
 
 // importTable streams one table's rows out of the archive and into the
@@ -229,6 +255,41 @@ func (s *service) importTable(
 	for _, c := range t.ResetOnImport {
 		reset[c] = true
 	}
+	var resetOnOverwrite []string
+	if t.ResetOnOverwrite {
+		for _, c := range t.ResetOnImport {
+			if writable[c] {
+				resetOnOverwrite = append(resetOnOverwrite, c)
+			}
+		}
+	}
+	for _, c := range t.ResetColumnsOnOverwrite {
+		if writable[c] && reset[c] && !slices.Contains(resetOnOverwrite, c) {
+			resetOnOverwrite = append(resetOnOverwrite, c)
+		}
+	}
+	var invalidations []repository.ImportInvalidation
+	for _, relation := range t.InvalidateOnImport {
+		columns, err := s.repo.TableColumns(ctx, relation.Table)
+		if err != nil {
+			return 0, nil, fmt.Errorf("inspect checkpoint relation %s: %w", relation.Table, err)
+		}
+		if len(columns) > 0 {
+			if len(relation.ResetColumns) > 0 {
+				var available []string
+				for _, c := range relation.ResetColumns {
+					if slices.ContainsFunc(columns, func(info repository.ColumnInfo) bool { return info.Name == c }) {
+						available = append(available, c)
+					}
+				}
+				if len(available) == 0 {
+					continue
+				}
+				relation.ResetColumns = available
+			}
+			invalidations = append(invalidations, relation)
+		}
+	}
 
 	insertCols := make([]string, 0, len(mt.Columns))
 	unknown := 0
@@ -252,18 +313,20 @@ func (s *service) importTable(
 			"%s: %d column(s) in the archive do not exist here and were ignored.", t.Name, unknown))
 	}
 
-	var pk []string
-	if ic.conflict == models.OrgImportConflictOverwrite {
-		if pk, err = s.repo.PrimaryKeyColumns(ctx, t.Name); err != nil {
-			return 0, nil, err
-		}
-		if len(pk) == 0 {
-			warnings = append(warnings, fmt.Sprintf(
-				"%s has no primary key, so existing rows there were kept rather than overwritten.", t.Name))
-		}
+	pk, err := s.repo.PrimaryKeyColumns(ctx, t.Name)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(pk) == 0 && ic.conflict == models.OrgImportConflictOverwrite {
+		warnings = append(warnings, fmt.Sprintf(
+			"%s has no primary key, so existing rows there were kept rather than overwritten.", t.Name))
 	}
 
 	refs, err := s.referencePlan(ctx, t, destCols, ic.selected)
+	if err != nil {
+		return 0, nil, err
+	}
+	tenantRefs, err := s.tenantReferences(ctx, t.Name, insertCols)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -288,7 +351,14 @@ func (s *service) importTable(
 		if len(batch) == 0 {
 			return nil
 		}
-		n, err := s.repo.InsertBatch(ctx, tx, t.Name, insertCols, batch, ic.conflict, pk)
+		foreign, err := s.repo.CountForeignRows(ctx, tx, t.Name, t.OwnerScope(), pk, tenantRefs, orgID, batch)
+		if err != nil {
+			return err
+		}
+		if foreign > 0 {
+			return fmt.Errorf("%s: %w", t.Name, ErrForeignRows)
+		}
+		n, err := s.repo.InsertBatch(ctx, tx, t.Name, insertCols, batch, ic.conflict, pk, t.OwnerScope(), orgID, resetOnOverwrite, invalidations)
 		if err != nil {
 			return err
 		}
@@ -398,6 +468,10 @@ func (s *service) importRow(
 		}
 	}
 
+	if rule := importRules[t.Name]; rule != nil && ic.rules != nil {
+		rule(ic.rules, obj)
+	}
+
 	for _, sc := range t.Secrets {
 		raw, ok := obj[sc.Column]
 		if !ok {
@@ -449,6 +523,14 @@ func (s *service) sealSecret(ctx context.Context, sc SecretColumn, plain string,
 			return "", errors.New("destination organization key unavailable")
 		}
 		return orgCipher.Encrypt(ctx, plain)
+	case KeyDomainMailbox:
+		if s.mailSealing == mailcred.ModeOrganization {
+			return mailcred.SealOrg(ctx, orgCipher, plain)
+		}
+		if s.creds == nil {
+			return "", errors.New("this instance has no CREDENTIALS_ENCRYPTION_KEY, so mailbox credentials cannot be stored")
+		}
+		return s.creds.Encrypt(plain)
 	}
 	return "", fmt.Errorf("column %s has no key domain", sc.Column)
 }
@@ -521,6 +603,51 @@ func (s *service) referencePlan(
 	return plan, nil
 }
 
+// tenantReferences are the foreign keys a written row carries into data some
+// organization owns, each with the fragment selecting the destination's rows.
+func (s *service) tenantReferences(ctx context.Context, table string, insertCols []string) ([]repository.TenantReference, error) {
+	fks, err := s.repo.ForeignKeys(ctx, table)
+	if err != nil {
+		return nil, err
+	}
+	written := make(map[string]bool, len(insertCols))
+	for _, c := range insertCols {
+		written[c] = true
+	}
+	if t, ok := TableByName[table]; ok {
+		for _, c := range t.PartnerRefs {
+			delete(written, c)
+		}
+	}
+	var out []repository.TenantReference
+	for _, fk := range fks {
+		carried := true
+		for _, c := range fk.Columns {
+			carried = carried && written[c]
+		}
+		if !carried {
+			continue
+		}
+		var owner string
+		switch fk.RefTable {
+		case "users":
+			// People are matched to destination accounts by email.
+			continue
+		case "organizations":
+			owner = `id = $1`
+		default:
+			dep, ok := TableByName[fk.RefTable]
+			if !ok {
+				// Instance-wide data, or a reference referencePlan clears.
+				continue
+			}
+			owner = dep.OwnerScope()
+		}
+		out = append(out, repository.TenantReference{ForeignKey: fk, RefOwner: owner})
+	}
+	return out, nil
+}
+
 // mergeOrganization applies the archive's workspace settings onto the
 // destination org. Identity, ownership, and lifecycle columns are excluded:
 // an archive must not be able to hand a workspace to someone else or schedule
@@ -529,6 +656,7 @@ func (s *service) mergeOrganization(ctx context.Context, tx pgx.Tx, orgID uuid.U
 	if len(m.Organization) == 0 {
 		return nil
 	}
+	cleanArchiveOrgName(m.Organization)
 	destCols, err := s.repo.TableColumns(ctx, "organizations")
 	if err != nil {
 		return err
@@ -575,11 +703,27 @@ func (s *service) mergeOrganization(ctx context.Context, tx pgx.Tx, orgID uuid.U
 	return nil
 }
 
+// cleanArchiveOrgName keeps the destination's name unless the archive's passes
+// the same rules as a rename.
+func cleanArchiveOrgName(org map[string]any) {
+	raw, ok := org["name"]
+	if !ok {
+		return
+	}
+	name, _ := raw.(string)
+	if clean := displayname.Clean(name, displayname.Workspace); clean != "" {
+		org["name"] = clean
+		return
+	}
+	delete(org, "name")
+}
+
 // orgMergeExcluded are the organization columns an archive may never set.
 var orgMergeExcluded = func() map[string]bool {
 	out := map[string]bool{
 		"id":                     true,
 		"owner_user_id":          true,
+		"category":               true,
 		"slug":                   true,
 		"created_at":             true,
 		"deletion_scheduled_at":  true,
@@ -651,7 +795,7 @@ func (s *service) buildUserMap(ctx context.Context, m *Manifest, actor uuid.UUID
 
 // restoreBlobs writes the archive's objects back into this instance's storage
 // under their original keys, so the rows that reference them resolve.
-func (s *service) restoreBlobs(ctx context.Context, entries map[string]*zip.File, m *Manifest) []string {
+func (s *service) restoreBlobs(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, entries map[string]*zip.File, m *Manifest) []string {
 	if len(m.Blobs) == 0 {
 		return nil
 	}
@@ -660,8 +804,29 @@ func (s *service) restoreBlobs(ctx context.Context, entries map[string]*zip.File
 			"Object storage is not configured here, so %d attachment(s) in the archive were not restored.", len(m.Blobs))}
 	}
 
-	var failed int
+	// The keys come out of the archive, which is a file the customer uploaded,
+	// so the archive does not get to choose where the bytes land. A key is only
+	// written when it matches a shape this product mints, and a public one is
+	// re-scoped to this workspace with its extension checked.
+	scope, err := loadBlobKeyScope(ctx, tx, orgID)
+	if err != nil {
+		return []string{"Attachments were not restored: this instance could not confirm which objects the archive is allowed to write."}
+	}
+
+	var failed, refused, notImage int
+	// Keys under the two org-scoped public prefixes are rewritten to this
+	// workspace, so the rows that name them have to be repointed or the bytes
+	// are orphaned at a path nothing reads.
+	var imageOldKeys, imageNewKeys, imageURLs []string
+	type urlRewrite struct{ table, column, oldKey, newURL string }
+	var urlRewrites []urlRewrite
+
 	for _, b := range m.Blobs {
+		destKey, ok := scope.plan(b.Key)
+		if !ok {
+			refused++
+			continue
+		}
 		entry, ok := entries[b.Path]
 		if !ok {
 			failed++
@@ -672,16 +837,88 @@ func (s *service) restoreBlobs(ctx context.Context, entries map[string]*zip.File
 			failed++
 			continue
 		}
-		err = s.blobs.Put(ctx, b.Key, rc, "")
+		// A key under a public prefix has to be written public-read again, or
+		// the avatars, form assets and email-body images that reference it by
+		// URL resolve to a 403 on an S3 backend after the move.
+		if isPublicBlobKey(destKey) {
+			body, contentType, ok := publicImage(rc, destKey)
+			if !ok {
+				_ = rc.Close()
+				notImage++
+				continue
+			}
+			var url string
+			url, err = s.blobs.PutPublic(ctx, destKey, bytes.NewReader(body), contentType)
+			if err == nil && url != "" {
+				switch {
+				case strings.HasPrefix(destKey, models.EmailImageKeyPrefix):
+					imageOldKeys = append(imageOldKeys, b.Key)
+					imageNewKeys = append(imageNewKeys, destKey)
+					imageURLs = append(imageURLs, url)
+				case publicURLColumn(b.Table, b.Column):
+					// A form's logo, cover or background is referenced by URL,
+					// and that URL still names the instance it came from. The
+					// bytes are here now, so the row is repointed at this one.
+					// The table and column are the archive's strings, so they
+					// are only used after matching the compiled registry.
+					urlRewrites = append(urlRewrites, urlRewrite{b.Table, b.Column, b.Key, url})
+				}
+			}
+		} else {
+			err = s.blobs.Put(ctx, destKey, rc, "")
+		}
 		_ = rc.Close()
 		if err != nil {
 			failed++
 		}
 	}
-	if failed > 0 {
-		return []string{fmt.Sprintf("%d attachment(s) could not be restored to object storage.", failed)}
+
+	warnings := make([]string, 0, 3)
+	// An imported image row still carries the key and the URL the source
+	// instance used. The bytes now live here, under a key scoped to this
+	// workspace, so the row is repointed at both. Matching on the OLD key is
+	// what makes this work: that is still what the row holds at this point.
+	if len(imageOldKeys) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE email_images SET storage_key = fresh.new_key, url = fresh.url
+			FROM (
+				SELECT unnest($2::text[]) AS old_key,
+				       unnest($3::text[]) AS new_key,
+				       unnest($4::text[]) AS url
+			) AS fresh
+			WHERE email_images.organization_id = $1 AND email_images.storage_key = fresh.old_key
+		`, orgID, imageOldKeys, imageNewKeys, imageURLs); err != nil {
+			warnings = append(warnings, "Email images were restored but still name the instance they came from; re-upload them if that host goes away.")
+		}
 	}
-	return nil
+
+	// Form logos, covers and backgrounds are referenced by URL rather than by
+	// key. The table and column were matched against the compiled registry
+	// above, so they are this binary's own identifiers; the values are bound.
+	for _, rw := range urlRewrites {
+		stmt := fmt.Sprintf(
+			`UPDATE %s SET %s = $1 WHERE organization_id = $2 AND %s LIKE $3`,
+			pgx.Identifier{rw.table}.Sanitize(),
+			pgx.Identifier{rw.column}.Sanitize(),
+			pgx.Identifier{rw.column}.Sanitize(),
+		)
+		if _, err := tx.Exec(ctx, stmt, rw.newURL, orgID, "%"+rw.oldKey); err != nil {
+			warnings = append(warnings, "Some form images were restored but still name the instance they came from; re-upload them if that host goes away.")
+			break
+		}
+	}
+	if failed > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d attachment(s) could not be restored to object storage.", failed))
+	}
+	if refused > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d object(s) in the archive named a storage location this workspace does not own, so they were not written.", refused))
+	}
+	if notImage > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d image(s) in the archive were not a PNG, JPG, GIF or WebP matching their name, so they were not written.", notImage))
+	}
+	return warnings
 }
 
 // resolveArchiveKey derives the archive key when the archive has secrets and a

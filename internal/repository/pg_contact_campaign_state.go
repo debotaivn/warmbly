@@ -19,10 +19,13 @@ import (
 // the service.
 func (r *contactRepository) ListCampaignStates(ctx context.Context, orgID, contactID uuid.UUID) ([]models.ContactCampaignState, *errx.Error) {
 	campQuery := `
-		SELECT cam.id, cam.name, cam.status, c.subscribed, ` + undeliverableClause("cam.id") + `
+		SELECT cam.id, cam.name, cam.status, c.subscribed, ` + undeliverableClause("cam.id") + `,
+		       cl.email_account_id, COALESCE(sender.email, ''),
+		       ` + leadHoldColumns + `
 		FROM campaign_leads cl
 		JOIN campaigns cam ON cam.id = cl.campaign_id AND cam.organization_id = $2
 		JOIN contacts c ON c.id = cl.contact_id AND c.organization_id = $2
+		LEFT JOIN email_accounts sender ON sender.id = cl.email_account_id
 		WHERE cl.contact_id = $1
 		ORDER BY cam.created_at DESC
 	`
@@ -35,14 +38,26 @@ func (r *contactRepository) ListCampaignStates(ctx context.Context, orgID, conta
 		state         models.ContactCampaignState
 		subscribed    bool
 		undeliverable bool
+		held          bool
 	}
 	var camps []campRow
+	now := time.Now()
 	for rows.Next() {
 		var cr campRow
-		if err := rows.Scan(&cr.state.CampaignID, &cr.state.CampaignName, &cr.state.CampaignStatus, &cr.subscribed, &cr.undeliverable); err != nil {
+		var pausedAt, pausedUntil *time.Time
+		var pauseReason, pauseSource string
+		if err := rows.Scan(&cr.state.CampaignID, &cr.state.CampaignName, &cr.state.CampaignStatus, &cr.subscribed, &cr.undeliverable,
+			&cr.state.SenderID, &cr.state.SenderEmail, &pausedAt, &pausedUntil, &pauseReason, &pauseSource); err != nil {
 			rows.Close()
 			db.CaptureError(err, "", nil, "ListCampaignStates campaigns scan")
 			return nil, errx.InternalError()
+		}
+		// A dated hold stops counting the moment it passes, with nothing having
+		// to write. models.LeadHold.Live is the one Go definition of that, and
+		// the router reads the same one.
+		hold := &models.LeadHold{Since: pausedAtOrZero(pausedAt), Until: pausedUntil, Reason: pauseReason, Source: pauseSource}
+		if pausedAt != nil && hold.Live(now) {
+			cr.held, cr.state.Hold = true, hold
 		}
 		camps = append(camps, cr)
 	}
@@ -61,6 +76,12 @@ func (r *contactRepository) ListCampaignStates(ctx context.Context, orgID, conta
 		}
 		st.Steps = steps
 		st.TotalSteps = len(steps)
+		cc, err := listLeadCC(ctx, r.DB.Pool, st.CampaignID, contactID)
+		if err != nil {
+			db.CaptureError(err, "", nil, "ListCampaignStates cc")
+			return nil, errx.InternalError()
+		}
+		st.CC = cc
 
 		var sent, replied, bounced, failed bool
 		var emailSteps, emailSent int
@@ -106,7 +127,7 @@ func (r *contactRepository) ListCampaignStates(ctx context.Context, orgID, conta
 			}
 		}
 		// Same priority as leadStatusClause: unsubscribed > bounced > replied >
-		// failed > completed > active > undeliverable > pending.
+		// failed > completed > paused > active > undeliverable > pending.
 		switch {
 		case !cr.subscribed:
 			st.LeadStatus = models.LeadStatusUnsubscribed
@@ -116,8 +137,12 @@ func (r *contactRepository) ListCampaignStates(ctx context.Context, orgID, conta
 			st.LeadStatus = models.LeadStatusReplied
 		case failed:
 			st.LeadStatus = models.LeadStatusFailed
+		case cr.state.Hold != nil && cr.state.Hold.Source == "send_recovery":
+			st.LeadStatus = models.LeadStatusPaused
 		case sent && emailSteps > 0 && emailSent >= emailSteps:
 			st.LeadStatus = models.LeadStatusCompleted
+		case cr.held:
+			st.LeadStatus = models.LeadStatusPaused
 		case sent:
 			st.LeadStatus = models.LeadStatusActive
 		case cr.undeliverable:
@@ -137,7 +162,12 @@ func (r *contactRepository) ListCampaignStates(ctx context.Context, orgID, conta
 func (r *contactRepository) campaignStepsForContact(ctx context.Context, campaignID, contactID uuid.UUID) ([]models.ContactCampaignStep, string, *errx.Error) {
 	stepQuery := `
 		SELECT s.id, s.name, s.subject, s.kind, s.action, s.position,
-		       p.sent_at, p.opened_at, p.clicked_at, p.replied_at, p.bounced_at, p.failed_at,
+		       p.sent_at,
+		       -- A person's open, as in the Leads list this mirrors: a client
+		       -- prefetch or a gateway scan must not read as the recipient
+		       -- having opened the step.
+		       CASE WHEN p.opened_machine THEN NULL ELSE p.opened_at END,
+		       p.clicked_at, p.replied_at, p.bounced_at, p.failed_at,
 		       COALESCE(p.send_attempts, 0), p.dispatched_at, COALESCE(p.failure_reason, '')
 		FROM sequences s
 		LEFT JOIN campaign_contact_progress p
@@ -151,7 +181,7 @@ func (r *contactRepository) campaignStepsForContact(ctx context.Context, campaig
 		return nil, "", errx.InternalError()
 	}
 	defer rows.Close()
-	var steps []models.ContactCampaignStep
+	steps := make([]models.ContactCampaignStep, 0)
 	var failureReason string
 	var failedAt time.Time
 	emails := 0
@@ -205,9 +235,9 @@ func stepLabel(name, kind string, action []byte, emailOrdinal int) string {
 		}
 		switch cfg.Type {
 		case "add_tag":
-			return "Add tag"
+			return "Add label"
 		case "remove_tag":
-			return "Remove tag"
+			return "Remove label"
 		case "add_to_segment":
 			return "Add to segment"
 		case "remove_from_segment":
@@ -222,4 +252,13 @@ func stepLabel(name, kind string, action []byte, emailOrdinal int) string {
 		return "Action"
 	}
 	return "Step"
+}
+
+// pausedAtOrZero reads a nullable hold start; the zero value is only ever seen
+// by a LeadHold that is immediately discarded as not live.
+func pausedAtOrZero(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
 }

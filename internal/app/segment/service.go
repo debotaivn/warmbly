@@ -7,6 +7,7 @@ package segment
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,15 +19,10 @@ import (
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
-// CampaignWaker wakes a campaign's parked send chain after leads are added.
+// CampaignWaker wakes a campaign's parked send chain after leads are added,
+// and restarts a finished one. Satisfied structurally by campaign.CampaignService.
 type CampaignWaker interface {
 	WakeCampaigns(ctx context.Context, orgID uuid.UUID, campaignIDs []string)
-}
-
-// CampaignStarter restarts a completed campaign whose linked segments grew.
-// Satisfied structurally by campaign.CampaignService.
-type CampaignStarter interface {
-	StartCampaign(ctx context.Context, orgID uuid.UUID, campaignID string, opts models.StartCampaignOptions) *errx.Error
 }
 
 type Service interface {
@@ -36,6 +32,7 @@ type Service interface {
 	Update(ctx context.Context, orgID, id uuid.UUID, in *models.SegmentWrite) (*models.Segment, *errx.Error)
 	Delete(ctx context.Context, orgID, id uuid.UUID) *errx.Error
 	Preview(ctx context.Context, orgID uuid.UUID, in *models.SegmentPreview) (int, *errx.Error)
+	CountAudience(ctx context.Context, orgID uuid.UUID, segmentIDs []string, campaignID *uuid.UUID) (int, *errx.Error)
 	SetMembers(ctx context.Context, orgID, id uuid.UUID, in *models.SegmentMembersWrite) (int, *errx.Error)
 	MemberModes(ctx context.Context, orgID, id uuid.UUID, contactIDs []string) (map[uuid.UUID]models.SegmentMemberMode, *errx.Error)
 	AddToCampaign(ctx context.Context, orgID uuid.UUID, actor string, id uuid.UUID, in *models.SegmentAddToCampaign) (*models.SegmentAddToCampaignResult, *errx.Error)
@@ -45,10 +42,11 @@ type Service interface {
 	Overrides(ctx context.Context, orgID, id uuid.UUID) ([]models.SegmentOverride, *errx.Error)
 	// ListCampaignSegments lists the segments linked to a campaign.
 	ListCampaignSegments(ctx context.Context, orgID, campaignID uuid.UUID) ([]models.CampaignSegmentLink, *errx.Error)
-	// SetCampaignSegments replaces a campaign's linked segments and enrols
-	// their current members immediately. Returns the links and how many
-	// leads were new.
-	SetCampaignSegments(ctx context.Context, orgID, campaignID uuid.UUID, in *models.CampaignSegmentsWrite) ([]models.CampaignSegmentLink, int, *errx.Error)
+	// SetCampaignSegments replaces a campaign's linked segments, enrols their
+	// current members immediately and withdraws the audience a detached link
+	// brought. Returns the links, how many leads were new, and what the
+	// detachment took back.
+	SetCampaignSegments(ctx context.Context, orgID, campaignID uuid.UUID, in *models.CampaignSegmentsWrite) ([]models.CampaignSegmentLink, int, models.CampaignAudienceChange, *errx.Error)
 	// SyncOrgLinkedCampaigns re-enrols every linked campaign of the org after
 	// contacts changed. Best effort: the sweep is the backstop.
 	SyncOrgLinkedCampaigns(ctx context.Context, orgID uuid.UUID)
@@ -56,7 +54,13 @@ type Service interface {
 	// membership drift (dates, engagement, nested segments) still enrols.
 	StartCampaignSegmentSync(ctx context.Context, interval time.Duration)
 	SetCampaignWaker(w CampaignWaker)
-	SetCampaignStarter(st CampaignStarter)
+	SetEnrolmentAuditor(a EnrolmentAuditor)
+}
+
+// EnrolmentAuditor records an automatic enrolment as a campaign update, so the
+// audit spine refreshes every teammate's Leads tab when the sweep adds leads.
+type EnrolmentAuditor interface {
+	LogAction(ctx context.Context, orgID, actorID uuid.UUID, action models.AuditAction, entityType models.AuditEntityType, entityID *uuid.UUID, ipAddress, userAgent string, changes, metadata map[string]string)
 }
 
 // CustomFieldLister is the slice of the contact repository Fields needs.
@@ -65,10 +69,10 @@ type CustomFieldLister interface {
 }
 
 type service struct {
-	repo    repository.SegmentRepository
-	fields  CustomFieldLister
-	waker   CampaignWaker
-	starter CampaignStarter
+	repo   repository.SegmentRepository
+	fields CustomFieldLister
+	waker  CampaignWaker
+	audit  EnrolmentAuditor
 	// orgSync coalesces org-wide enrolment passes, one entry per org that is
 	// currently syncing. Guarded by syncMu, which owns every transition so an
 	// entry is only dropped when nothing is running or queued.
@@ -88,8 +92,8 @@ func NewService(repo repository.SegmentRepository, fields CustomFieldLister) Ser
 	return &service{repo: repo, fields: fields, orgSync: map[uuid.UUID]*orgSyncState{}}
 }
 
-func (s *service) SetCampaignWaker(w CampaignWaker)      { s.waker = w }
-func (s *service) SetCampaignStarter(st CampaignStarter) { s.starter = st }
+func (s *service) SetCampaignWaker(w CampaignWaker)       { s.waker = w }
+func (s *service) SetEnrolmentAuditor(a EnrolmentAuditor) { s.audit = a }
 
 func (s *service) List(ctx context.Context, orgID uuid.UUID) ([]models.Segment, *errx.Error) {
 	return s.repo.List(ctx, orgID)
@@ -259,12 +263,33 @@ func (s *service) Preview(ctx context.Context, orgID uuid.UUID, in *models.Segme
 	return s.repo.Count(ctx, orgID, in.ID, in.Match, in.Conditions)
 }
 
-func parseContactIDs(raw []string) ([]uuid.UUID, *errx.Error) {
+// CountAudience counts a campaign audience: members of any of the segments,
+// plus the campaign's leads that no segment link enrolled, each once.
+func (s *service) CountAudience(ctx context.Context, orgID uuid.UUID, segmentIDs []string, campaignID *uuid.UUID) (int, *errx.Error) {
+	ids := make([]uuid.UUID, 0, len(segmentIDs))
+	for _, raw := range segmentIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return 0, errx.New(errx.BadRequest, "invalid segment id")
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) > 0 {
+		cond := []models.SegmentCondition{{Field: "segment", Operator: models.SegOpIn, Values: segmentIDs}}
+		if xerr := s.checkReferences(ctx, orgID, cond, nil); xerr != nil {
+			return 0, xerr
+		}
+	}
+	return s.repo.CountAudience(ctx, orgID, ids, campaignID)
+}
+
+func parseContactIDs(raw []string, max int) ([]uuid.UUID, *errx.Error) {
 	if len(raw) == 0 {
 		return nil, errx.New(errx.BadRequest, "no contacts provided")
 	}
-	if len(raw) > 1000 {
-		return nil, errx.New(errx.BadRequest, "at most 1000 contacts per request")
+	if len(raw) > max {
+		return nil, errx.NewWithIdentifier(errx.BadRequest, "too_many_contacts",
+			fmt.Sprintf("too many contacts, maximum is %d per request", max))
 	}
 	out := make([]uuid.UUID, 0, len(raw))
 	for _, r := range raw {
@@ -283,7 +308,9 @@ func (s *service) SetMembers(ctx context.Context, orgID, id uuid.UUID, in *model
 	default:
 		return 0, errx.New(errx.BadRequest, "mode must be include, exclude or auto")
 	}
-	ids, xerr := parseContactIDs(in.Contacts)
+	// The handler already bounded the selection by its shape; this is the
+	// ceiling for callers that pass ids straight in.
+	ids, xerr := parseContactIDs(in.Contacts, models.MaxContactBulkSelection)
 	if xerr != nil {
 		return 0, xerr
 	}
@@ -302,7 +329,7 @@ func (s *service) SetMembers(ctx context.Context, orgID, id uuid.UUID, in *model
 }
 
 func (s *service) MemberModes(ctx context.Context, orgID, id uuid.UUID, contactIDs []string) (map[uuid.UUID]models.SegmentMemberMode, *errx.Error) {
-	ids, xerr := parseContactIDs(contactIDs)
+	ids, xerr := parseContactIDs(contactIDs, models.MaxContactBatchIDs)
 	if xerr != nil {
 		return nil, xerr
 	}
@@ -321,9 +348,7 @@ func (s *service) AddToCampaign(ctx context.Context, orgID uuid.UUID, actor stri
 	if xerr != nil {
 		return nil, xerr
 	}
-	if s.waker != nil && res.Added > 0 {
-		s.waker.WakeCampaigns(ctx, orgID, []string{campaignID.String()})
-	}
+	s.reactToEnrolment(ctx, models.LinkedCampaign{CampaignID: campaignID, OrganizationID: orgID, Status: res.Status}, res.Added)
 	return res, nil
 }
 
@@ -331,13 +356,14 @@ func (s *service) ListCampaignSegments(ctx context.Context, orgID, campaignID uu
 	return s.repo.ListForCampaign(ctx, orgID, campaignID)
 }
 
-func (s *service) SetCampaignSegments(ctx context.Context, orgID, campaignID uuid.UUID, in *models.CampaignSegmentsWrite) ([]models.CampaignSegmentLink, int, *errx.Error) {
+func (s *service) SetCampaignSegments(ctx context.Context, orgID, campaignID uuid.UUID, in *models.CampaignSegmentsWrite) ([]models.CampaignSegmentLink, int, models.CampaignAudienceChange, *errx.Error) {
+	var none models.CampaignAudienceChange
 	seen := map[uuid.UUID]bool{}
 	ids := make([]uuid.UUID, 0, len(in.SegmentIDs))
 	for _, raw := range in.SegmentIDs {
 		id, err := uuid.Parse(raw)
 		if err != nil {
-			return nil, 0, errx.New(errx.BadRequest, "invalid segment id")
+			return nil, 0, none, errx.New(errx.BadRequest, "invalid segment id")
 		}
 		if seen[id] {
 			continue
@@ -346,58 +372,52 @@ func (s *service) SetCampaignSegments(ctx context.Context, orgID, campaignID uui
 		ids = append(ids, id)
 	}
 	if len(ids) > models.CampaignSegmentsMax {
-		return nil, 0, errx.New(errx.BadRequest, fmt.Sprintf("a campaign can link at most %d segments", models.CampaignSegmentsMax))
+		return nil, 0, none, errx.New(errx.BadRequest, fmt.Sprintf("a campaign can link at most %d segments", models.CampaignSegmentsMax))
 	}
-	if xerr := s.repo.SetForCampaign(ctx, orgID, campaignID, ids); xerr != nil {
-		return nil, 0, xerr
+	// Links, withdrawal and enrolment commit together: the user is waiting on
+	// this one, and a failed enrolment must not answer 200 with "added 0".
+	added, change, status, xerr := s.repo.ReplaceForCampaign(ctx, orgID, campaignID, ids)
+	if xerr != nil {
+		return nil, 0, none, xerr
 	}
-	added := 0
-	if len(ids) > 0 {
-		links, xerr := s.repo.LinkedCampaignsForSegments(ctx, orgID, ids)
-		if xerr != nil {
-			return nil, 0, xerr
-		}
-		for _, lc := range links {
-			if lc.CampaignID == campaignID {
-				added = s.syncLinkedCampaign(ctx, lc)
-			}
-		}
-	}
+	s.reactToEnrolment(ctx, models.LinkedCampaign{CampaignID: campaignID, OrganizationID: orgID, Status: status}, added)
 	out, xerr := s.repo.ListForCampaign(ctx, orgID, campaignID)
 	if xerr != nil {
-		return nil, 0, xerr
+		return nil, 0, none, xerr
 	}
-	return out, added, nil
+	return out, added, change, nil
 }
 
 // syncLinkedCampaign enrols missing leads for one linked campaign, waking an
 // active chain and restarting a completed one when anything was added.
-func (s *service) syncLinkedCampaign(ctx context.Context, lc models.LinkedCampaign) int {
+func (s *service) syncLinkedCampaign(ctx context.Context, lc models.LinkedCampaign) (int, *errx.Error) {
 	added, xerr := s.repo.SyncCampaignSegments(ctx, lc.OrganizationID, lc.CampaignID)
 	if xerr != nil {
 		log.Warn().Str("campaign_id", lc.CampaignID.String()).Str("error", xerr.Message).Msg("segment sync: enrol failed")
-		return 0
+		return 0, xerr
 	}
-	if added == 0 {
-		return 0
+	s.reactToEnrolment(ctx, lc, added)
+	if added > 0 && s.audit != nil {
+		// The request paths audit themselves; this is the platform acting
+		// (zero actor), and it is what tells open Leads tabs to refresh.
+		s.audit.LogAction(ctx, lc.OrganizationID, uuid.Nil, models.AuditActionUpdate, models.AuditEntityCampaign, &lc.CampaignID, "", "",
+			map[string]string{"leads_added": strconv.Itoa(added)}, map[string]string{"source": "segment_sync"})
+	}
+	return added, nil
+}
+
+// reactToEnrolment wakes an active campaign and restarts a finished one when
+// new leads arrived. WakeCampaigns owns both (the finished case goes through
+// the full launch checks), so a segment enrolment, a direct add and an
+// automation all behave the same way. Paused and draft campaigns accumulate.
+func (s *service) reactToEnrolment(ctx context.Context, lc models.LinkedCampaign, added int) {
+	if added == 0 || s.waker == nil {
+		return
 	}
 	switch lc.Status {
-	case "active":
-		if s.waker != nil {
-			s.waker.WakeCampaigns(ctx, lc.OrganizationID, []string{lc.CampaignID.String()})
-		}
-	case "completed":
-		// Completed only means the campaign ran out of leads; new segment
-		// members are exactly the reason to pick it back up. StartCampaign
-		// re-runs every launch check, so a campaign past its end date, over
-		// plan limits, or with a risky list stays closed.
-		if s.starter != nil {
-			if xerr := s.starter.StartCampaign(ctx, lc.OrganizationID, lc.CampaignID.String(), models.StartCampaignOptions{Automatic: true}); xerr != nil {
-				log.Info().Str("campaign_id", lc.CampaignID.String()).Str("reason", xerr.Message).Msg("segment sync: completed campaign not restarted")
-			}
-		}
+	case "active", "completed":
+		s.waker.WakeCampaigns(ctx, lc.OrganizationID, []string{lc.CampaignID.String()})
 	}
-	return added
 }
 
 // syncLinkedCampaignsForSegments re-enrols the campaigns linked to any of the
@@ -415,7 +435,7 @@ func (s *service) syncLinkedCampaignsForSegments(ctx context.Context, orgID uuid
 			return
 		}
 		for _, lc := range links {
-			s.syncLinkedCampaign(rctx, lc)
+			_, _ = s.syncLinkedCampaign(rctx, lc)
 		}
 	}()
 }
@@ -466,7 +486,7 @@ func (s *service) runOrgSyncPass(ctx context.Context, orgID uuid.UUID) {
 		return
 	}
 	for _, lc := range links {
-		s.syncLinkedCampaign(rctx, lc)
+		_, _ = s.syncLinkedCampaign(rctx, lc)
 	}
 }
 
@@ -503,7 +523,8 @@ func (s *service) sweepLinkedCampaigns(ctx context.Context) {
 			return
 		}
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		total += s.syncLinkedCampaign(cctx, lc)
+		n, _ := s.syncLinkedCampaign(cctx, lc)
+		total += n
 		cancel()
 	}
 	if total > 0 {

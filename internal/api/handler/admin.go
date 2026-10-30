@@ -11,6 +11,7 @@ import (
 	"github.com/warmbly/warmbly/internal/api/middleware"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/utils/paging"
 )
 
 // User Management Handlers
@@ -22,6 +23,11 @@ func (h *Handler) AdminSearchUsers(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.BadRequest, "invalid query parameters"))
 		return
 	}
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
+	search.Offset = offset
 
 	result, xerr := h.AdminService.SearchUsers(c.Request.Context(), &search)
 	if xerr != nil {
@@ -82,7 +88,7 @@ func (h *Handler) AdminBanUser(c *gin.Context) {
 
 	var req models.BanUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -111,7 +117,7 @@ func (h *Handler) AdminUnbanUser(c *gin.Context) {
 
 	var req models.UnbanUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -149,10 +155,13 @@ func (h *Handler) AdminGetUserCampaigns(c *gin.Context) {
 		return
 	}
 
-	cursor := parseCursor(c.Query("cursor"))
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	result, xerr := h.AdminService.GetUserCampaigns(c.Request.Context(), userID, cursor, limit)
+	result, xerr := h.AdminService.GetUserCampaigns(c.Request.Context(), userID, offset, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -169,10 +178,13 @@ func (h *Handler) AdminGetUserEmails(c *gin.Context) {
 		return
 	}
 
-	cursor := parseCursor(c.Query("cursor"))
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	emails, pagination, xerr := h.AdminService.GetUserEmails(c.Request.Context(), userID, cursor, limit)
+	emails, pagination, xerr := h.AdminService.GetUserEmails(c.Request.Context(), userID, offset, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -214,7 +226,7 @@ func (h *Handler) AdminUpdateUserRateLimits(c *gin.Context) {
 
 	var req models.UpdateUserRateLimitsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -231,10 +243,13 @@ func (h *Handler) AdminUpdateUserRateLimits(c *gin.Context) {
 
 // AdminListWorkers lists all workers
 func (h *Handler) AdminListWorkers(c *gin.Context) {
-	cursor := parseCursor(c.Query("cursor"))
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	result, xerr := h.AdminService.ListWorkers(c.Request.Context(), cursor, limit)
+	result, xerr := h.AdminService.ListWorkers(c.Request.Context(), offset, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -276,7 +291,7 @@ func (h *Handler) AdminUpdateWorker(c *gin.Context) {
 
 	var req models.AdminUpdateWorker
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -297,10 +312,14 @@ func (h *Handler) AdminGetWorkerEmails(c *gin.Context) {
 		return
 	}
 
-	cursor := parseCursor(c.Query("cursor"))
+	beforeAt, beforeID, cursorErr := paging.DecodeTimeCursor(c.Query("cursor"))
+	if cursorErr != nil {
+		errx.JSON(c, cursorErr)
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	emails, pagination, xerr := h.AdminService.GetWorkerEmails(c.Request.Context(), workerID, cursor, limit)
+	emails, pagination, xerr := h.AdminService.GetWorkerEmails(c.Request.Context(), workerID, beforeAt, beforeID, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -342,7 +361,7 @@ func (h *Handler) AdminReassignEmails(c *gin.Context) {
 
 	var req models.ReassignEmailsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -386,10 +405,13 @@ func (h *Handler) AdminGetWarmupHealthSummary(c *gin.Context) {
 // AdminGetPoolParticipants gets participants in a warmup pool
 func (h *Handler) AdminGetPoolParticipants(c *gin.Context) {
 	poolType := c.Param("type")
-	cursor := parseCursor(c.Query("cursor"))
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	result, xerr := h.AdminService.GetPoolParticipants(c.Request.Context(), poolType, cursor, limit)
+	result, xerr := h.AdminService.GetPoolParticipants(c.Request.Context(), poolType, offset, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -400,10 +422,13 @@ func (h *Handler) AdminGetPoolParticipants(c *gin.Context) {
 
 // AdminListBlockedAccounts lists blocked warmup accounts
 func (h *Handler) AdminListBlockedAccounts(c *gin.Context) {
-	cursor := parseCursor(c.Query("cursor"))
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	result, xerr := h.AdminService.ListBlockedAccounts(c.Request.Context(), cursor, limit)
+	result, xerr := h.AdminService.ListBlockedAccounts(c.Request.Context(), offset, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -428,7 +453,7 @@ func (h *Handler) AdminBlockAccount(c *gin.Context) {
 
 	var req models.BlockAccountRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -469,10 +494,13 @@ func (h *Handler) AdminUnblockAccount(c *gin.Context) {
 // AdminListAppeals lists warmup appeals
 func (h *Handler) AdminListAppeals(c *gin.Context) {
 	status := c.Query("status")
-	cursor := parseCursor(c.Query("cursor"))
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	result, xerr := h.AdminService.ListAppeals(c.Request.Context(), status, cursor, limit)
+	result, xerr := h.AdminService.ListAppeals(c.Request.Context(), status, offset, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -514,7 +542,7 @@ func (h *Handler) AdminApproveAppeal(c *gin.Context) {
 
 	var req models.ReviewAppealRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -543,7 +571,7 @@ func (h *Handler) AdminRejectAppeal(c *gin.Context) {
 
 	var req models.ReviewAppealRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -565,6 +593,11 @@ func (h *Handler) AdminSearchCampaigns(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.BadRequest, "invalid query parameters"))
 		return
 	}
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
+	search.Offset = offset
 
 	result, xerr := h.AdminService.SearchCampaigns(c.Request.Context(), &search)
 	if xerr != nil {
@@ -682,28 +715,6 @@ func (h *Handler) AdminGetHourlyEmailStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"stats": stats})
 }
 
-// AdminGetWorkerLoadStats gets worker load statistics
-func (h *Handler) AdminGetWorkerLoadStats(c *gin.Context) {
-	stats, xerr := h.AdminService.GetWorkerLoadStats(c.Request.Context())
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"stats": stats})
-}
-
-// AdminGetEmailDistribution gets email distribution across workers
-func (h *Handler) AdminGetEmailDistribution(c *gin.Context) {
-	dist, xerr := h.AdminService.GetEmailDistribution(c.Request.Context())
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"distribution": dist})
-}
-
 // AdminGetUserGrowthStats gets user growth statistics
 func (h *Handler) AdminGetUserGrowthStats(c *gin.Context) {
 	startDate, endDate := parseDateRange(c)
@@ -717,197 +728,17 @@ func (h *Handler) AdminGetUserGrowthStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"stats": stats})
 }
 
-// Plan Management Handlers
-
-// AdminListPlans lists the plan catalog with the shared faceted query params;
-// returns the standard {data, pagination} envelope.
-func (h *Handler) AdminListPlans(c *gin.Context) {
-	var search models.AdminPlanSearch
-	if err := c.ShouldBindQuery(&search); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid query parameters"))
-		return
-	}
-	// duration is durations.title (free text, no DB enum) — validate app-side.
-	if search.Duration != "" && search.Duration != "month" && search.Duration != "year" {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid duration"))
-		return
-	}
-
-	result, xerr := h.AdminService.SearchPlansForAdmin(c.Request.Context(), &search)
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, result)
-}
-
-// AdminCreatePlan creates a new plan
-func (h *Handler) AdminCreatePlan(c *gin.Context) {
-	adminID := middleware.GetAdminUserID(c)
-	if adminID == nil {
-		errx.JSON(c, errx.ErrUnauthorized)
-		return
-	}
-
-	var req models.CreatePlanRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
-		return
-	}
-
-	plan, xerr := h.AdminService.CreatePlan(c.Request.Context(), *adminID, &req, c.ClientIP(), c.GetHeader("User-Agent"))
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusCreated, plan)
-}
-
-// AdminGetPlan gets a plan by ID
-func (h *Handler) AdminGetPlan(c *gin.Context) {
-	planID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid plan ID"))
-		return
-	}
-
-	plan, xerr := h.AdminService.GetPlan(c.Request.Context(), planID)
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, plan)
-}
-
-// AdminUpdatePlan updates a plan
-func (h *Handler) AdminUpdatePlan(c *gin.Context) {
-	adminID := middleware.GetAdminUserID(c)
-	if adminID == nil {
-		errx.JSON(c, errx.ErrUnauthorized)
-		return
-	}
-
-	planID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid plan ID"))
-		return
-	}
-
-	var req models.UpdatePlanRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
-		return
-	}
-
-	plan, xerr := h.AdminService.UpdatePlan(c.Request.Context(), *adminID, planID, &req, c.ClientIP(), c.GetHeader("User-Agent"))
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, plan)
-}
-
-// AdminDeletePlan deletes a plan
-func (h *Handler) AdminDeletePlan(c *gin.Context) {
-	adminID := middleware.GetAdminUserID(c)
-	if adminID == nil {
-		errx.JSON(c, errx.ErrUnauthorized)
-		return
-	}
-
-	planID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid plan ID"))
-		return
-	}
-
-	xerr := h.AdminService.DeletePlan(c.Request.Context(), *adminID, planID, c.ClientIP(), c.GetHeader("User-Agent"))
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "plan deleted successfully"})
-}
-
-// Enterprise Inquiry Handlers
-
-// AdminListEnterpriseInquiries lists enterprise inquiries with the shared
-// faceted query params; returns the standard {data, pagination} envelope.
-func (h *Handler) AdminListEnterpriseInquiries(c *gin.Context) {
-	var search models.AdminEnterpriseInquirySearch
-	if err := c.ShouldBindQuery(&search); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid query parameters"))
-		return
-	}
-
-	result, xerr := h.AdminService.ListEnterpriseInquiries(c.Request.Context(), &search)
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, result)
-}
-
-// AdminGetEnterpriseInquiry gets a specific enterprise inquiry
-func (h *Handler) AdminGetEnterpriseInquiry(c *gin.Context) {
-	inquiryID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid inquiry ID"))
-		return
-	}
-
-	inquiry, xerr := h.AdminService.GetEnterpriseInquiry(c.Request.Context(), inquiryID)
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, inquiry)
-}
-
-// AdminUpdateEnterpriseInquiry updates an enterprise inquiry
-func (h *Handler) AdminUpdateEnterpriseInquiry(c *gin.Context) {
-	adminID := middleware.GetAdminUserID(c)
-	if adminID == nil {
-		errx.JSON(c, errx.ErrUnauthorized)
-		return
-	}
-
-	inquiryID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid inquiry ID"))
-		return
-	}
-
-	var req models.UpdateEnterpriseInquiryRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
-		return
-	}
-
-	xerr := h.AdminService.UpdateEnterpriseInquiry(c.Request.Context(), *adminID, inquiryID, &req, c.ClientIP(), c.GetHeader("User-Agent"))
-	if xerr != nil {
-		errx.JSON(c, xerr)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "inquiry updated successfully"})
-}
-
 // Admin Management Handlers
 
 // AdminListAdmins lists all admin users
 func (h *Handler) AdminListAdmins(c *gin.Context) {
-	cursor := parseCursor(c.Query("cursor"))
+	offset, ok := offsetCursor(c)
+	if !ok {
+		return
+	}
 	limit := parseLimit(c.Query("limit"), 50)
 
-	result, xerr := h.AdminService.ListAdmins(c.Request.Context(), cursor, limit)
+	result, xerr := h.AdminService.ListAdmins(c.Request.Context(), offset, limit)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -932,7 +763,7 @@ func (h *Handler) AdminGrantPermissions(c *gin.Context) {
 
 	var req models.GrantAdminRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -975,6 +806,10 @@ func (h *Handler) AdminSearchAuditLogs(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.BadRequest, "invalid query parameters"))
 		return
 	}
+	if _, _, xerr := paging.DecodeTimeCursor(search.Cursor); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
 
 	result, xerr := h.AdminService.SearchAuditLogs(c.Request.Context(), &search)
 	if xerr != nil {
@@ -992,6 +827,17 @@ func (h *Handler) AdminGetPermissionList(c *gin.Context) {
 }
 
 // Helper functions
+
+// offsetCursor decodes an admin list's opaque ?cursor, answering 400 for a
+// malformed one rather than quietly serving the first page.
+func offsetCursor(c *gin.Context) (int, bool) {
+	offset, xerr := paging.DecodeOffsetCursor(c.Query("cursor"))
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return 0, false
+	}
+	return offset, true
+}
 
 func parseCursor(s string) *uuid.UUID {
 	if s == "" {

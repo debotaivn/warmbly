@@ -10,19 +10,19 @@ import (
 	"context"
 	"strings"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
-	"github.com/warmbly/warmbly/internal/pkg/crypt"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 	"golang.org/x/oauth2"
 )
 
 // OAuthReauth issues an authorization URL that renews an existing mailbox's
 // tokens. Same round trip as OAuthStart, but the state carries the account id
 // so the finish leg updates in place instead of connecting a duplicate.
-func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uuid.UUID, accountID uuid.UUID) (*models.EmailOnboardingStartResponse, *errx.Error) {
+func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uuid.UUID, accountID uuid.UUID, returnOrigin string) (*models.EmailOnboardingStartResponse, *errx.Error) {
 	if orgID == nil {
 		return nil, errx.ErrNoOrganization
 	}
@@ -36,8 +36,14 @@ func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uu
 	}
 
 	provider := models.InboxProvider(account.Provider)
+	if returnOrigin != "" && config.DashboardOrigin(returnOrigin) == "" {
+		return nil, errx.ErrEmailOnboardReturnOrigin
+	}
 	if provider == models.InboxProviderSMTPIMAP {
 		return nil, errx.ErrEmailReauthProvider
+	}
+	if account.AuthMethod == models.MailAuthDelegated {
+		return nil, errx.ErrEmailReauthDelegated
 	}
 	// A cloud-managed mailbox has no local token row to renew; its sign-in
 	// lives on Warmbly Cloud.
@@ -52,11 +58,16 @@ func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uu
 		return nil, xerr
 	}
 
-	state, err := crypt.Nonce()
+	// Only the dashboard renews a mailbox's sign-in.
+	state, err := newState(true)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
+
+	// PKCE, same as the first-connect path: the verifier never leaves the
+	// server, so an intercepted code is not redeemable.
+	verifier := oauth2.GenerateVerifier()
 
 	if xerr := s.saveOnboardingState(ctx, state, &models.EmailOnboardingState{
 		UserID:         userID,
@@ -64,17 +75,14 @@ func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uu
 		Provider:       string(provider),
 		Nonce:          state,
 		EmailAccountID: &accountID,
+		CodeVerifier:   verifier,
+		ReturnOrigin:   returnOrigin,
 	}); xerr != nil {
 		return nil, xerr
 	}
 
-	url := cfg.AuthCodeURL(
-		state,
-		oauth2.AccessTypeOffline,
-		oauth2.ApprovalForce, // force refresh_token issuance on reconnect
-		// Preselect the mailbox being renewed in the provider's picker.
-		oauth2.SetAuthURLParam("login_hint", account.Email),
-	)
+	opts := append(authCodeOptions(provider, account.Email), oauth2.S256ChallengeOption(verifier))
+	url := cfg.AuthCodeURL(state, opts...)
 	return &models.EmailOnboardingStartResponse{URL: url, State: state}, nil
 }
 
@@ -118,6 +126,12 @@ func (s *emailService) finishReauth(ctx context.Context, sess *models.EmailOnboa
 		return nil, errx.InternalError()
 	}
 
+	// The send-as list can have changed while the mailbox was disconnected,
+	// and a stale one is what would put a removed alias on the From header.
+	// The signature is deliberately not re-imported: a reconnect is a repair,
+	// not a moment to overwrite what someone has since edited here.
+	s.captureSendIdentityList(ctx, account, tok)
+
 	return s.reconnectAccount(ctx, account.ID)
 }
 
@@ -125,6 +139,8 @@ func (s *emailService) finishReauth(ctx context.Context, sess *models.EmailOnboa
 // validate the replacement credentials against a live worker, store them, and
 // put the mailbox back to work.
 func (s *emailService) UpdateSMTPIMAPCredentials(ctx context.Context, orgID *uuid.UUID, accountID uuid.UUID, creds *models.SmtpImap) (*models.Email, *errx.Error) {
+	ctx, cancel := detach(ctx, connectBudget)
+	defer cancel()
 	if orgID == nil {
 		return nil, errx.ErrNoOrganization
 	}
@@ -145,20 +161,12 @@ func (s *emailService) UpdateSMTPIMAPCredentials(ctx context.Context, orgID *uui
 	if xerr := validateSMTPIMAPCredentials(creds); xerr != nil {
 		return nil, xerr
 	}
+	s.inheritTLSPolicy(ctx, accountID, creds)
 
 	if s.workerAssignment == nil {
 		return nil, errx.ErrEmailOnboardNoWorker
 	}
-	// Any healthy worker can run the one-shot validation handshake, same as at
-	// connect time; tier only matters for placement.
-	w, werr := s.workerAssignment.SelectSharedWorker(ctx, false)
-	if werr != nil || w == nil {
-		w, werr = s.workerAssignment.SelectSharedWorker(ctx, true)
-	}
-	if werr != nil || w == nil {
-		return nil, errx.ErrEmailOnboardNoWorker
-	}
-	if xerr := s.ValidateCredentials(ctx, *orgID, w.ID.String(), creds); xerr != nil {
+	if xerr := s.checkCredentials(ctx, *orgID, account.WorkerID, creds); xerr != nil {
 		return nil, xerr
 	}
 
@@ -166,7 +174,17 @@ func (s *emailService) UpdateSMTPIMAPCredentials(ctx context.Context, orgID *uui
 		return nil, errx.InternalError()
 	}
 
-	return s.reconnectAccount(ctx, accountID)
+	account, xerr = s.reconnectAccount(ctx, accountID)
+	if xerr != nil {
+		return nil, xerr
+	}
+	// Warmbly Cloud sends this mailbox's warmup with its own copy of the credential.
+	if s.cloudCredentials != nil {
+		if xerr := s.cloudCredentials.RefreshCredentials(ctx, *orgID, accountID); xerr != nil {
+			log.Warn().Str("account_id", accountID.String()).Str("code", xerr.Identifier).Msg("cloud link: new credential not handed to Warmbly Cloud; it keeps the old one until the mailbox is enrolled again")
+		}
+	}
+	return account, nil
 }
 
 // reconnectAccount is the shared tail of both reconnect flows: reactivate,
@@ -184,12 +202,23 @@ func (s *emailService) reconnectAccount(ctx context.Context, accountID uuid.UUID
 	if account == nil {
 		return nil, errx.ErrNotFound
 	}
+	if account.OrganizationID == nil {
+		return nil, errx.ErrNoOrganization
+	}
 	status := "active"
-	updated, xerr := s.Update(ctx, account.UserID, account.ID.String(), &models.UpdateEmail{Status: &status})
+	updated, xerr := s.Update(ctx, account.OrganizationID.String(), account.UserID, account.ID.String(), &models.UpdateEmail{Status: &status})
 	if xerr != nil {
 		return nil, xerr
 	}
 	s.resolveCredentialErrors(ctx, account.ID)
+	// Both reconnect flows only get here with a credential the server just accepted, which is what an authentication hold waits for.
+	if releaser, ok := s.emailRepository.(interface {
+		ReleaseAuthenticationHold(context.Context, uuid.UUID, uuid.UUID) (bool, error)
+	}); ok {
+		if _, err := releaser.ReleaseAuthenticationHold(ctx, *account.OrganizationID, account.ID); err != nil {
+			log.Warn().Err(err).Str("account_id", account.ID.String()).Msg("reconnect succeeded but the authentication send hold could not be released")
+		}
+	}
 	return updated, nil
 }
 
@@ -200,13 +229,37 @@ func (s *emailService) resolveCredentialErrors(ctx context.Context, accountID uu
 	if s.accountErrors == nil {
 		return
 	}
-	codes := make([]string, 0, len(errx.CredentialMailErrorCodes))
-	for _, c := range errx.CredentialMailErrorCodes {
+	// The certificate errors clear too: every reconnect path first passed a
+	// connection test under the TLS settings it stored.
+	codes := make([]string, 0, len(errx.CredentialMailErrorCodes)+len(errx.TLSCertificateMailErrorCodes))
+	for _, c := range append(append([]errx.MailErrorCode{}, errx.CredentialMailErrorCodes...), errx.TLSCertificateMailErrorCodes...) {
 		codes = append(codes, string(c))
 	}
 	if xerr := s.accountErrors.ResolveByCodes(ctx, accountID, codes, "reconnect"); xerr != nil {
 		log.Warn().Str("account_id", accountID.String()).Str("error", xerr.Message).Msg("could not resolve credential errors after reconnect")
 	}
+}
+
+// inheritTLSPolicy keeps a server's certificate opt-out and pin across a
+// credential change that does not mention them, as long as the host is the
+// same. The check that follows clears both once the chain passes CA verification.
+func (s *emailService) inheritTLSPolicy(ctx context.Context, accountID uuid.UUID, creds *models.SmtpImap) {
+	stored, xerr := s.emailRepository.GetSMTPCredentials(ctx, accountID)
+	if xerr != nil || stored == nil {
+		return
+	}
+	inheritTLS(creds.SMTP, stored.SMTPHost, stored.SMTPTLSUnverified, stored.SMTPTLSPin)
+	inheritTLS(creds.IMAP, stored.IMAPHost, stored.IMAPTLSUnverified, stored.IMAPTLSPin)
+}
+
+func inheritTLS(svc *models.Service, host string, unverified bool, pin string) {
+	if svc == nil || svc.TLSUnverified || !unverified {
+		return
+	}
+	if !strings.EqualFold(models.NormalizeMailHost(svc.Host), models.NormalizeMailHost(host)) {
+		return
+	}
+	svc.TLSUnverified, svc.TLSPin = true, pin
 }
 
 // validateSMTPIMAPCredentials checks a replacement credential set: same bar as
@@ -227,5 +280,6 @@ func validateSMTPIMAPCredentials(creds *models.SmtpImap) *errx.Error {
 	if !validPort(creds.IMAP.Port) {
 		return errx.ErrEmailIMAPPort
 	}
+	normalizeMailPasswords(creds.SMTP, creds.IMAP)
 	return validateMailSecurity(creds.SMTP, creds.IMAP)
 }

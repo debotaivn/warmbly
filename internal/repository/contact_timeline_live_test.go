@@ -2,11 +2,15 @@ package repository
 
 import (
 	"context"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/utils/paging"
 )
 
 // Live cover for the contact timeline's lifecycle events and first-touch
@@ -34,8 +38,8 @@ func TestLiveContactTimelineLifecycleEvents(t *testing.T) {
 	repo := NewContactRepostory(handle)
 
 	category := uuid.New()
-	if _, err := pool.Exec(ctx, `INSERT INTO categories (id, user_id, title, color, position) VALUES ($1, $2, 'Warm lead', '#ff8800', 0)`,
-		category, f.owner); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO categories (id, organization_id, user_id, title, color, position) VALUES ($1, $2, $3, 'Warm lead', '#ff8800', 0)`,
+		category, f.org, f.owner); err != nil {
 		t.Fatalf("category: %v", err)
 	}
 	t.Cleanup(func() {
@@ -59,7 +63,7 @@ func TestLiveContactTimelineLifecycleEvents(t *testing.T) {
 
 	timeline := func() []models.ContactTimelineEvent {
 		t.Helper()
-		res, xerr := repo.ListTimeline(ctx, f.owner, &f.org, id, 50, nil)
+		res, xerr := repo.ListTimeline(ctx, f.org, id, 50, nil)
 		if xerr != nil {
 			t.Fatalf("timeline: %v", xerr)
 		}
@@ -123,9 +127,9 @@ func TestLiveContactTimelineLifecycleEvents(t *testing.T) {
 
 	// Bulk edit: the other direction for both link kinds.
 	if _, xerr := repo.BulkUpdate(ctx, f.owner.String(), f.org, &models.BulkEditContactsData{
-		Contacts:        []string{id.String()},
-		RemoveCampaigns: []string{f.other.String()},
-		AddCategories:   []string{category.String()},
+		ContactSelection: models.ContactSelection{Contacts: []string{id.String()}},
+		RemoveCampaigns:  []string{f.other.String()},
+		AddCategories:    []string{category.String()},
 	}); xerr != nil {
 		t.Fatalf("bulk update: %v", xerr)
 	}
@@ -138,7 +142,7 @@ func TestLiveContactTimelineLifecycleEvents(t *testing.T) {
 	}
 	// A no-op bulk edit (already linked) writes nothing.
 	if _, xerr := repo.BulkUpdate(ctx, f.owner.String(), f.org, &models.BulkEditContactsData{
-		Contacts: []string{id.String()}, AddCategories: []string{category.String()},
+		ContactSelection: models.ContactSelection{Contacts: []string{id.String()}}, AddCategories: []string{category.String()},
 	}); xerr != nil {
 		t.Fatalf("bulk no-op: %v", xerr)
 	}
@@ -151,6 +155,67 @@ func TestLiveContactTimelineLifecycleEvents(t *testing.T) {
 		if ev[i].At.After(ev[i-1].At) {
 			t.Fatalf("timeline out of order at %d: %s after %s", i, ev[i].At, ev[i-1].At)
 		}
+	}
+}
+
+// Issue #550: organization members see the timeline regardless of who created the contact.
+func TestLiveContactTimelineIsOrganizationWide(t *testing.T) {
+	handle, pool := liveContactDB(t)
+	f := newSharedOrgFixture(t, pool)
+	ctx := context.Background()
+	repo := NewContactRepostory(handle)
+	step := uuid.New()
+	task := uuid.New()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO contact_activities (contact_id, organization_id, user_id, activity_type, metadata)
+		VALUES ($1, $2, $3, 'contact_created', '{"source":"manual"}')
+	`, f.contact, f.org, f.owner); err != nil {
+		t.Fatalf("seed activity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO sequences (id, campaign_id, organization_id, name, subject, body_plain, body_html)
+		VALUES ($1, $2, $3, 'Intro', 'Quick question', '', '')
+	`, step, f.campaign, f.org); err != nil {
+		t.Fatalf("seed sequence: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO campaign_contact_progress (campaign_id, contact_id, sequence_id, sent_at)
+		VALUES ($1, $2, $3, NOW())
+	`, f.campaign, f.contact, step); err != nil {
+		t.Fatalf("seed campaign activity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO email_link_clicks (task_id, campaign_id, contact_id, sequence_id, destination, label)
+		VALUES ($1, $2, $3, $4, 'https://example.com/pricing', 'Pricing')
+	`, task, f.campaign, f.contact, step); err != nil {
+		t.Fatalf("seed click: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO email_opens (id, task_id, campaign_id, contact_id, sequence_id, opened_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`, uuid.New(), task, f.campaign, f.contact, step); err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+
+	res, xerr := repo.ListTimeline(ctx, f.org, f.contact, 50, nil)
+	if xerr != nil {
+		t.Fatalf("teammate timeline: %v", xerr)
+	}
+	if n := countTimeline(res.Data, models.TimelineContactCreated, nil); n != 1 {
+		t.Fatalf("teammate timeline has %d contact_created events, want 1", n)
+	}
+	if n := countTimeline(res.Data, models.TimelineEmailSent, nil); n != 1 {
+		t.Fatalf("teammate timeline has %d email_sent events, want 1", n)
+	}
+	if n := countTimeline(res.Data, models.TimelineEmailClicked, nil); n != 1 {
+		t.Fatalf("teammate timeline has %d email_clicked events, want 1", n)
+	}
+	if n := countTimeline(res.Data, models.TimelineEmailOpened, nil); n != 1 {
+		t.Fatalf("teammate timeline has %d email_opened events, want 1", n)
+	}
+	if _, xerr := repo.ListTimeline(ctx, uuid.New(), f.contact, 50, nil); xerr != errx.ErrNotFound {
+		t.Fatalf("other organization timeline error = %v, want not found", xerr)
 	}
 }
 
@@ -181,5 +246,119 @@ func TestLiveContactSourceCampaignResolvesName(t *testing.T) {
 		Email: "i255-bad-" + uuid.New().String()[:8] + "@test.local", Source: "website",
 	}}); xerr == nil {
 		t.Fatal("an unknown source must be refused, not stored")
+	}
+}
+
+// Live cover for the timeline's cursor (issue #305): events that share a
+// timestamp, within one source and across sources, must land on one side of
+// a page boundary or the other, never be skipped and never repeat, and a page
+// filled by a single source must still report that more follow.
+//
+//	WARMBLY_TEST_DB=postgres://warmbly:warmbly@localhost:15432/warmbly_dev?sslmode=disable \
+//	  go test ./internal/repository/ -run LiveContactTimelinePages -v
+func TestLiveContactTimelinePagesOnTiesWithoutGapsOrRepeats(t *testing.T) {
+	handle, pool := liveContactDB(t)
+	f := newSharedOrgFixture(t, pool)
+	ctx := context.Background()
+	repo := NewContactRepostory(handle)
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed %q: %v", sql[:min(60, len(sql))], err)
+		}
+	}
+	at := time.Date(2026, 6, 9, 11, 42, 0, 250000000, time.UTC)
+	step := uuid.New()
+	exec(`INSERT INTO sequences (id, campaign_id, organization_id, name, subject, body_plain, body_html) VALUES ($1, $2, $3, 'Intro', 'Quick question', '', '')`, step, f.campaign, f.org)
+	// Three stamps on one lead at the same instant: sent, a summary open
+	// (nothing in email_opens stands for it) and a reply.
+	exec(`INSERT INTO campaign_contact_progress (campaign_id, contact_id, sequence_id, sent_at, opened_at, replied_at) VALUES ($1, $2, $3, $4, $4, $4)`,
+		f.campaign, f.contact, step, at)
+	for i := 0; i < 3; i++ {
+		exec(`INSERT INTO contact_notes (contact_id, organization_id, user_id, content, created_at) VALUES ($1, $2, $3, $4, $5)`,
+			f.contact, f.org, f.owner, "note "+strconv.Itoa(i), at)
+	}
+	exec(`INSERT INTO contact_notes (contact_id, organization_id, user_id, content, created_at) VALUES ($1, $2, $3, 'older', $4)`,
+		f.contact, f.org, f.owner, at.Add(-time.Hour))
+	for i := 0; i < 2; i++ {
+		exec(`INSERT INTO contact_activities (contact_id, organization_id, user_id, activity_type, metadata, created_at) VALUES ($1, $2, $3, 'campaign_added', '{"campaign_name":"Agency partnerships"}', $4)`,
+			f.contact, f.org, f.owner, at)
+	}
+	exec(`INSERT INTO contact_activities (contact_id, organization_id, user_id, activity_type, metadata, created_at) VALUES ($1, $2, $3, 'contact_created', '{"source":"manual"}', $4)`,
+		f.contact, f.org, f.owner, at.Add(time.Hour))
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = pool.Exec(c, `DELETE FROM contact_activities WHERE contact_id = $1`, f.contact)
+		_, _ = pool.Exec(c, `DELETE FROM contact_notes WHERE contact_id = $1`, f.contact)
+		_, _ = pool.Exec(c, `DELETE FROM campaign_contact_progress WHERE contact_id = $1`, f.contact)
+		_, _ = pool.Exec(c, `DELETE FROM sequences WHERE id = $1`, step)
+	})
+	const total = 10 // 3 stamps + 4 notes + 3 activities
+
+	// Walk the feed three at a time: a page of three can be filled by the
+	// notes at `at` alone, and eight events share that instant.
+	var all []models.ContactTimelineEvent
+	var cursor *models.ContactTimelineKey
+	for page := 0; ; page++ {
+		res, xerr := repo.ListTimeline(ctx, f.org, f.contact, 3, cursor)
+		if xerr != nil {
+			t.Fatalf("page %d: %v", page, xerr)
+		}
+		if res.HasMore != res.Pagination.HasMore {
+			t.Fatalf("page %d: has_more %v disagrees with pagination.has_more %v", page, res.HasMore, res.Pagination.HasMore)
+		}
+		all = append(all, res.Data...)
+		if !res.HasMore {
+			if res.Pagination.NextCursor != nil {
+				t.Fatalf("last page must carry no cursor, got %q", *res.Pagination.NextCursor)
+			}
+			break
+		}
+		if res.Pagination.NextCursor == nil || len(res.Data) != 3 {
+			t.Fatalf("page %d: has_more with %d events and cursor %v", page, len(res.Data), res.Pagination.NextCursor)
+		}
+		cAt, cSource, cID, xerr := paging.DecodeMergedCursor(*res.Pagination.NextCursor)
+		if xerr != nil {
+			t.Fatalf("page %d: cursor does not decode: %v", page, xerr)
+		}
+		if last := res.Data[2].Key; !cAt.Equal(last.At) || models.ContactTimelineSource(cSource) != last.Source || cID != last.ID {
+			t.Fatalf("page %d: cursor %v/%d/%s is not the last event's key %+v", page, cAt, cSource, cID, last)
+		}
+		cursor = &models.ContactTimelineKey{At: cAt, Source: models.ContactTimelineSource(cSource), ID: cID}
+		if page > total {
+			t.Fatal("the walk never ends")
+		}
+	}
+	if len(all) != total {
+		t.Fatalf("want %d events across the pages, got %d: %+v", total, len(all), all)
+	}
+	seen := map[models.ContactTimelineKey]bool{}
+	for i, e := range all {
+		if seen[e.Key] {
+			t.Fatalf("event %d repeated across pages: %+v", i, e.Key)
+		}
+		seen[e.Key] = true
+		if i > 0 && !e.Key.Before(all[i-1].Key) {
+			t.Fatalf("feed out of order at %d: %+v then %+v", i, all[i-1].Key, e.Key)
+		}
+	}
+	for typ, want := range map[models.ContactTimelineEventType]int{
+		models.TimelineEmailSent: 1, models.TimelineEmailOpened: 1, models.TimelineEmailReplied: 1,
+		models.TimelineNote: 4, models.TimelineCampaignAdded: 2, models.TimelineContactCreated: 1,
+	} {
+		if n := countTimeline(all, typ, nil); n != want {
+			t.Fatalf("want %d %s events, got %d", want, typ, n)
+		}
+	}
+
+	// The legacy bare timestamp still means "strictly older than": rank zero
+	// sits below every source, so nothing at that instant qualifies.
+	res, xerr := repo.ListTimeline(ctx, f.org, f.contact, 50, &models.ContactTimelineKey{At: at})
+	if xerr != nil {
+		t.Fatalf("before: %v", xerr)
+	}
+	if len(res.Data) != 1 || res.Data[0].Type != models.TimelineNote || res.HasMore {
+		t.Fatalf("want only the older note before %s, got %+v (has_more %v)", at, res.Data, res.HasMore)
 	}
 }

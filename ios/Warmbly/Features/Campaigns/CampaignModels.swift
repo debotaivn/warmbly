@@ -44,6 +44,8 @@ struct Campaign: Codable, Identifiable, Hashable, Sendable {
     var espMatchMode: String?
     var maxNewLeadsPerDay: Int?
     var prioritizeNewLeads: Bool?
+    /// Minutes a contact's first email waits after they entered the campaign.
+    var entryDelayMinutes: Int?
     var trackingDomain: String?
     var trackingDomainVerified: Bool?
     var lastStatusChangeAt: Date?
@@ -78,6 +80,7 @@ struct Campaign: Codable, Identifiable, Hashable, Sendable {
         case espMatchMode = "esp_match_mode"
         case maxNewLeadsPerDay = "max_new_leads_per_day"
         case prioritizeNewLeads = "prioritize_new_leads"
+        case entryDelayMinutes = "entry_delay_minutes"
         case trackingDomain = "tracking_domain"
         case trackingDomainVerified = "tracking_domain_verified"
         case lastStatusChangeAt = "last_status_change_at"
@@ -157,6 +160,7 @@ struct CampaignUpdateBody: Encodable {
     var espMatchMode: String? = nil
     var maxNewLeadsPerDay: Int? = nil
     var prioritizeNewLeads: Bool? = nil
+    var entryDelayMinutes: Int? = nil
     var rampEnabled: Bool? = nil
     var rampStart: Int? = nil
     var rampIncrement: Int? = nil
@@ -177,6 +181,7 @@ struct CampaignUpdateBody: Encodable {
         case espMatchMode = "esp_match_mode"
         case maxNewLeadsPerDay = "max_new_leads_per_day"
         case prioritizeNewLeads = "prioritize_new_leads"
+        case entryDelayMinutes = "entry_delay_minutes"
         case rampEnabled = "ramp_enabled"
         case rampStart = "ramp_start"
         case rampIncrement = "ramp_increment"
@@ -318,7 +323,7 @@ struct CampaignStatusInfo {
         case "active":
             CampaignStatusInfo(label: "running", tone: .emerald, isLive: true)
         case "completed":
-            CampaignStatusInfo(label: "finished", tone: .emerald, isLive: false)
+            CampaignStatusInfo(label: "finished", tone: .sky, isLive: false)
         case "paused":
             CampaignStatusInfo(label: "paused", tone: .amber, isLive: false)
         case "paused_no_accounts":
@@ -530,11 +535,15 @@ struct CampaignAnalyticsSummary: Codable, Sendable {
     var machineOpens: Int?
     var uniqueClicks: Int?
     var replies: Int?
+    var positiveReplies: Int?
+    var interestedLeads: Int?
     var bounces: Int?
     var unsubscribes: Int?
+    var replyBreakdown: CampaignReplyBreakdown?
     var openRate: Double?
     var clickRate: Double?
     var replyRate: Double?
+    var positiveReplyRate: Double?
     var bounceRate: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -545,10 +554,32 @@ struct CampaignAnalyticsSummary: Codable, Sendable {
         case machineOpens = "machine_opens"
         case uniqueClicks = "unique_clicks"
         case replies, bounces, unsubscribes
+        case positiveReplies = "positive_replies"
+        case interestedLeads = "interested_leads"
+        case replyBreakdown = "reply_breakdown"
         case openRate = "open_rate"
         case clickRate = "click_rate"
         case replyRate = "reply_rate"
+        case positiveReplyRate = "positive_reply_rate"
         case bounceRate = "bounce_rate"
+    }
+}
+
+/// Replies by classification; the human classes plus unclassified add up to
+/// `replies`, and the automated ones are not part of it.
+struct CampaignReplyBreakdown: Codable, Sendable {
+    var positive: Int?
+    var neutral: Int?
+    var negative: Int?
+    var unsubscribe: Int?
+    var unclassified: Int?
+    var outOfOffice: Int?
+    var autoReply: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case positive, neutral, negative, unsubscribe, unclassified
+        case outOfOffice = "out_of_office"
+        case autoReply = "auto_reply"
     }
 }
 
@@ -560,7 +591,10 @@ struct CampaignAnalyticsStep: Codable, Identifiable, Sendable {
     var opens: Int?
     var clicks: Int?
     var replies: Int?
+    var positiveReplies: Int?
     var bounces: Int?
+    var replyRate: Double?
+    var positiveReplyRate: Double?
 
     var id: String { stepID ?? String(position ?? 0) }
 
@@ -568,6 +602,9 @@ struct CampaignAnalyticsStep: Codable, Identifiable, Sendable {
         case stepID = "step_id"
         case name, position, opens, clicks, replies, bounces
         case emailsSent = "emails_sent"
+        case positiveReplies = "positive_replies"
+        case replyRate = "reply_rate"
+        case positiveReplyRate = "positive_reply_rate"
     }
 }
 
@@ -577,9 +614,11 @@ struct CampaignDailyStat: Codable, Hashable, Sendable {
     var opens: Int?
     var clicks: Int?
     var replies: Int?
+    var positiveReplies: Int?
 
     enum CodingKeys: String, CodingKey {
         case date, sent, opens, clicks, replies
+        case positiveReplies = "positive_replies"
     }
 }
 
@@ -718,9 +757,41 @@ struct CampaignLeadCounts: Codable, Sendable {
     var total: Int?
     var queued: Int?
     var processing: Int?
+    var completed: Int?
     var replied: Int?
     var bounced: Int?
+    var failed: Int?
     var unsubscribed: Int?
+    var paused: Int?
+    var undeliverable: Int?
+    var contacted: Int?
+
+    /// Leads whose flow has ended: every step sent, or stopped by a reply,
+    /// bounce, unsubscribe, failure or a refused address.
+    var finished: Int {
+        (completed ?? 0) + (replied ?? 0) + (bounced ?? 0) + (unsubscribed ?? 0) + (failed ?? 0) + (undeliverable ?? 0)
+    }
+
+    /// Share of leads finished, 0...1; nil with no leads.
+    var progress: Double? {
+        guard let total, total > 0 else { return nil }
+        return min(1, Double(finished) / Double(total))
+    }
+}
+
+/// How the campaigns list is ordered (client-side, like the web).
+enum CampaignSort: String, CaseIterable, Identifiable {
+    case newest, oldest, name
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .newest: "Newest first"
+        case .oldest: "Oldest first"
+        case .name: "Name (A–Z)"
+        }
+    }
 }
 
 /// The Leads browser's status scopes, mirroring the contacts browse scopes but

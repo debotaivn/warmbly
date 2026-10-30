@@ -1,6 +1,7 @@
 package models
 
 import (
+	"bytes"
 	"time"
 
 	"github.com/google/uuid"
@@ -49,10 +50,15 @@ type Contact struct {
 	// 100, scored from the last check plus what real mail to the address
 	// showed (deliveries, opens, replies, bounces).
 	VerificationConfidence int `json:"verification_confidence"`
+	// VerificationRequestedAt is set while a member-requested re-check waits
+	// to run; the verdict above stands until it lands.
+	VerificationRequestedAt *time.Time `json:"verification_requested_at,omitempty"`
 
-	// Recipient ESP/provider, derived in the control plane from the recipient
-	// domain (never an MX dial on the send hot path). '' | 'gmail' | 'outlook'
-	// | 'other'. Used by the campaign ESP-matching feature.
+	// MailHost is who hosts the contact's inbox (a mailhost.Host value), read
+	// from the domain's MX by the backend sweep; '' until it has run.
+	MailHost string `json:"mail_host"`
+	// ESPProvider is MailHost's family for campaign ESP matching: '' | 'gmail'
+	// | 'outlook' | 'other'. Resolved with it, never on the send hot path.
 	ESPProvider   string     `json:"esp_provider"`
 	ESPResolvedAt *time.Time `json:"esp_resolved_at,omitempty"`
 
@@ -61,6 +67,15 @@ type Contact struct {
 	// (the campaign Leads view); nil otherwise. Lets the Leads list show which
 	// leads are queued, in progress, replied, bounced, or unsubscribed.
 	CampaignLead *ContactCampaignProgress `json:"campaign_lead,omitempty"`
+
+	// Outreach is the contact's engagement across every campaign. Populated by
+	// Search on every row; nil elsewhere.
+	Outreach *ContactOutreach `json:"outreach,omitempty"`
+
+	// IsNew is set by the upsert write when this call inserted the row rather
+	// than matching an existing contact. Server-side only: it decides whether
+	// a contact.created event fires.
+	IsNew bool `json:"-"`
 
 	UpdatedAt time.Time `json:"updated_at"`
 	CreatedAt time.Time `json:"created_at"`
@@ -94,7 +109,45 @@ type ContactCampaignProgress struct {
 	// FailureReason is the worker's reason for the last failed send, set only
 	// when Status is "failed".
 	FailureReason string `json:"failure_reason,omitempty"`
+	// Sender is the mailbox address this lead's whole sequence sends from,
+	// fixed when its first email went out. Empty until then.
+	Sender string `json:"sender,omitempty"`
+	// Hold is the per-lead pause, set only while it is live. Present on any
+	// status: a held lead that has also replied still reads "replied".
+	Hold *LeadHold `json:"hold,omitempty"`
+	// CC is the contacts copied on every email to this lead in this campaign.
+	CC []CampaignLeadCC `json:"cc,omitempty"`
 }
+
+// LeadHold is one contact's flow parked inside one campaign. Source is
+// "out_of_office" when an auto-reply parked it and "manual" when a member did.
+// Until is nil for a hold with no end, which only a person lifts.
+type LeadHold struct {
+	Since  time.Time  `json:"since"`
+	Until  *time.Time `json:"until,omitempty"`
+	Reason string     `json:"reason,omitempty"`
+	Source string     `json:"source"`
+}
+
+// Live reports whether the hold is in force at t. A dated hold stops counting
+// the moment it passes, with nothing having to write, so every surface that
+// shows or enforces a hold reads it through this.
+func (h *LeadHold) Live(t time.Time) bool {
+	return h != nil && (h.Until == nil || h.Until.After(t))
+}
+
+// Lead hold sources, stored in campaign_leads.pause_source and matched by the
+// CHECK constraint migration 000161 adds.
+const (
+	LeadHoldSourceManual      = "manual"
+	LeadHoldSourceOutOfOffice = "out_of_office"
+	// LeadHoldSourceInboxTagging is a hold a classified reply wrote: "not now"
+	// for a while, a decline with no end.
+	LeadHoldSourceInboxTagging = "inbox_tagging"
+	// LeadHoldSourceCRM is a hold a CRM rule wrote: a lead status, a
+	// conversion or an open opportunity in Salesforce.
+	LeadHoldSourceCRM = "crm"
+)
 
 // Lead status constants for ContactCampaignProgress.Status.
 const (
@@ -105,6 +158,11 @@ const (
 	LeadStatusBounced      = "bounced"
 	LeadStatusFailed       = "failed"
 	LeadStatusUnsubscribed = "unsubscribed"
+	// LeadStatusPaused is a lead whose flow is held: an out-of-office
+	// auto-reply parked it until the contact is back, or a member paused it by
+	// hand. The lead keeps its place in the sequence and resumes where it
+	// stopped; it is not unsubscribed and not removed from the campaign.
+	LeadStatusPaused = "paused"
 	// LeadStatusUndeliverable is a lead routing will never send to because
 	// address verification refused it (invalid, or risky with the campaign's
 	// "send to risky emails" toggle off). Distinct from pending, which is a
@@ -116,7 +174,7 @@ const (
 // Used to gate the single-campaign Leads-view `lead_status` search filter.
 func ValidLeadStatus(s string) bool {
 	switch s {
-	case LeadStatusPending, LeadStatusActive, LeadStatusCompleted, LeadStatusReplied, LeadStatusBounced, LeadStatusFailed, LeadStatusUnsubscribed, LeadStatusUndeliverable:
+	case LeadStatusPending, LeadStatusActive, LeadStatusCompleted, LeadStatusReplied, LeadStatusBounced, LeadStatusFailed, LeadStatusUnsubscribed, LeadStatusPaused, LeadStatusUndeliverable:
 		return true
 	default:
 		return false
@@ -165,8 +223,8 @@ type ContactsResult struct {
 
 // CampaignLeadCounts are per-status lead totals within a single campaign,
 // derived the same way as ContactCampaignProgress.Status (unsubscribed >
-// bounced > replied > failed > completed > processing > undeliverable >
-// queued). Drives the Leads-view scope chips.
+// bounced > replied > failed > completed > paused > processing >
+// undeliverable > queued). Drives the Leads-view scope chips.
 type CampaignLeadCounts struct {
 	Total        int `json:"total"`
 	Queued       int `json:"queued"`     // pending: a lead, no email sent yet
@@ -176,6 +234,9 @@ type CampaignLeadCounts struct {
 	Bounced      int `json:"bounced"`
 	Failed       int `json:"failed"` // a step could not be sent after every retry
 	Unsubscribed int `json:"unsubscribed"`
+	// Paused: the lead's flow is held (an out-of-office auto-reply, or a
+	// member pausing it by hand) and resumes where it stopped.
+	Paused int `json:"paused"`
 	// Undeliverable: address verification refused it, so routing skips it.
 	Undeliverable int `json:"undeliverable"`
 	// Engagement totals, matching the `engagement` search filter: leads sent
@@ -185,6 +246,18 @@ type CampaignLeadCounts struct {
 	Opened     int `json:"opened"`
 	Clicked    int `json:"clicked"`
 	RepliedAny int `json:"replied_any"`
+	// Providers splits the leads by their inbox's family, as ESP matching sees it.
+	Providers CampaignLeadProviderCounts `json:"providers"`
+}
+
+// CampaignLeadProviderCounts are a campaign's leads by esp_provider family.
+// Other includes checked domains with no known host, which match like other;
+// Undetected counts the leads the provider check has not reached yet.
+type CampaignLeadProviderCounts struct {
+	Google     int `json:"gmail"`
+	Microsoft  int `json:"outlook"`
+	Other      int `json:"other"`
+	Undetected int `json:"undetected"`
 }
 
 // ContactsCounts are org-wide contact facet totals for the browse sidebar.
@@ -199,7 +272,7 @@ type ContactsCounts struct {
 }
 
 // ContactVerificationCounts is the org's contacts by verification status.
-// Pending is the subset of Unknown nobody has checked yet.
+// Pending counts contacts never checked plus those with a re-check queued.
 type ContactVerificationCounts struct {
 	Valid   int `json:"valid"`
 	Risky   int `json:"risky"`
@@ -216,6 +289,16 @@ type ContactVerificationDetail struct {
 	// Decisive is true when real mail, not a check, decided the status.
 	Decisive bool                          `json:"decisive"`
 	Evidence []ContactVerificationEvidence `json:"evidence"`
+	// Source and Provider name who produced the last check or verdict, and
+	// ProviderLabel is the verifier's display name ("MillionVerifier").
+	Source        string `json:"source"`
+	Provider      string `json:"provider"`
+	ProviderLabel string `json:"provider_label,omitempty"`
+	// CheckStatus is what that check said before real mail was weighed in.
+	CheckStatus string     `json:"check_status"`
+	CheckedAt   *time.Time `json:"checked_at,omitempty"`
+	// RequestedAt is set while a member-requested re-check waits to run.
+	RequestedAt *time.Time `json:"requested_at,omitempty"`
 }
 
 // ContactVerificationEvidence is one observed fact about the mailbox.
@@ -251,9 +334,34 @@ const (
 	ContactVerificationActionMarkUndeliverable = "mark_undeliverable"
 )
 
+// MaxContactBulkSelection bounds how many contacts one "select all matching"
+// bulk action may resolve to. Past it the action is refused and the user
+// narrows the filters, so a stray click can never walk a whole workspace.
+const MaxContactBulkSelection = 250000
+
+// MaxContactBatchIDs bounds an explicit contact id list in one request body.
+const MaxContactBatchIDs = 10000
+
+// ContactSelection names the contacts a bulk action applies to. Either an
+// explicit id list (Contacts), or every contact matching a search (All +
+// Filters) minus the rows the user unticked afterwards (Exclude), which is
+// what the dashboard's "select all matching" sends. A selection that names
+// both prefers the filter.
+type ContactSelection struct {
+	Contacts []string `json:"contacts"`
+	// All switches the selection from the id list to Filters.
+	All bool `json:"all,omitempty"`
+	// Filters is the same search body /contacts/search takes, so the set
+	// resolved here is exactly the set the list was showing.
+	Filters *SearchContacts `json:"filters,omitempty"`
+	// Exclude drops ids from the resolved set: the rows unticked after a
+	// select-all. Ignored unless All is set.
+	Exclude []string `json:"exclude,omitempty"`
+}
+
 // ContactVerificationRequest is the body of POST /contacts/verification.
 type ContactVerificationRequest struct {
-	Contacts []string `json:"contacts"`
+	ContactSelection
 	// CampaignID selects every lead of one campaign that verification refused
 	// (the "re-verify skipped leads" action), instead of listing ids.
 	CampaignID string `json:"campaign_id,omitempty"`
@@ -267,12 +375,18 @@ type ContactVerificationResponse struct {
 	// Queued is true for the verify action: the check runs in the background
 	// and each contact updates live as its verdict lands.
 	Queued bool `json:"queued"`
+	// Verifier and VerifierLabel name who runs a queued check ("builtin" or
+	// the connected provider). VerifierError says why a connected provider
+	// cannot be used right now, in which case the built-in check runs instead.
+	Verifier      string `json:"verifier,omitempty"`
+	VerifierLabel string `json:"verifier_label,omitempty"`
+	VerifierError string `json:"verifier_error,omitempty"`
 }
 
 // VerificationOverview is what Settings shows about address verification.
 type VerificationOverview struct {
 	// Provider is who checks this workspace's addresses: "builtin" or
-	// "millionverifier".
+	// "millionverifier" or "cleanmylist".
 	Provider string `json:"provider"`
 	// ConnectionID is the integration connection behind a paid provider.
 	ConnectionID *string `json:"connection_id,omitempty"`
@@ -297,6 +411,23 @@ type ContactCategoryCount struct {
 // ContactEngagement summarises every email touchpoint we have for a
 // single contact. It's denormalised on read so the contact 360 view
 // can render counts and "last X" timestamps in a single round-trip.
+// ContactOutreach is where a contact stands with your outreach: the emails
+// that reached them, what they did with them, and when each last happened.
+// Opens count people only; a mail client's automatic fetch is not engagement.
+type ContactOutreach struct {
+	Sent    int `json:"sent"`
+	Opened  int `json:"opened"`
+	Clicked int `json:"clicked"`
+	Replied int `json:"replied"`
+	Bounced int `json:"bounced"`
+
+	LastSentAt    *time.Time `json:"last_sent_at,omitempty"`
+	LastOpenedAt  *time.Time `json:"last_opened_at,omitempty"`
+	LastClickedAt *time.Time `json:"last_clicked_at,omitempty"`
+	LastRepliedAt *time.Time `json:"last_replied_at,omitempty"`
+	LastBouncedAt *time.Time `json:"last_bounced_at,omitempty"`
+}
+
 type ContactEngagement struct {
 	TotalSent       int `json:"total_sent"`
 	TotalOpened     int `json:"total_opened"`
@@ -310,13 +441,34 @@ type ContactEngagement struct {
 	LastClickedAt *time.Time `json:"last_clicked_at,omitempty"`
 	LastRepliedAt *time.Time `json:"last_replied_at,omitempty"`
 	LastBouncedAt *time.Time `json:"last_bounced_at,omitempty"`
+
+	// ReadsOn is how the contact reads your mail: each client and device a
+	// person's opens came from, most recent first, with how often.
+	ReadsOn []ContactReadingOrigin `json:"reads_on,omitempty"`
+}
+
+// ContactReadingOrigin is one client and device a contact opened mail on.
+type ContactReadingOrigin struct {
+	Client       string    `json:"client,omitempty"`
+	ClientType   string    `json:"client_type,omitempty"`
+	DeviceHidden bool      `json:"device_hidden,omitempty"`
+	DeviceType   string    `json:"device_type,omitempty"`
+	OS           string    `json:"os,omitempty"`
+	Browser      string    `json:"browser,omitempty"`
+	Opens        int       `json:"opens"`
+	LastOpenedAt time.Time `json:"last_opened_at"`
 }
 
 // ContactSuppression mirrors a row from suppressed_recipients for the
 // contact's email. Null on the wire when the contact is not suppressed.
 type ContactSuppression struct {
+	ID uuid.UUID `json:"id"`
+	// Kind is "email" for the contact's own address or "domain" when the
+	// whole domain is suppressed; Value is the matching list entry.
+	Kind      string     `json:"kind"`
+	Value     string     `json:"value"`
 	Reason    string     `json:"reason"`
-	Source    string     `json:"source"` // bounce | complaint | unsubscribe
+	Source    string     `json:"source"` // bounce | complaint | unsubscribe | manual | import
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 }
@@ -361,10 +513,14 @@ type ContactSentEmail struct {
 	SequenceName *string    `json:"step_name,omitempty"`
 
 	// Engagement (from campaign_contact_progress, may be nil).
-	OpenedAt  *time.Time `json:"opened_at,omitempty"`
-	ClickedAt *time.Time `json:"clicked_at,omitempty"`
-	RepliedAt *time.Time `json:"replied_at,omitempty"`
-	BouncedAt *time.Time `json:"bounced_at,omitempty"`
+	// OpenedAt is a person's open. An automated fetch (client prefetch,
+	// security gateway) lands in MachineOpenedAt instead, so the two are
+	// never mistaken for each other.
+	OpenedAt        *time.Time `json:"opened_at,omitempty"`
+	MachineOpenedAt *time.Time `json:"machine_opened_at,omitempty"`
+	ClickedAt       *time.Time `json:"clicked_at,omitempty"`
+	RepliedAt       *time.Time `json:"replied_at,omitempty"`
+	BouncedAt       *time.Time `json:"bounced_at,omitempty"`
 }
 
 type ContactSentEmailsResult struct {
@@ -409,12 +565,73 @@ const (
 	TimelinePageHit ContactTimelineEventType = "page_hit"
 )
 
+// ContactTimelineSource ranks the tables the timeline is merged from. It is
+// the middle key of the feed's order (at, source, id): two events at the same
+// instant sort by source, then by that source's row id, so a page boundary
+// can never split a tie. The values are part of the cursor; never renumber.
+type ContactTimelineSource int
+
+const (
+	// campaign_contact_progress stamps, keyed by the step (sequence) id.
+	TimelineSourceProgressSent    ContactTimelineSource = 1
+	TimelineSourceProgressOpened  ContactTimelineSource = 2
+	TimelineSourceProgressClicked ContactTimelineSource = 3
+	TimelineSourceProgressReplied ContactTimelineSource = 4
+	TimelineSourceProgressBounced ContactTimelineSource = 5
+
+	TimelineSourceLinkClick      ContactTimelineSource = 6  // email_link_clicks
+	TimelineSourceOpen           ContactTimelineSource = 7  // email_opens
+	TimelineSourceReplyIntent    ContactTimelineSource = 8  // reply_intents
+	TimelineSourceDeliverability ContactTimelineSource = 9  // deliverability_events
+	TimelineSourceSuppression    ContactTimelineSource = 10 // suppressed_recipients
+	TimelineSourceNote           ContactTimelineSource = 11 // contact_notes
+	TimelineSourceMeeting        ContactTimelineSource = 12 // meeting_bookings
+	TimelineSourceActivity       ContactTimelineSource = 13 // contact_activities
+	TimelineSourcePageHit        ContactTimelineSource = 14 // website_page_hits
+)
+
+// Valid reports whether s names a source the timeline is merged from. A
+// cursor carrying any other rank is malformed: zero is reserved for the
+// legacy bare-timestamp bound and anything above the last source would
+// re-admit the events at the cursor's instant.
+func (s ContactTimelineSource) Valid() bool {
+	return s >= TimelineSourceProgressSent && s <= TimelineSourcePageHit
+}
+
+// ContactTimelineKey is one event's position in the merged feed. A page
+// resumes strictly after the key of the last event it returned, comparing
+// (At, Source, ID) as a tuple, which is what the opaque cursor carries.
+type ContactTimelineKey struct {
+	At     time.Time
+	Source ContactTimelineSource
+	ID     uuid.UUID
+}
+
+// Before reports whether k sorts after o in the feed's newest-first order,
+// which is to say it is the older position: a smaller time, or the same time
+// and a lower source rank, or the same time and source and a lower id (uuid
+// order is the byte order Postgres uses, so Go and SQL agree).
+func (k ContactTimelineKey) Before(o ContactTimelineKey) bool {
+	if !k.At.Equal(o.At) {
+		return k.At.Before(o.At)
+	}
+	if k.Source != o.Source {
+		return k.Source < o.Source
+	}
+	return bytes.Compare(k.ID[:], o.ID[:]) < 0
+}
+
 // ContactTimelineEvent is one entry in the merged activity feed. The
 // optional fields are tagged with omitempty so the JSON stays compact
 // for event types that don't carry that data.
 type ContactTimelineEvent struct {
 	Type ContactTimelineEventType `json:"type"`
 	At   time.Time                `json:"at"`
+
+	// Position in the feed, used for the merged sort and the next-page
+	// cursor. Not part of the wire shape: the row ids are not unique across
+	// sources, so a client gets an opaque cursor instead.
+	Key ContactTimelineKey `json:"-"`
 
 	// Mailbox sender (email_sent / opened / clicked / replied / bounced).
 	EmailAccountID    *uuid.UUID `json:"email_account_id,omitempty"`
@@ -458,20 +675,104 @@ type ContactTimelineEvent struct {
 	// Website page view (page_hit): URL, referrer, device, UTM, location.
 	PageHit *WebsitePageHit `json:"page_hit,omitempty"`
 
+	// Engagement classification (email_opened / email_clicked). Machine is
+	// true when the open or click came from an automated fetcher (a mail
+	// privacy proxy, a security gateway walking the links) rather than a
+	// person; MachineReason says which rule caught it.
+	Machine       *bool   `json:"machine,omitempty"`
+	MachineReason *string `json:"machine_reason,omitempty"`
+
+	// The exact link behind an email_clicked event, when the click was
+	// logged per link (every click since link attribution shipped).
+	Link *ContactLinkClick `json:"link,omitempty"`
+
+	// Where an email_opened / email_clicked event came from, when it was
+	// logged per event: mail client, device and rough location.
+	Origin *EngagementOrigin `json:"origin,omitempty"`
+
 	// Author (notes, lifecycle events).
 	UserID *uuid.UUID `json:"user_id,omitempty"`
 }
 
+// ContactLinkClick names the link a contact clicked: where it went, the
+// anchor text it was minted from, and the UTM parameters the destination
+// carried (automatic or hand-written).
+type ContactLinkClick struct {
+	ID          uuid.UUID `json:"id"`
+	URL         string    `json:"url"`
+	Label       string    `json:"label,omitempty"`
+	UTMSource   string    `json:"utm_source,omitempty"`
+	UTMMedium   string    `json:"utm_medium,omitempty"`
+	UTMCampaign string    `json:"utm_campaign,omitempty"`
+	UTMTerm     string    `json:"utm_term,omitempty"`
+	UTMContent  string    `json:"utm_content,omitempty"`
+	UserAgent   string    `json:"user_agent,omitempty"`
+}
+
+// EngagementOrigin is what an open or click said about where it came from.
+// Client names the mail client when the user agent does (Gmail, Apple Mail,
+// Outlook); ClientType says whether it was an installed app or webmail; the
+// browser fields describe the rest. DeviceHidden marks a fetch by a mailbox
+// provider's image proxy, which hides the reader's device and network. The
+// location is resolved from the source network and the address itself is
+// never stored. Every field is empty when unknown.
+type EngagementOrigin struct {
+	Client         string `json:"client,omitempty"`
+	ClientType     string `json:"client_type,omitempty"`
+	DeviceHidden   bool   `json:"device_hidden,omitempty"`
+	DeviceType     string `json:"device_type,omitempty"`
+	OS             string `json:"os,omitempty"`
+	Browser        string `json:"browser,omitempty"`
+	BrowserVersion string `json:"browser_version,omitempty"`
+	CountryCode    string `json:"country_code,omitempty"`
+	Region         string `json:"region,omitempty"`
+	City           string `json:"city,omitempty"`
+}
+
+// EngagementOrigin.ClientType values, as the email_opens and
+// email_link_clicks checks allow them. Empty is unknown.
+const (
+	EngagementClientApp     = "app"
+	EngagementClientWebmail = "webmail"
+)
+
+// Empty reports whether nothing about the origin is known.
+func (o EngagementOrigin) Empty() bool {
+	return o == EngagementOrigin{}
+}
+
 type ContactTimelineResult struct {
 	Data []ContactTimelineEvent `json:"data"`
-	// True if we hit the per-call cap and the caller should paginate
-	// via the `before` query param.
+	// Deprecated: read pagination.has_more. Kept for clients written against
+	// the bare-timestamp pagination that predated the cursor envelope.
 	HasMore bool `json:"has_more"`
+	// NextCursor is an opaque (at, source, id) position; pass it back as
+	// `cursor` for the next page. Total is never counted across the sources.
+	Pagination Pagination `json:"pagination"`
+}
+
+// EvidenceStep names the campaign step a verification observation came from.
+// It is what lets a late bounce or open be refused when the mail it describes
+// left before the contact's address was edited: the observation is about the
+// old mailbox, not the one the contact holds now. A zero value means the
+// observation is not attributable to a step and is always recorded.
+type EvidenceStep struct {
+	CampaignID *uuid.UUID
+	SequenceID *uuid.UUID
+}
+
+// Step builds an EvidenceStep from ids a caller already holds.
+func Step(campaignID, sequenceID *uuid.UUID) EvidenceStep {
+	return EvidenceStep{CampaignID: campaignID, SequenceID: sequenceID}
 }
 
 type UpdateContact struct {
-	FirstName        *string            `json:"first_name"`
-	LastName         *string            `json:"last_name"`
+	FirstName *string `json:"first_name"`
+	LastName  *string `json:"last_name"`
+	// Email replaces the contact's address. It is the contact's identity, so
+	// changing it drops the verification verdict and the delivery evidence
+	// that belonged to the old mailbox.
+	Email            *string            `json:"email"`
 	Company          *string            `json:"company"`
 	Phone            *string            `json:"phone"`
 	CustomFields     *map[string]string `json:"custom_fields"`
@@ -540,13 +841,26 @@ const (
 	ContactSourceAPI         ContactSource = "api"
 	ContactSourceAIAssistant ContactSource = "ai_assistant"
 	ContactSourceForm        ContactSource = "form"
+	// ContactSourceAutomation is a contact an automation's "create or update
+	// contact" action wrote; the detail is the automation's name.
+	ContactSourceAutomation ContactSource = "automation"
+	// ContactSourceCRMSync is a contact imported from a CRM list view or
+	// campaign; the detail names the CRM and the list.
+	ContactSourceCRMSync ContactSource = "crm_sync"
+	// ContactSourceApollo is a contact imported from an Apollo list; the detail
+	// names the list.
+	ContactSourceApollo ContactSource = "apollo"
+	// ContactSourceClay is a contact a Clay table sent in; the detail names the
+	// connection.
+	ContactSourceClay ContactSource = "clay"
 )
 
 // Valid reports whether the value is one the database accepts.
 func (s ContactSource) Valid() bool {
 	switch s {
 	case ContactSourceUnknown, ContactSourceManual, ContactSourceCampaign, ContactSourceImport,
-		ContactSourceSheetSync, ContactSourceAPI, ContactSourceAIAssistant, ContactSourceForm:
+		ContactSourceSheetSync, ContactSourceAPI, ContactSourceAIAssistant, ContactSourceForm,
+		ContactSourceAutomation, ContactSourceCRMSync, ContactSourceApollo, ContactSourceClay:
 		return true
 	}
 	return false
@@ -585,12 +899,13 @@ type SearchContacts struct {
 	MaxCampaigns       *int                   `json:"max_campaigns"`        // Maximum number of associated campaigns
 	Subscribed         *bool                  `json:"subscribed"`           // Filter by subscription status
 	VerificationStatus string                 `json:"verification_status"`  // Filter by verification verdict: valid | risky | invalid | unknown
+	MailHosts          []string               `json:"mail_hosts"`           // Contacts whose inbox host is any of these; "" matches not detected yet
 	CreatedAfter       *time.Time             `json:"created_after"`        // Contacts created after this date
 	CreatedBefore      *time.Time             `json:"created_before"`       // Contacts created before this date
 	UpdatedAfter       *time.Time             `json:"updated_after"`        // Contacts updated after this date
 	UpdatedBefore      *time.Time             `json:"updated_before"`       // Contacts updated before this date
-	SortBy             string                 `json:"sort_by"`              // e.g., "first_name ASC", "campaign_count DESC"
-	Reverse            bool                   `json:"reverse"`              // ASC or DESC
+	SortBy             string                 `json:"sort_by"`              // A column name (created_at, first_name, company, ...) or "custom:<key>" for a custom field
+	Reverse            bool                   `json:"reverse"`              // Ascending when true; the default is descending
 }
 
 type BulkEditContactsFieldType string
@@ -609,7 +924,7 @@ type BulkEditContactsField struct {
 }
 
 type BulkEditContactsData struct {
-	Contacts []string `json:"contacts"`
+	ContactSelection
 
 	AddCampaigns     []string                `json:"add_campaigns"`
 	RemoveCampaigns  []string                `json:"remove_campaigns"`
@@ -617,4 +932,35 @@ type BulkEditContactsData struct {
 	RemoveCategories []string                `json:"remove_categories,omitempty"`
 	Fields           []BulkEditContactsField `json:"fields"`
 	Subscribe        *bool                   `json:"subscribe"`
+
+	// SkipRows suppresses the hydrated rows in the response. Set by the
+	// handler for a filter-shaped selection, which can name far more contacts
+	// than are worth serializing back. Never part of the request body.
+	SkipRows bool `json:"-"`
+}
+
+// ContactLookupMatch says how a unibox sender resolved to a contact.
+type ContactLookupMatch string
+
+const (
+	// ContactLookupMatchEmail: the sender's address is the contact's.
+	ContactLookupMatchEmail ContactLookupMatch = "email"
+	// ContactLookupMatchThread: the thread answers a campaign send to the
+	// contact, and the reply came from another address.
+	ContactLookupMatchThread ContactLookupMatch = "thread"
+)
+
+// ContactLookupThread is the unibox thread a sender wrote in. AllowedAccounts
+// is an API key's mailbox allowlist; empty means every mailbox.
+type ContactLookupThread struct {
+	ID              string
+	AccountID       *uuid.UUID
+	AllowedAccounts []uuid.UUID
+}
+
+// ContactLookup is the answer to GET /contacts/lookup; Contact is nil when
+// nothing matched.
+type ContactLookup struct {
+	Contact *Contact           `json:"contact"`
+	Match   ContactLookupMatch `json:"match,omitempty"`
 }

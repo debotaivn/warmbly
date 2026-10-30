@@ -4,9 +4,11 @@
 import React from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Loader2Icon, XIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { Label, TextInput } from "@/components/ui/field";
+import { Checkbox } from "@/components/ui/checkbox";
 import changePassword from "@/lib/api/client/auth/changePassword";
+import { endSession, saveTokens } from "@/lib/auth";
 import { useQueryClient } from "@tanstack/react-query";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
@@ -15,6 +17,7 @@ export default function ChangePasswordDialog({ open, onClose }: { open: boolean;
     const [current, setCurrent] = React.useState("");
     const [next, setNext] = React.useState("");
     const [confirm, setConfirm] = React.useState("");
+    const [revokeApi, setRevokeApi] = React.useState(false);
     const [pending, setPending] = React.useState(false);
     const queryClient = useQueryClient();
 
@@ -23,6 +26,7 @@ export default function ChangePasswordDialog({ open, onClose }: { open: boolean;
             setCurrent("");
             setNext("");
             setConfirm("");
+            setRevokeApi(false);
         }
     }, [open]);
 
@@ -38,14 +42,34 @@ export default function ChangePasswordDialog({ open, onClose }: { open: boolean;
         if (!valid || pending) return;
         setPending(true);
         try {
-            await changePassword({ current_password: current, new_password: next });
-            // Other sessions are revoked server-side; refresh the list so they
-            // drop out of the Sessions panel live.
+            const token = await changePassword({ current_password: current, new_password: next, revoke_api_credentials: revokeApi });
+            // The session this request ran on is gone with every other one;
+            // store the new pair before anything else asks the API.
+            saveTokens(token as unknown as Record<string, unknown>);
             void queryClient.invalidateQueries({ queryKey: ["sessions"] });
-            toast.success("Password changed. Other devices were signed out.");
+            if (revokeApi) {
+                void queryClient.invalidateQueries({ queryKey: ["api-keys"] });
+                void queryClient.invalidateQueries({ queryKey: ["oauth-authorized-apps"] });
+            }
+            toast.success(
+                revokeApi
+                    ? "Password changed. Every other device, connected app and API key you created was signed out."
+                    : "Password changed. Every other device was signed out.",
+            );
             onClose();
         } catch (e) {
-            toast.error(buildError(e as AppError));
+            const err = e as AppError;
+            // The password is stored but this device got no new session: the
+            // old tokens are dead, so leave rather than keep using them.
+            if (err.code === "password_changed_sign_in_again") {
+                toast.error(err.message);
+                onClose();
+                endSession({ notice: false });
+                return;
+            }
+            // Only the option can be refused here, so clear it for the retry.
+            if (err.code === "api_credentials_revoke_unsupported") setRevokeApi(false);
+            toast.error(buildError(err));
         } finally {
             setPending(false);
         }
@@ -99,8 +123,23 @@ export default function ChangePasswordDialog({ open, onClose }: { open: boolean;
                                     <p className="text-[11px] text-rose-500 mt-1">Passwords do not match.</p>
                                 )}
                             </div>
+                            <label className="flex items-start gap-2 pt-1 cursor-pointer">
+                                <Checkbox
+                                    tone="slate"
+                                    className="mt-0.5"
+                                    checked={revokeApi}
+                                    onChange={(e) => setRevokeApi(e.target.checked)}
+                                    disabled={pending}
+                                />
+                                <span className="text-[12px] text-slate-700 leading-snug">
+                                    Also sign out connected apps and API keys
+                                    <span className="block text-[11px] text-slate-400">
+                                        Ends the apps you authorized and every API key you created, in all your workspaces.
+                                    </span>
+                                </span>
+                            </label>
                             <p className="text-[11px] text-slate-400 leading-relaxed pt-1">
-                                Changing your password signs out every other device. This one stays signed in.
+                                Changing your password ends every session, including this one. This device is signed back in with a new session.
                             </p>
                         </div>
 

@@ -35,10 +35,17 @@ const (
 
 	// Data
 	IntegrationGoogleSheets IntegrationProvider = "google_sheets"
+	IntegrationApollo       IntegrationProvider = "apollo"
+	IntegrationClay         IntegrationProvider = "clay"
 
 	// Verification
 	IntegrationMillionVerifier IntegrationProvider = "millionverifier"
+	IntegrationCleanMyList     IntegrationProvider = "cleanmylist"
 )
+
+// VerificationProviders are the providers that verify contact addresses. A
+// connection to one of these makes a built-in verdict worth re-checking.
+var VerificationProviders = []IntegrationProvider{IntegrationMillionVerifier, IntegrationCleanMyList}
 
 // AllIntegrationProviders lists every provider the dashboard exposes. The
 // order here is the catalog order users see.
@@ -55,7 +62,10 @@ var AllIntegrationProviders = []IntegrationProvider{
 	IntegrationCalendly,
 	IntegrationCalCom,
 	IntegrationGoogleSheets,
+	IntegrationApollo,
+	IntegrationClay,
 	IntegrationMillionVerifier,
+	IntegrationCleanMyList,
 }
 
 func IsValidIntegrationProvider(s string) bool {
@@ -173,6 +183,10 @@ type IntegrationCatalogEntry struct {
 	// for this provider. OAuth providers without credentials render as
 	// "coming soon" instead of a dead Connect button.
 	Configured bool `json:"configured"`
+
+	// Rank is the provider's popularity on this instance, 1 being the most
+	// used: workspaces with a live connection, ties broken by catalog order.
+	Rank int `json:"rank"`
 }
 
 // IntegrationConnection is one org's link to one provider. Secrets
@@ -215,6 +229,34 @@ type IntegrationConnection struct {
 	InboundWebhookURL string `json:"inbound_webhook_url,omitempty"`
 }
 
+// ConfigCapabilitiesSigningSecret is the config_capabilities key an automation
+// connection's outbound HMAC secret is moved out of into its sealed config.
+// Only the webhook-secret route, behind the connection write gate, hands it out.
+const ConfigCapabilitiesSigningSecret = "signing_secret"
+
+// MarshalJSON leaves the outbound signing secret out of every response.
+func (c IntegrationConnection) MarshalJSON() ([]byte, error) {
+	type plain IntegrationConnection
+	out := plain(c)
+	if len(c.ConfigCapabilities) > 0 {
+		var cc map[string]any
+		if err := json.Unmarshal(c.ConfigCapabilities, &cc); err == nil {
+			if _, ok := cc[ConfigCapabilitiesSigningSecret]; ok {
+				delete(cc, ConfigCapabilitiesSigningSecret)
+				redacted, err := json.Marshal(cc)
+				if err != nil {
+					return nil, err
+				}
+				out.ConfigCapabilities = redacted
+			}
+		} else {
+			// Not an object, so nothing a caller can use: drop it rather than echo it.
+			out.ConfigCapabilities = nil
+		}
+	}
+	return json.Marshal(out)
+}
+
 // IntegrationTokens carries the freshly-exchanged OAuth material an
 // implementation persists. Plaintext lives only in memory.
 type IntegrationTokens struct {
@@ -222,6 +264,8 @@ type IntegrationTokens struct {
 	RefreshToken string
 	ExpiresAt    *time.Time
 	Scopes       []string
+	// InstanceURL is a per-org API host a refresh reported (Salesforce).
+	InstanceURL string
 }
 
 // IntegrationOAuthState is the short-lived CSRF/PKCE record minted at the
@@ -235,9 +279,12 @@ type IntegrationOAuthState struct {
 	CodeVerifier    string
 	Label           string
 	RequestedScopes []string
-	UsedAt          *time.Time
-	ExpiresAt       time.Time
-	CreatedAt       time.Time
+	// Params carries provider options chosen at start, such as the Salesforce
+	// login host the code must be exchanged at.
+	Params    map[string]string
+	UsedAt    *time.Time
+	ExpiresAt time.Time
+	CreatedAt time.Time
 }
 
 // IntegrationOAuthStartResponse is returned to the SPA so it can open the
@@ -259,6 +306,9 @@ const (
 	IntegrationActionSalesforceUpsert   IntegrationAction = "salesforce.upsert_contact"
 	IntegrationActionCloseUpsert        IntegrationAction = "close.upsert_lead"
 	IntegrationActionGenericWebhookPing IntegrationAction = "webhook.ping"
+	// IntegrationActionClaySendRow posts a flat row for the event to a Clay
+	// table's webhook source.
+	IntegrationActionClaySendRow IntegrationAction = "clay.send_row"
 
 	// Native (Warmbly-internal) actions: CRM/contact mutations that need no
 	// external connection. Run against the contact resolved from the event data.
@@ -289,6 +339,13 @@ const (
 	// with REALTIME_SUBSCRIBE on the org websocket) receive it with no public URL,
 	// so it replaces an outbound webhook for "tell my system this happened".
 	IntegrationActionFireEvent IntegrationAction = "warmbly.fire_event"
+	// IntegrationActionUpsertContact creates a contact from templated event
+	// fields, or enriches the one already holding that email, then tags it and
+	// enrols it in a campaign. The lead-intake action: an inbound webhook or a
+	// form submission becomes a contact without leaving Warmbly.
+	IntegrationActionUpsertContact IntegrationAction = "warmbly.upsert_contact"
+	// IntegrationActionAddToCampaign enrols the event's contact in a campaign.
+	IntegrationActionAddToCampaign IntegrationAction = "warmbly.add_to_campaign"
 
 	// AI nodes mirror the campaign step types: one unified AI step plus an AI
 	// switch router.
@@ -328,6 +385,7 @@ func IsNativeAction(a IntegrationAction) bool {
 		IntegrationActionCreateDeal, IntegrationActionMoveDealStage, IntegrationActionUnsubscribe,
 		IntegrationActionRunAutomation, IntegrationActionLabelEmail,
 		IntegrationActionSetVariables, IntegrationActionFireEvent,
+		IntegrationActionUpsertContact, IntegrationActionAddToCampaign,
 		IntegrationActionAIStep, IntegrationActionAISwitch:
 		return true
 	default:

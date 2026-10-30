@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/api/middleware"
+	"github.com/warmbly/warmbly/internal/app/apikey"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/utils/paging"
@@ -30,7 +31,11 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	var data models.CreateAPIKey
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	if xerr := h.checkKeyWithinCaller(c, data.Permissions, data.AllowedIPs, data.AllowedEmailAccounts); xerr != nil {
+		errx.JSON(c, xerr)
 		return
 	}
 
@@ -124,7 +129,11 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 
 	var data models.UpdateAPIKey
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	if xerr := h.checkUpdateWithinCaller(c, *orgID, keyID, &data); xerr != nil {
+		errx.JSON(c, xerr)
 		return
 	}
 
@@ -171,15 +180,137 @@ func (h *Handler) RevokeAPIKey(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
 
-// ListAPIPermissions lists all available API permissions
+// DeleteAPIKey permanently removes a revoked or expired API key
+// DELETE /api-keys/:id/permanent
+func (h *Handler) DeleteAPIKey(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
+
+	keyIDStr := c.Param("id")
+	keyID, err := uuid.Parse(keyIDStr)
+	if err != nil {
+		errx.JSON(c, errx.ErrNotFound)
+		return
+	}
+
+	if xerr := h.APIKeyService.Delete(c.Request.Context(), *orgID, keyID); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+
+	h.auditOrg(c, models.AuditActionDelete, models.AuditEntityAPIKey, &keyID, nil, nil)
+
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
+// RevokeOwnAPIKey revokes the key the request was made with.
+//
+// Deliberately outside the API_KEYS scope gate: a credential must always be
+// able to end itself. Requiring a privilege to sign out means a read-only key
+// on a laptop someone is handing back stays live, which is the opposite of
+// what a `warmbly auth logout` promises.
+func (h *Handler) RevokeOwnAPIKey(c *gin.Context) {
+	keyID := middleware.GetAPIKeyID(c)
+	if keyID == nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "this endpoint revokes the API key it is called with, and this request did not use one"))
+		return
+	}
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
+
+	reason := c.Query("reason")
+	if reason == "" {
+		reason = "Revoked by the credential itself"
+	}
+	if xerr := h.APIKeyService.Revoke(c.Request.Context(), *orgID, *keyID, reason); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+
+	h.auditOrg(c, models.AuditActionRevoke, models.AuditEntityAPIKey, keyID, nil, map[string]string{"self": "true"})
+	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
+}
+
+// checkKeyWithinCaller refuses a key shape the caller could not use itself: a session
+// caller is bounded by its role, a key caller by its own permissions, mailboxes and addresses.
+func (h *Handler) checkKeyWithinCaller(c *gin.Context, perms uint64, ips []string, accounts []uuid.UUID) *errx.Error {
+	if middleware.GetAuthType(c) == middleware.AuthTypeAPIKey {
+		caller, xerr := h.callerAPIKey(c)
+		if xerr != nil {
+			return xerr
+		}
+		return apikey.WithinKey(caller, perms, ips, accounts)
+	}
+	member, xerr := h.callerMember(c)
+	if xerr != nil {
+		return xerr
+	}
+	if perms&^models.APIPermissionsFor(member) != 0 {
+		return errx.NewWithIdentifier(errx.Forbidden, apikey.ErrCodeKeyExceedsCaller,
+			"an API key cannot hold permissions your role in this workspace does not include")
+	}
+	return nil
+}
+
+// checkUpdateWithinCaller bounds a key edit: a session caller by the permissions it sets,
+// a key caller by the whole key the edit leaves behind.
+func (h *Handler) checkUpdateWithinCaller(c *gin.Context, orgID, keyID uuid.UUID, data *models.UpdateAPIKey) *errx.Error {
+	if middleware.GetAuthType(c) != middleware.AuthTypeAPIKey {
+		if data.Permissions == nil {
+			return nil
+		}
+		return h.checkKeyWithinCaller(c, *data.Permissions, nil, nil)
+	}
+	target, xerr := h.APIKeyService.Get(c.Request.Context(), orgID, keyID)
+	if xerr != nil {
+		return xerr
+	}
+	perms, ips, accounts := target.Permissions, target.AllowedIPs, target.AllowedEmailAccounts
+	if data.Permissions != nil {
+		perms = *data.Permissions
+	}
+	if data.AllowedIPs != nil {
+		ips = data.AllowedIPs
+	}
+	if data.AllowedEmailAccounts != nil {
+		accounts = data.AllowedEmailAccounts
+	}
+	return h.checkKeyWithinCaller(c, perms, ips, accounts)
+}
+
+// callerAPIKey loads the API key the request authenticated with.
+func (h *Handler) callerAPIKey(c *gin.Context) (*models.APIKey, *errx.Error) {
+	orgID := middleware.GetOrganizationID(c)
+	keyID := middleware.GetAPIKeyID(c)
+	if orgID == nil || keyID == nil {
+		return nil, errx.ErrForbidden
+	}
+	return h.APIKeyService.Get(c.Request.Context(), *orgID, *keyID)
+}
+
+// ListAPIPermissions lists all available API permissions, with the set the caller may
+// put on a key (grantable) and the set an OAuth app may request (app_scopes).
 // GET /api-keys/permissions
 func (h *Handler) ListAPIPermissions(c *gin.Context) {
+	grantable, xerr := h.apiKeyCeiling(c)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"permissions": models.AllAPIPermissions,
 		"presets": gin.H{
 			"read_only":   models.APIPermReadOnly,
 			"full_access": models.APIPermFullAccess,
 		},
+		"grantable":  grantable,
+		"app_scopes": models.AppGrantableScopes,
 	})
 }
 

@@ -4,10 +4,10 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 )
 
 // GetByThread returns every message in a thread. limit/cursor are
@@ -18,6 +18,10 @@ func (s *uniboxService) GetByThread(
 	orgID, emailID uuid.UUID,
 	threadID, limit, cursor string,
 ) (*models.MailSearchResult, *errx.Error) {
+	return s.GetByThreadWithin(ctx, orgID, emailID, threadID, limit, cursor, nil)
+}
+
+func (s *uniboxService) GetByThreadWithin(ctx context.Context, orgID, emailID uuid.UUID, threadID, limit, cursor string, allowed []uuid.UUID) (*models.MailSearchResult, *errx.Error) {
 	l := DefaultThreadLimit
 	if limit != "" {
 		parsed, err := strconv.Atoi(limit)
@@ -30,9 +34,9 @@ func (s *uniboxService) GetByThread(
 		l = parsed
 	}
 
-	resp, err := s.uniboxRepository.GetByThread(ctx, orgID, emailID, threadID, l, cursor)
+	resp, err := s.uniboxRepository.GetByThreadWithin(ctx, orgID, emailID, threadID, l, cursor, allowed)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 
@@ -48,7 +52,7 @@ func (s *uniboxService) LatestMessageIDInThread(
 ) (string, *errx.Error) {
 	messageID, err := s.uniboxRepository.LatestMessageIDInThread(ctx, orgID, threadID)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return "", errx.InternalError()
 	}
 	return messageID, nil

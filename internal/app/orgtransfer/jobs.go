@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
@@ -48,7 +48,7 @@ func (s *service) RequestExport(
 		if err := ValidatePassphrase(req.Passphrase); err != nil {
 			return nil, errx.New(errx.BadRequest, err.Error())
 		}
-		if s.creds == nil {
+		if !s.carriesMailboxCredentials() {
 			return nil, errx.New(errx.BadRequest,
 				"This instance has no CREDENTIALS_ENCRYPTION_KEY, so there are no mailbox credentials to carry. Export without credentials instead.")
 		}
@@ -63,7 +63,7 @@ func (s *service) RequestExport(
 
 	active, err := s.repo.HasActiveExport(ctx, orgID)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	if active {
@@ -77,7 +77,7 @@ func (s *service) RequestExport(
 		IncludeSecrets: req.IncludeSecrets,
 	}
 	if err := s.repo.CreateExportJob(ctx, job); err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 
@@ -87,7 +87,7 @@ func (s *service) RequestExport(
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), staleTransferDeadline)
 		defer cancel()
 		if err := s.runExport(runCtx, job, passphrase); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			_ = s.repo.FailExportJob(context.WithoutCancel(ctx), job.ID, err.Error())
 		}
 	}()
@@ -145,7 +145,7 @@ func (s *service) runExport(ctx context.Context, job *models.OrgExportJob, passp
 func (s *service) GetExport(ctx context.Context, orgID, id uuid.UUID) (*models.OrgExportJob, *errx.Error) {
 	job, err := s.repo.GetExportJob(ctx, orgID, id)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	if job == nil {
@@ -157,7 +157,7 @@ func (s *service) GetExport(ctx context.Context, orgID, id uuid.UUID) (*models.O
 func (s *service) ListExports(ctx context.Context, orgID uuid.UUID) ([]models.OrgExportJob, *errx.Error) {
 	jobs, err := s.repo.ListExportJobs(ctx, orgID, jobHistoryLimit)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	return jobs, nil
@@ -181,7 +181,7 @@ func (s *service) OpenExport(ctx context.Context, orgID, id uuid.UUID) (io.ReadC
 
 	body, err := s.blobs.Get(ctx, *job.ArchiveKey)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, nil, errx.New(errx.NotFound, "This archive could not be read from storage.")
 	}
 	return body, job, nil
@@ -190,12 +190,12 @@ func (s *service) OpenExport(ctx context.Context, orgID, id uuid.UUID) (io.ReadC
 func (s *service) DeleteExport(ctx context.Context, orgID, id uuid.UUID) *errx.Error {
 	key, err := s.repo.DeleteExportJob(ctx, orgID, id)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return errx.InternalError()
 	}
 	if key != "" && s.blobs != nil {
 		if err := s.blobs.Delete(ctx, key); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 		}
 	}
 	return nil
@@ -243,7 +243,7 @@ func (s *service) Preflight(
 		out.Warnings = append(out.Warnings, "This archive was exported without credentials, so every mailbox and integration will need reconnecting.")
 	case !out.SecretsUnsealed:
 		out.Warnings = append(out.Warnings, "Enter the export passphrase to bring mailbox credentials across; without it every mailbox will need reconnecting.")
-	case s.creds == nil:
+	case !s.carriesMailboxCredentials():
 		out.Warnings = append(out.Warnings, "This instance has no CREDENTIALS_ENCRYPTION_KEY, so mailbox credentials cannot be stored here.")
 	}
 
@@ -254,7 +254,7 @@ func (s *service) Preflight(
 	}
 	known, rerr := s.repo.ResolveUsersByEmail(ctx, emails)
 	if rerr != nil {
-		sentry.CaptureException(rerr)
+		errs.CaptureException(rerr)
 		return nil, errx.InternalError()
 	}
 	for _, m := range manifest.Members {
@@ -264,6 +264,7 @@ func (s *service) Preflight(
 	}
 
 	// What already exists here, and what this instance cannot take.
+	foreignTables := 0
 	for _, mt := range manifest.Tables {
 		t, known := TableByName[mt.Name]
 		if !known || t.ImportSkip {
@@ -271,7 +272,7 @@ func (s *service) Preflight(
 		}
 		destCols, err := s.repo.TableColumns(ctx, mt.Name)
 		if err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return nil, errx.InternalError()
 		}
 		if len(destCols) == 0 {
@@ -289,7 +290,7 @@ func (s *service) Preflight(
 		if !ok {
 			continue
 		}
-		n, err := s.countConflicts(ctx, mt.Name, pk, entry)
+		n, foreign, err := s.countConflicts(ctx, orgID, t, pk, entry)
 		if err != nil {
 			// A conflict count is advisory; failing the whole preflight over
 			// one unreadable table helps nobody.
@@ -298,8 +299,15 @@ func (s *service) Preflight(
 		if n > 0 {
 			out.Conflicts[mt.Name] = n
 		}
+		if foreign > 0 {
+			foreignTables++
+		}
 	}
 
+	if foreignTables > 0 {
+		out.Warnings = append(out.Warnings, "Some records in this archive already belong to another workspace on this instance, so the import will be refused. "+
+			"Import it into the workspace it was exported from, or into a workspace on another instance.")
+	}
 	if len(out.SkippedTables) > 0 {
 		out.Warnings = append(out.Warnings, fmt.Sprintf(
 			"%d table(s) in this archive do not exist on this instance and will be skipped. It was probably exported from a newer release.",
@@ -313,18 +321,27 @@ func (s *service) Preflight(
 // scanning a million-row inbox table twice for a preview is not worth it.
 const conflictSampleRows = 2000
 
-func (s *service) countConflicts(ctx context.Context, table string, pk []string, entry *zip.File) (int64, error) {
+// The second count is the sampled keys another workspace already holds.
+func (s *service) countConflicts(ctx context.Context, orgID uuid.UUID, t *Table, pk []string, entry *zip.File) (int64, int64, error) {
 	rc, err := entry.Open()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer rc.Close()
 
 	rows, err := readRows(rc, conflictSampleRows)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return s.repo.CountExisting(ctx, table, pk, rows)
+	existing, err := s.repo.CountExisting(ctx, t.Name, pk, rows)
+	if err != nil {
+		return 0, 0, err
+	}
+	foreign, err := s.repo.CountForeignRows(ctx, nil, t.Name, t.OwnerScope(), pk, nil, orgID, rows)
+	if err != nil {
+		return 0, 0, err
+	}
+	return existing, foreign, nil
 }
 
 func (s *service) RequestImport(
@@ -346,7 +363,7 @@ func (s *service) RequestImport(
 
 	active, err := s.repo.HasActiveImport(ctx, orgID)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	if active {
@@ -386,14 +403,14 @@ func (s *service) RequestImport(
 	if s.blobs != nil {
 		key := uploadObjectKey(orgID, uuid.New())
 		if err := s.blobs.Put(ctx, key, io.NewSectionReader(archive, 0, size), "application/zip"); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			return nil, errx.New(errx.Internal, "The archive could not be stored for import.")
 		}
 		job.ArchiveKey = &key
 	}
 
 	if err := s.repo.CreateImportJob(ctx, job); err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 
@@ -425,7 +442,7 @@ func (s *service) RequestImport(
 			_ = s.repo.UpdateImportProgress(runCtx, job.ID, percent, stage)
 		})
 		if err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			_ = s.repo.FailImportJob(runCtx, job.ID, err.Error())
 			return
 		}
@@ -435,7 +452,7 @@ func (s *service) RequestImport(
 		// not linger past the point it could still be useful.
 		if job.ArchiveKey != nil && s.blobs != nil {
 			if derr := s.blobs.Delete(runCtx, *job.ArchiveKey); derr != nil {
-				sentry.CaptureException(derr)
+				errs.CaptureException(derr)
 			}
 		}
 	}()
@@ -446,7 +463,7 @@ func (s *service) RequestImport(
 func (s *service) GetImport(ctx context.Context, orgID, id uuid.UUID) (*models.OrgImportJob, *errx.Error) {
 	job, err := s.repo.GetImportJob(ctx, orgID, id)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	if job == nil {
@@ -458,7 +475,7 @@ func (s *service) GetImport(ctx context.Context, orgID, id uuid.UUID) (*models.O
 func (s *service) ListImports(ctx context.Context, orgID uuid.UUID) ([]models.OrgImportJob, *errx.Error) {
 	jobs, err := s.repo.ListImportJobs(ctx, orgID, jobHistoryLimit)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	return jobs, nil
@@ -478,18 +495,18 @@ func (s *service) PurgeExpiredExports(ctx context.Context) (int, error) {
 		job := &expired[i]
 		if job.ArchiveKey != nil && s.blobs != nil {
 			if derr := s.blobs.Delete(ctx, *job.ArchiveKey); derr != nil {
-				sentry.CaptureException(derr)
+				errs.CaptureException(derr)
 			}
 		}
 		if err := s.repo.MarkExportExpired(ctx, job.ID); err != nil {
-			sentry.CaptureException(err)
+			errs.CaptureException(err)
 			continue
 		}
 		purged++
 	}
 
 	if err := s.repo.FailStaleTransfers(ctx, time.Now().Add(-staleTransferDeadline)); err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 	}
 	return purged, nil
 }

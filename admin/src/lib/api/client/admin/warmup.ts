@@ -110,3 +110,25 @@ export function rejectAppeal(
         data: body,
     });
 }
+
+// ---- admin action history ----
+// Shape mirrors AdminWarmupAction in internal/models/admin_ops.go.
+
+export interface AdminWarmupAction {
+    id: string;
+    admin_user_id: string;
+    admin_email: string;
+    email_account_id: string;
+    email: string;
+    action: string;
+    reason?: string | null;
+    created_at: string;
+}
+
+export function listWarmupActions(limit = 200): Promise<{ data: AdminWarmupAction[] | null }> {
+    return Request({
+        method: "GET",
+        url: `/admin/warmup/actions?limit=${limit}`,
+        authorization: true,
+    });
+}

@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
+	"strconv"
+
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,7 @@ import (
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/notify/templates"
+	"github.com/warmbly/warmbly/internal/pkg/displayname"
 )
 
 // CreateOrganization creates a new organization
@@ -26,11 +28,11 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 
 	var req models.CreateOrganizationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
-	org, xerr := h.OrganizationService.Create(c.Request.Context(), userID, req.Name)
+	org, xerr := h.OrganizationService.Create(c.Request.Context(), userID, req.Name, req.Timezone)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -103,11 +105,33 @@ func (h *Handler) SwitchOrganization(c *gin.Context) {
 	})
 }
 
-// GetCurrentOrganization returns the current organization from session
+type scopedOrganizationCounts struct {
+	TotalCampaigns  int `json:"total_campaigns"`
+	ActiveCampaigns int `json:"active_campaigns"`
+	TotalContacts   int `json:"total_contacts"`
+	EmailAccounts   int `json:"email_accounts"`
+	EmailsSentToday int `json:"emails_sent_today"`
+}
+
+type scopedOrganizationWithLimits struct {
+	models.OrganizationWithLimits
+	// Shadow workspace-only fields so they are absent, not merely empty.
+	ProductDescription *string                  `json:"product_description,omitempty"`
+	ICPNotes           *string                  `json:"icp_notes,omitempty"`
+	VoiceProfile       *string                  `json:"voice_profile,omitempty"`
+	Counts             scopedOrganizationCounts `json:"counts"`
+}
+
+// GetCurrentOrganization returns the current organization from session.
 func (h *Handler) GetCurrentOrganization(c *gin.Context) {
 	orgID := middleware.GetOrganizationID(c)
 	if orgID == nil {
 		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
+	restricted := middleware.IsScopeRestricted(c)
+	if restricted && middleware.GetResourceScope(c) == nil {
+		errx.JSON(c, errx.InternalError())
 		return
 	}
 
@@ -118,13 +142,42 @@ func (h *Handler) GetCurrentOrganization(c *gin.Context) {
 	}
 
 	// Get counts and limits
-	counts, _ := h.OrganizationService.GetOrganizationCounts(c.Request.Context(), *orgID)
-	limits, _ := h.OrganizationService.GetOrganizationLimits(c.Request.Context(), *orgID)
+	var counts *models.OrganizationCounts
+	if restricted {
+		scope := &models.ResourceScope{Campaigns: middleware.AllowedCampaigns(c), Mailboxes: middleware.AllowedEmailAccounts(c)}
+		counts, xerr = h.OrganizationService.GetScopedOrganizationCounts(c.Request.Context(), *orgID, scope)
+	} else {
+		counts, xerr = h.OrganizationService.GetOrganizationCounts(c.Request.Context(), *orgID)
+	}
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	if counts == nil || org == nil {
+		errx.JSON(c, errx.InternalError())
+		return
+	}
+	limits, xerr := h.OrganizationService.GetOrganizationLimits(c.Request.Context(), *orgID)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
 
 	result := models.OrganizationWithLimits{
 		Organization: *org,
 		Limits:       limits,
 		Counts:       counts,
+	}
+	if restricted {
+		c.JSON(http.StatusOK, scopedOrganizationWithLimits{
+			OrganizationWithLimits: result,
+			Counts: scopedOrganizationCounts{
+				TotalCampaigns: counts.TotalCampaigns, ActiveCampaigns: counts.ActiveCampaigns,
+				TotalContacts: counts.TotalContacts, EmailAccounts: counts.EmailAccounts,
+				EmailsSentToday: counts.EmailsSentToday,
+			},
+		})
+		return
 	}
 
 	c.JSON(http.StatusOK, result)
@@ -140,7 +193,7 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 
 	var req models.UpdateOrganizationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -151,6 +204,10 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 	}
 
 	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityOrganization, orgID, nil, nil)
+
+	if req.Timezone != nil {
+		go h.replaceParkedSendsForWorkspace(*orgID)
+	}
 
 	// A presence privacy change re-gates connected sockets live (re-track /
 	// untrack / strip activity) rather than waiting for members to reconnect.
@@ -194,7 +251,7 @@ func (h *Handler) InviteMember(c *gin.Context) {
 
 	var req models.InviteMemberRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -204,31 +261,34 @@ func (h *Handler) InviteMember(c *gin.Context) {
 		return
 	}
 
-	h.auditOrg(c, models.AuditActionInvite, models.AuditEntityOrganizationMember, nil, nil, map[string]string{"email": inv.Email, "role": inv.Role})
+	inviteMeta := map[string]string{"email": inv.Email, "role": inv.Role}
+	if inv.Access.Restricted() {
+		inviteMeta["access_scope"] = string(models.AccessScopeRestricted)
+	}
+	h.auditOrg(c, models.AuditActionInvite, models.AuditEntityOrganizationMember, nil, nil, inviteMeta)
 
 	// Get organization name for email
 	org, _ := h.OrganizationService.Get(c.Request.Context(), *orgID)
 	orgName := "your organization"
-	if org != nil {
-		orgName = org.Name
+	if org != nil && displayname.Displayable(org.Name) != "" {
+		orgName = displayname.Displayable(org.Name)
 	}
 
-	// Get inviter name
+	// Names predating the display-name rules fall back rather than render.
 	inviter, _ := h.UserService.GetUser(c.Request.Context(), userID)
 	inviterName := "A team member"
-	if inviter != nil && inviter.FirstName != "" {
-		inviterName = inviter.FirstName
-		if inviter.LastName != "" {
-			inviterName += " " + inviter.LastName
+	if inviter != nil {
+		if name := displayname.FullName(inviter.FirstName, inviter.LastName); name != "" {
+			inviterName = name
 		}
 	}
 
 	// Send invitation email
 	if h.EmailNotificationService != nil {
-		subject := fmt.Sprintf("You've been invited to join %s on %s", orgName, templates.CompanyName)
-		acceptURL := config.GetInviteURL(inv.Token)
-		// GenerateInvitationHTML reports its own render errors to Sentry.
-		if body, gerr := templates.GenerateInvitationHTML(inviterName, orgName, acceptURL); gerr == nil {
+		subject := fmt.Sprintf("You've been invited to join %s on %s", orgName, templates.CompanyName())
+		acceptURL := config.GetInviteURL(inv.Token, config.DashboardOriginFromContext(c.Request.Context()))
+		// GenerateInvitationHTML reports its own render errors.
+		if body, gerr := templates.GenerateInvitationHTML(inviterName, orgName, acceptURL, time.Until(inv.ExpiresAt).Round(time.Hour)); gerr == nil {
 			// Detached from the request context: the handler returns before the
 			// send completes, and a cancelled context aborted the send mid-dial.
 			sendCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 45*time.Second)
@@ -262,7 +322,7 @@ func (h *Handler) UpdateMemberRole(c *gin.Context) {
 
 	var req models.UpdateMemberRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -298,7 +358,13 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 		return
 	}
 
-	if xerr := h.OrganizationService.RemoveMember(c.Request.Context(), *orgID, memberUserID); xerr != nil {
+	actorID, err := middleware.GetUserUUID(c)
+	if err != nil {
+		errx.JSON(c, errx.ErrUser)
+		return
+	}
+
+	if xerr := h.OrganizationService.RemoveMember(c.Request.Context(), *orgID, actorID, memberUserID); xerr != nil {
 		errx.JSON(c, xerr)
 		return
 	}
@@ -310,6 +376,11 @@ func (h *Handler) RemoveMember(c *gin.Context) {
 
 // TransferOwnership transfers organization ownership to another member
 func (h *Handler) TransferOwnership(c *gin.Context) {
+	session := middleware.GetSession(c)
+	if session == nil {
+		errx.JSON(c, errx.ErrUnauthorized)
+		return
+	}
 	orgID := middleware.GetOrganizationID(c)
 	if orgID == nil {
 		errx.JSON(c, errx.New(errx.BadRequest, "no organization selected"))
@@ -318,11 +389,11 @@ func (h *Handler) TransferOwnership(c *gin.Context) {
 
 	var req models.TransferOwnershipRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
-	if xerr := h.OrganizationService.TransferOwnership(c.Request.Context(), *orgID, req.NewOwnerUserID); xerr != nil {
+	if xerr := h.OrganizationService.TransferOwnership(c.Request.Context(), *orgID, session.UserID, req.NewOwnerUserID); xerr != nil {
 		errx.JSON(c, xerr)
 		return
 	}
@@ -340,10 +411,28 @@ func (h *Handler) GetPendingInvitations(c *gin.Context) {
 		return
 	}
 
+	includeExpired := false
+	switch c.Query("include_expired") {
+	case "", "false":
+	case "true":
+		includeExpired = true
+	default:
+		errx.JSON(c, errx.New(errx.BadRequest, "include_expired must be true or false. Leave it out to list only invitations that can still be accepted."))
+		return
+	}
+
 	invitations, xerr := h.OrganizationService.GetPendingInvitations(c.Request.Context(), *orgID)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
+	}
+	if includeExpired {
+		expired, xerr := h.OrganizationService.GetExpiredInvitations(c.Request.Context(), *orgID)
+		if xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		invitations = append(invitations, expired...)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"data": invitations})
@@ -351,6 +440,11 @@ func (h *Handler) GetPendingInvitations(c *gin.Context) {
 
 // CancelInvitation cancels a pending invitation
 func (h *Handler) CancelInvitation(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.ErrUnauthorized)
+		return
+	}
 	invIDStr := c.Param("id")
 	invID, err := uuid.Parse(invIDStr)
 	if err != nil {
@@ -358,7 +452,7 @@ func (h *Handler) CancelInvitation(c *gin.Context) {
 		return
 	}
 
-	if xerr := h.OrganizationService.CancelInvitation(c.Request.Context(), invID); xerr != nil {
+	if xerr := h.OrganizationService.CancelInvitation(c.Request.Context(), *orgID, invID); xerr != nil {
 		errx.JSON(c, xerr)
 		return
 	}
@@ -415,7 +509,7 @@ func (h *Handler) AcceptInvitation(c *gin.Context) {
 
 	var req models.AcceptInvitationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -446,7 +540,7 @@ func (h *Handler) AcceptInvitation(c *gin.Context) {
 	// joiner). Detached + best-effort: a notification hiccup must not fail
 	// the accept.
 	if h.NotificationService != nil {
-		joiner := strings.TrimSpace(strings.TrimSpace(user.FirstName) + " " + strings.TrimSpace(user.LastName))
+		joiner := displayname.FullName(user.FirstName, user.LastName)
 		if joiner == "" {
 			joiner = user.Email
 		}
@@ -493,7 +587,10 @@ func (h *Handler) GetMyPendingInvitations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": invitations})
 }
 
-// GetOrganizationLimits returns the organization's limits and current usage
+// GetOrganizationLimits returns the limits the server actually enforces for
+// the workspace (plan, then any approved override) beside the live counts,
+// plus the mailbox allowance and attachment storage, which have no plan
+// column of their own. A nil limit is unmetered.
 func (h *Handler) GetOrganizationLimits(c *gin.Context) {
 	orgID := middleware.GetOrganizationID(c)
 	if orgID == nil {
@@ -501,7 +598,7 @@ func (h *Handler) GetOrganizationLimits(c *gin.Context) {
 		return
 	}
 
-	limits, xerr := h.OrganizationService.GetOrganizationLimits(c.Request.Context(), *orgID)
+	limits, xerr := h.OrganizationService.GetEffectiveLimits(c.Request.Context(), *orgID)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -513,8 +610,148 @@ func (h *Handler) GetOrganizationLimits(c *gin.Context) {
 		return
 	}
 
+	mailboxes, xerr := h.OrganizationService.MailboxAllowance(c.Request.Context(), *orgID)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+
+	// Storage is reported here because nothing else does: a workspace that
+	// dropped to a smaller plan is over its quota with no upload refused yet.
+	storage := gin.H{"used_bytes": int64(0), "limit_bytes": int64(0)}
+	if h.FeatureGateService != nil && h.AttachmentRepo != nil {
+		limit, xerr := h.FeatureGateService.GetStorageLimitBytes(c.Request.Context(), *orgID)
+		if xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		used, err := h.AttachmentRepo.SumStorageUsedByOrg(c.Request.Context(), *orgID)
+		if err != nil {
+			errx.JSON(c, errx.InternalError())
+			return
+		}
+		storage = gin.H{"used_bytes": used, "limit_bytes": limit, "over_quota": used > limit}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"limits": limits,
-		"counts": counts,
+		"limits":    limits,
+		"counts":    counts,
+		"mailboxes": mailboxes,
+		"storage":   storage,
 	})
+}
+
+// GetMemberAccess is GET /organization/members/:id/access: which resources the member's role applies to.
+func (h *Handler) GetMemberAccess(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.ErrNoOrganization)
+		return
+	}
+	memberUserID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "invalid member ID"))
+		return
+	}
+	access, xerr := h.OrganizationService.GetMemberAccess(c.Request.Context(), *orgID, memberUserID)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	c.JSON(http.StatusOK, access)
+}
+
+// SetMemberAccess is PUT /organization/members/:id/access. It replaces the
+// whole scope, so a retry lands on the same state.
+func (h *Handler) SetMemberAccess(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.ErrNoOrganization)
+		return
+	}
+	memberUserID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		errx.JSON(c, errx.New(errx.BadRequest, "invalid member ID"))
+		return
+	}
+	actorID, err := middleware.GetUserUUID(c)
+	if err != nil {
+		errx.JSON(c, errx.ErrUnauthorized)
+		return
+	}
+	var req models.SetMemberAccessRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	member, xerr := h.OrganizationService.SetMemberAccess(c.Request.Context(), *orgID, actorID, memberUserID, req.Access())
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	meta := map[string]string{"access_scope": string(member.AccessScope)}
+	if a := member.Access; a != nil && a.Restricted() {
+		meta["campaign_folders"] = strconv.Itoa(len(a.FolderIDs))
+		meta["campaigns"] = strconv.Itoa(len(a.CampaignIDs))
+		meta["mailboxes"] = strconv.Itoa(len(a.EmailAccountIDs))
+	}
+	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityOrganizationMember, &memberUserID, nil, meta)
+	c.JSON(http.StatusOK, member)
+}
+
+// SuggestAccessSenders is GET /organization/access/suggested-senders: the
+// mailboxes the given campaigns and folders send from, for an administrator
+// to review before granting them. Campaign access never grants a mailbox.
+func (h *Handler) SuggestAccessSenders(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.ErrNoOrganization)
+		return
+	}
+	campaignIDs, xerr := parseUUIDList(c.Query("campaign_ids"))
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	folderIDs, xerr := parseUUIDList(c.Query("campaign_folder_ids"))
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	if len(campaignIDs)+len(folderIDs) > 2*models.MaxAccessGrants {
+		errx.JSON(c, errx.New(errx.BadRequest, "too many campaigns or folders"))
+		return
+	}
+	senders, xerr := h.OrganizationService.SuggestCampaignSenders(c.Request.Context(), *orgID, campaignIDs, folderIDs)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": senders})
+}
+
+// parseUUIDList reads a comma-separated list of ids; an invalid one is refused.
+func parseUUIDList(raw string) ([]uuid.UUID, *errx.Error) {
+	parts := splitAndTrim(raw)
+	out := make([]uuid.UUID, 0, len(parts))
+	for _, p := range parts {
+		id, err := uuid.Parse(p)
+		if err != nil {
+			return nil, errx.ErrUuid
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// replaceParkedSendsForWorkspace moves warmup and campaign work parked under the old workspace timezone; detached so a large workspace does not hold the request.
+func (h *Handler) replaceParkedSendsForWorkspace(orgID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if h.CampaignService != nil {
+		h.CampaignService.RescheduleForOrganization(ctx, orgID)
+	}
+	if h.TasksService != nil {
+		h.TasksService.ReplaceWorkspaceWarmupSchedules(ctx, orgID)
+	}
 }

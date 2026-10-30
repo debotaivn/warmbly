@@ -2,7 +2,7 @@
 // workspace and the pool allowance they share.
 
 import React from "react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { Loader2Icon, ServerIcon } from "lucide-react";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
@@ -30,8 +30,8 @@ export default function LinkedInstances() {
             {plan && (
                 <p className="text-[12.5px] text-slate-500">
                     {plan.mailbox_limit === null
-                        ? `Unlimited linked mailboxes · ${plan.enrolled} enrolled`
-                        : `${plan.enrolled} of ${plan.mailbox_limit} free linked mailboxes used`}
+                        ? `Unlimited mailboxes · ${plan.enrolled} warming`
+                        : `${plan.enrolled} of ${plan.mailbox_limit} free mailboxes used, counting the ones connected here and through instances`}
                 </p>
             )}
             {list.length === 0 ? (
@@ -57,7 +57,7 @@ export default function LinkedInstances() {
                                 <button
                                     type="button"
                                     onClick={() =>
-                                        confirm.show(`Unlink ${inst.name}? Its ${inst.mailbox_count} enrolled mailboxes stop warming and are removed.`, async () => {
+                                        confirm.show(`Unlink ${inst.name}? Its ${inst.mailbox_count} mailbox links are released. SMTP/IMAP Cloud enrollments are deleted. Cloud warmup sending and receiving stop for every linked mailbox. Cloud-managed mailboxes stay in your Cloud workspace with their settings and history, and you can restart their warmup there.`, async () => {
                                             try {
                                                 await revoke.mutateAsync(inst.id);
                                                 toast.success("Instance unlinked");

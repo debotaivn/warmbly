@@ -1,22 +1,23 @@
 // Thread reader : right pane of the unibox.
 //
-// Fetches the thread via /unibox/thread. Header actions are wrapped
-// in radix tooltips so hover reveals the intent + (where it exists) a
-// keyboard hint. Snooze has both presets and a custom "pick a time"
-// path with a native datetime input.
+// Fetches the thread via /unibox/thread. The header is the subject over one
+// meta line (count, mailbox, labels, who else is here) with icon-only actions
+// on the right, each under a tooltip. Snooze has presets and a custom "pick a
+// time" path.
 
 import React from "react";
+import { useParams } from "@tanstack/react-router";
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient, useMutation } from "@tanstack/react-query";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import {
   AlertCircleIcon,
   ArchiveIcon,
   CheckIcon,
-  ChevronDownIcon,
   ClockIcon,
   CornerUpLeftIcon,
   ForwardIcon,
+  InboxIcon,
   Loader2Icon,
   MailCheckIcon,
   MoonIcon,
@@ -29,22 +30,29 @@ import {
 
 import { MessageBubble } from "./MessageBubble";
 import { ReplyComposer, type ReplyMode, type ReplySeed } from "./ReplyComposer";
+import { loadReplyDraft, replyDraftKey } from "@/lib/unibox/replyDraft";
 import { useOutboxStore } from "@/hooks/useOutboxStore";
 import AgentDraftCard from "./AgentDraftCard";
 import ResourceViewers from "@/components/app/presence/ResourceViewers";
 import { DateTimePicker } from "@/components/ui/DateTimePicker";
 import { usePresenceResource } from "@/hooks/PresenceProvider";
+import { useMediaQuery, LG_QUERY } from "@/hooks/useMediaQuery";
+import { useShortcutActions } from "@/hooks/useShortcutActions";
+import { useAccessRestricted } from "@/hooks/usePermission";
 import { ThreadLabelMenu } from "./ThreadLabelMenu";
 import ContactContextPanel from "./ContactContextPanel";
-import BookACallButton from "@/components/app/integrations/BookACallButton";
 import { CategoryChip } from "@/components/app/contacts/CategoryPicker";
-import { SectionBar } from "@/components/layout/Page";
 import useThread from "@/lib/api/hooks/app/unibox/useThread";
 import useMarkSeen from "@/lib/api/hooks/app/unibox/useMarkSeen";
+import { useConversationActions } from "@/hooks/useConversationActions";
+import { SNOOZE_PRESETS, offsetHours } from "@/lib/unibox/snooze";
+import type { FilableFolder } from "@/lib/api/client/app/unibox/moveFolder";
+import { bareEmail, nameFromAddr, wrappedEmail } from "@/lib/helper/emailAddress";
 import useThreadLabels from "@/lib/api/hooks/app/unibox/useThreadLabels";
 import useThreadScheduled from "@/lib/api/hooks/app/unibox/useThreadScheduled";
 import cancelScheduled from "@/lib/api/client/app/unibox/cancelScheduled";
 import { useAppStore } from "@/stores";
+import { cn } from "@/lib/utils";
 import {
   PopoverMenu,
   PopoverMenuContent,
@@ -57,10 +65,6 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-  snoozeThread,
-  unsnoozeThread,
-} from "@/lib/api/client/app/unibox/snoozeThread";
 import type UniboxEmail from "@/lib/api/models/app/unibox/UniboxEmail";
 import type UniboxScheduledItem from "@/lib/api/models/app/unibox/UniboxScheduled";
 import type { UniboxThreadMessage } from "@/lib/api/models/app/unibox/UniboxThread";
@@ -68,6 +72,8 @@ import type { UniboxThreadMessage } from "@/lib/api/models/app/unibox/UniboxThre
 interface ThreadViewProps {
   threadId: string;
   emailId?: string;
+  // Closes the reader. Shown from md up; below it the page has its own back.
+  onClose?: () => void;
 }
 
 function toUniboxEmail(m: UniboxThreadMessage): UniboxEmail {
@@ -75,46 +81,15 @@ function toUniboxEmail(m: UniboxThreadMessage): UniboxEmail {
     id: m.id,
     from: m.from_addr?.[0] ?? "",
     to: m.to_addr?.[0] ?? "",
+    recipients: m.to_addr ?? [],
     subject: m.subject,
     snippet: m.snippet,
     date: new Date(m.internal_date),
     is_seen: m.seen,
     thread_id: m.thread_id,
     account_id: m.email_id,
+    answers_mailbox_id: m.answers_mailbox_id,
   };
-}
-
-const SNOOZE_PRESETS: { label: string; until: () => Date }[] = [
-  { label: "In 1 hour", until: () => offsetHours(1) },
-  { label: "In 3 hours", until: () => offsetHours(3) },
-  { label: "Tomorrow 9:00", until: () => atHour(1, 9) },
-  { label: "Monday 9:00", until: () => nextMonday9() },
-  { label: "Next week", until: () => offsetDays(7) },
-];
-
-function offsetHours(h: number): Date {
-  const d = new Date();
-  d.setHours(d.getHours() + h);
-  return d;
-}
-function offsetDays(d: number): Date {
-  const x = new Date();
-  x.setDate(x.getDate() + d);
-  return x;
-}
-function atHour(dayOffset: number, hour: number): Date {
-  const d = new Date();
-  d.setDate(d.getDate() + dayOffset);
-  d.setHours(hour, 0, 0, 0);
-  return d;
-}
-function nextMonday9(): Date {
-  const d = new Date();
-  const dow = d.getDay();
-  const delta = (1 - dow + 7) % 7 || 7;
-  d.setDate(d.getDate() + delta);
-  d.setHours(9, 0, 0, 0);
-  return d;
 }
 
 // Local datetime → ISO string. The native <input type="datetime-local">
@@ -128,10 +103,14 @@ function defaultCustomSnoozeValue(): string {
   return toLocalInput(offsetHours(2));
 }
 
-export function ThreadView({ threadId, emailId }: ThreadViewProps) {
+export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
+  // A member restricted to selected resources reads the conversation and nothing more.
+  const readOnly = useAccessRestricted();
   const q = useThread(threadId, emailId);
   const scheduledQ = useThreadScheduled(threadId);
   const accounts = useAppStore((s) => s.emails);
+  const userId = useAppStore((s) => s.user?.id);
+  const orgId = useAppStore((s) => s.currentOrganization?.id);
   const queryClient = useQueryClient();
 
   const cancel = useMutation({
@@ -160,34 +139,32 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
   const threadLabels = useThreadLabels(threadId);
   const [labelMenuOpen, setLabelMenuOpen] = React.useState(false);
 
-  // CRM context rail (right side). Open by default on wide screens (lg+),
-  // where it renders as a static rail. Below lg it renders as an overlay
-  // drawer, so it starts closed and is opened from the header toggle.
-  const [crmOpen, setCrmOpen] = React.useState(
-    () =>
-      typeof window !== "undefined" &&
-      window.matchMedia("(min-width: 1024px)").matches,
+  // Desktop visibility is remembered; mobile drawers start closed.
+  const isWide = useMediaQuery(LG_QUERY);
+  const railPref = useAppStore((s) => s.uniboxContactRailOpen);
+  const setRailPref = useAppStore((s) => s.setUniboxContactRailOpen);
+  const [overlayOpen, setOverlayOpen] = React.useState(false);
+  const crmOpen = isWide ? railPref : overlayOpen;
+
+  // Widening drops the overlay state on the floor, so clear it: otherwise an
+  // overlay opened while narrow is still "open" on the way back down and the
+  // drawer plus its backdrop reappear over the thread with nobody asking. This
+  // is the invariant the removed matchMedia effect used to hold.
+  React.useEffect(() => {
+    if (isWide) setOverlayOpen(false);
+  }, [isWide]);
+  const setCrmOpen = React.useCallback(
+    (open: boolean) => {
+      if (isWide) setRailPref(open);
+      else setOverlayOpen(open);
+    },
+    [isWide, setRailPref],
   );
 
-  // `c` opens the label menu while a thread is open — ignored while
-  // typing into the composer / any input so it never eats keystrokes.
-  React.useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const t = e.target as HTMLElement | null;
-      if (t) {
-        const tag = t.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA" || t.isContentEditable)
-          return;
-      }
-      if (e.key === "c") {
-        setLabelMenuOpen(true);
-        e.preventDefault();
-      }
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, []);
+  // `c` labels the open conversation. The key itself is declared in the global
+  // shortcut registry; registering the action here is what makes the row live
+  // (and shown in the `?` modal) only while a thread is actually open.
+  useShortcutActions(readOnly ? {} : { labelThread: () => setLabelMenuOpen(true) });
 
   // Composer is opt-in. Default: no reply UI mounted. The user has
   // to click Reply (per-message or the footer CTA) before any blank
@@ -213,6 +190,24 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
     setReplySeed(null);
   }, [threadId]);
 
+  // Restore once on arrival, including drafts targeting an older message.
+  const reopenedFor = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    const msgs = q.data?.data ?? [];
+    if (!msgs.length || !userId || !orgId) return;
+    const identity = JSON.stringify([userId, orgId, threadId]);
+    if (reopenedFor.current === identity) return;
+    reopenedFor.current = identity;
+    for (const message of [...msgs].reverse()) {
+      for (const mode of ["reply", "forward"] as const) {
+        if (loadReplyDraft(replyDraftKey(userId, orgId, threadId, message.id, mode))) {
+          openReply(message.id, mode);
+          return;
+        }
+      }
+    }
+  }, [threadId, q.data, userId, orgId, openReply]);
+
   // A cancelled undo-send reply for this thread reopens the composer with
   // the exact content that was about to go out.
   const pendingRestore = useOutboxStore((s) => s.pendingReplyRestore);
@@ -225,6 +220,8 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
       bcc: pendingRestore.bcc,
       subject: pendingRestore.subject,
       body: pendingRestore.body,
+      ...(pendingRestore.bodyHtml ? { body_html: pendingRestore.bodyHtml } : {}),
+      email_account_id: pendingRestore.emailAccountId,
     });
   }, [pendingRestore, threadId, openReply]);
 
@@ -236,52 +233,80 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
     replyState ? "replying" : "viewing",
   );
 
-  // Opening a thread marks its unseen messages as read. The hook invalidates
-  // ["unibox"], so the unread badge, the collapsed list, and the overview all
-  // refresh. Once everything is seen the id list is empty and this no-ops, so
-  // it self-terminates after the post-mark refetch (no loop).
+  // Opening a thread marks its unseen messages as read. The hook writes the
+  // flip straight into the cached list and thread and refetches only the
+  // counters, so the conversation list the user came from does not re-order
+  // under them. Passing threadId is what lets it find the row. Once everything
+  // is seen the id list is empty and this no-ops, so it self-terminates.
   const markSeen = useMarkSeen();
   const markSeenMutate = markSeen.mutate;
+  // The reader outlives a close by a render (the URL follows the store in an
+  // effect), and reading back the patch Mark as unread just wrote undoes it.
+  const selected = useAppStore((s) => s.selectedThreadId === threadId);
   React.useEffect(() => {
+    if (!selected || readOnly) return;
     const unseenIds = (q.data?.data ?? [])
       .filter((m) => !m.seen)
       .map((m) => m.id);
     if (unseenIds.length === 0) return;
-    markSeenMutate({ ids: unseenIds });
-  }, [threadId, q.data, markSeenMutate]);
+    markSeenMutate({ ids: unseenIds, threadIds: [threadId] });
+  }, [selected, readOnly, threadId, q.data, markSeenMutate]);
+
+  // Header actions. Each one closes the thread: the effect above would
+  // otherwise re-mark an "unread" thread as seen on the next refetch, and a
+  // filed thread has left the list the reader is looking at.
+  const actions = useConversationActions();
+  const setSelectedThreadId = useAppStore((s) => s.setSelectedThreadId);
+  const threadIds = () => (q.data?.data ?? []).map((m) => m.id);
+  const markUnread = () => {
+    // By conversation: the server picks its newest received message.
+    markSeenMutate({ seen: false, threadIds: [threadId] });
+    setSelectedThreadId(null);
+  };
+
+  // Filing moves the message here first; the backend then moves it in the
+  // mailbox too, unless the mailbox turned that off.
+  // The row leaves the list and the reader closes at once; the request runs
+  // behind the toast, and a failure re-reads the list, which brings it back.
+  // The copy, the undo and the cache handling are shared with the list row.
+  const fileThread = async (folder: FilableFolder) => {
+    if (actions.filing) return;
+    setSelectedThreadId(null);
+    await actions.file([threadId], folder, threadIds());
+  };
+
+  // Restoring is only offered where the user can see what they are restoring.
+  const { scope: urlScope } = useParams({ strict: false });
+  const filed = urlScope === "trash" || urlScope === "archive";
 
   const snooze = useMutation({
-    mutationFn: (until: Date) =>
-      snoozeThread({ thread_id: threadId, snoozed_until: until.toISOString() }),
-    onSuccess: () => {
-      toast.success("Snoozed");
-      queryClient.invalidateQueries({ queryKey: ["unibox", "search"] });
-      queryClient.invalidateQueries({ queryKey: ["unibox", "overview"] });
-      queryClient.invalidateQueries({ queryKey: ["unibox", "count"] });
+    mutationFn: (until: Date) => actions.snooze([threadId], until),
+    onSettled: () => {
       setSnoozeOpen(false);
       setCustomMode(false);
     },
-    onError: () => toast.error("Couldn't snooze this thread"),
   });
 
   const unsnooze = useMutation({
-    mutationFn: () => unsnoozeThread(threadId),
-    onSuccess: () => {
-      toast.success("Un-snoozed");
-      queryClient.invalidateQueries({ queryKey: ["unibox", "search"] });
-      queryClient.invalidateQueries({ queryKey: ["unibox", "overview"] });
-      setSnoozeOpen(false);
-    },
-    onError: () => toast.error("Couldn't un-snooze"),
+    mutationFn: () => actions.unsnooze([threadId]),
+    onSettled: () => setSnoozeOpen(false),
   });
 
+  // Built once per fetch, not once per render. Every consumer holds these
+  // objects by identity, so rebuilding them on each render hands each one a
+  // value that looks new while the conversation has not changed. That is what
+  // let a thread re-render reset the reply composer; keep it memoised, and
+  // above the early returns below so the hook order stays fixed.
+  const messages = React.useMemo(() => (q.data?.data ?? []).map(toUniboxEmail), [q.data]);
+  // A forward never falls back: it would send a different message. With no
+  // target the Reply/Forward bar shows instead of an empty composer slot.
+  const replyTarget = replyState
+    ? messages.find((m) => m.id === replyState.messageId) ??
+      (replyState.mode === "reply" ? messages[messages.length - 1] : undefined)
+    : undefined;
+
   if (q.isPending) {
-    return (
-      <div className="flex-1 flex items-center justify-center gap-2 text-[12px] text-slate-400">
-        <Loader2Icon className="w-3.5 h-3.5 animate-spin" />
-        Loading thread…
-      </div>
-    );
+    return <ThreadSkeleton />;
   }
 
   if (q.isError) {
@@ -290,52 +315,77 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
         <div className="text-center max-w-sm">
           <AlertCircleIcon className="w-5 h-5 text-rose-500 mx-auto mb-2" />
           <p className="text-[12.5px] font-medium text-slate-900 mb-1">
-            Couldn't load this thread
+            Couldn't load this conversation
           </p>
           <p className="text-[11.5px] text-slate-500 mb-3">
             {q.error?.message ?? "Request failed"}
           </p>
-          <button
-            type="button"
-            onClick={() => q.refetch()}
-            className="h-7 px-2.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-[12px] font-medium transition-colors"
-          >
-            Try again
-          </button>
+          <div className="flex items-center justify-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => q.refetch()}
+              className="h-7 px-2.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-[12px] font-medium transition-colors"
+            >
+              Try again
+            </button>
+            {onClose && (
+              <button
+                type="button"
+                onClick={onClose}
+                className="hidden md:inline-flex h-7 px-2.5 items-center rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-[12px] font-medium transition-colors"
+              >
+                Close
+              </button>
+            )}
+          </div>
         </div>
       </div>
     );
   }
 
-  const messages = (q.data?.data ?? []).map(toUniboxEmail);
-
   if (messages.length === 0) {
     return (
-      <div className="flex-1 flex items-center justify-center text-[12px] text-slate-400">
-        This thread is empty.
+      <div className="flex-1 flex flex-col items-center justify-center gap-2 text-[12px] text-slate-400">
+        This conversation is empty.
+        {onClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            className="hidden md:inline-flex h-7 px-2.5 items-center rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-[12px] font-medium transition-colors"
+          >
+            Close
+          </button>
+        )}
       </div>
     );
   }
 
   const subject = messages[0]?.subject || "(no subject)";
-  const participants = new Set(
-    messages.map((m) => m.from).filter((f): f is string => Boolean(f)),
-  );
   const mailbox = accounts.find((a) => a.id === messages[0]?.account_id);
 
-  // The external party of the thread = the first message address that isn't
-  // our own mailbox. Addresses arrive as "Name <addr>" or bare "addr"; reduce
-  // to the bare address so the comparison + the CRM panel lookup both work.
+  // The external party of the thread = the first sender that isn't one of
+  // the workspace's mailboxes, else (nobody has written back yet) the first
+  // such recipient. Headers arrive in all three shapes lib/helper/emailAddress
+  // parses; reduce to the bare address so the comparison + the lookup work.
   const mailboxEmail = mailbox?.email?.toLowerCase();
-  const bareAddr = (s: string) => {
-    const m = s.match(/<([^>]+)>/);
-    return (m ? m[1] : s).trim();
+  const ownAddresses = new Set(accounts.map((a) => a.email?.toLowerCase()).filter(Boolean));
+  if (mailboxEmail) ownAddresses.add(mailboxEmail);
+  const isExternal = (addr: string) => {
+    const e = bareEmail(addr);
+    return !!e && !ownAddresses.has(e.toLowerCase());
   };
-  const contactEmail =
-    messages
-      .map((m) => bareAddr(m.from))
-      .find((e) => e && e.toLowerCase() !== mailboxEmail) ??
-    bareAddr(messages[0]?.from ?? "");
+  const externalFrom = messages.map((m) => m.from).find(isExternal);
+  const contactFrom =
+    externalFrom ??
+    messages.flatMap((m) => m.recipients ?? [m.to]).find(isExternal) ??
+    (messages[0]?.from ?? "");
+  const contactEmail = bareEmail(contactFrom);
+  // Display name from the From header, so an "Add as contact" from the
+  // panel does not create a nameless row. Empty when the header is bare.
+  const contactName =
+    wrappedEmail(contactFrom) && nameFromAddr(contactFrom) !== contactEmail
+      ? nameFromAddr(contactFrom)
+      : "";
 
   const submitCustomSnooze = () => {
     if (!customValue) return;
@@ -356,44 +406,44 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
   };
 
   return (
-    <div className="flex h-full min-h-0">
-      <div className="flex-1 flex flex-col min-w-0 bg-white">
-      <div className="h-12 px-3 sm:px-5 border-b border-slate-200 flex items-center gap-2 sm:gap-3 shrink-0 bg-white">
-        <span className="hidden sm:inline text-[10px] uppercase tracking-[0.14em] text-slate-400 font-medium">
-          Thread
-        </span>
-        <div className="hidden sm:block h-4 w-px bg-slate-200" />
-        <span className="text-[12.5px] text-slate-900 font-medium truncate min-w-0">
-          {subject}
-        </span>
-        {mailbox && (
-          <span className="ml-1 hidden md:inline-flex items-center gap-1 h-5 px-1.5 rounded bg-slate-100 text-slate-600 text-[10.5px] font-medium font-mono shrink-0">
-            {mailbox.email}
-          </span>
-        )}
-        {(threadLabels.data ?? []).length > 0 && (
-          <span className="hidden md:inline-flex items-center gap-1 shrink-0">
-            {(threadLabels.data ?? []).slice(0, 3).map((c) => (
-              <CategoryChip key={c.id} category={c} compact />
-            ))}
-          </span>
-        )}
-        <ResourceViewers resource={`thread:${threadId}`} className="shrink-0" />
-        <div className="ml-auto flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setCrmOpen((o) => !o)}
-            aria-label={crmOpen ? "Hide contact panel" : "Show contact panel"}
-            className={
-              "inline-flex size-7 rounded-md items-center justify-center transition-colors " +
-              (crmOpen
-                ? "text-sky-700 bg-sky-50"
-                : "text-slate-500 hover:text-slate-900 hover:bg-slate-100")
-            }
-          >
-            <UserIcon className="w-3.5 h-3.5" />
-          </button>
-          <BookACallButton email={contactEmail} className="hidden sm:inline-flex" />
+    <div className="flex h-full min-h-0 min-w-0 overflow-hidden">
+      <div className="@container/thread flex-1 flex flex-col min-h-0 min-w-0 bg-white">
+      <div className="min-h-12 px-4 sm:px-5 py-2 border-b border-slate-200 flex flex-col items-stretch gap-2 @min-[40rem]/thread:flex-row @min-[40rem]/thread:items-center @min-[40rem]/thread:gap-3 shrink-0 bg-white">
+        <div className="min-w-0 flex-1">
+          <h1 title={subject} className="text-[13.5px] text-slate-900 font-semibold line-clamp-2 break-words leading-5">
+            {subject}
+          </h1>
+          <div className="flex flex-wrap items-center gap-1.5 min-w-0 text-[11px] text-slate-400 leading-4">
+            <span className="shrink-0">
+              {messages.length} {messages.length === 1 ? "message" : "messages"}
+            </span>
+            {mailbox && (
+              <>
+                <span aria-hidden className="text-slate-300">&middot;</span>
+                <span className="truncate min-w-0">{mailbox.email}</span>
+              </>
+            )}
+            {(threadLabels.data ?? []).length > 0 && (
+              <span className="inline-flex max-w-full flex-wrap items-center gap-1 ml-1">
+                {(threadLabels.data ?? []).slice(0, 3).map((c) => (
+                  <CategoryChip key={c.id} category={c} compact />
+                ))}
+              </span>
+            )}
+            <ResourceViewers resource={`thread:${threadId}`} className="shrink-0 ml-1" />
+          </div>
+        </div>
+        {readOnly ? (
+          onClose && (
+            <IconAction
+              label="Close conversation"
+              className="hidden md:inline-flex"
+              icon={<XIcon className="w-[15px] h-[15px]" />}
+              onClick={onClose}
+            />
+          )
+        ) : (
+        <div className="flex flex-wrap items-center gap-0.5 shrink-0">
           <ThreadLabelMenu
             threadId={threadId}
             open={labelMenuOpen}
@@ -411,16 +461,20 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
             <PopoverMenuTrigger asChild>
               <button
                 aria-label="Snooze this thread"
-                className="h-7 px-2 rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100 inline-flex items-center gap-1 transition-colors text-[12px]"
+                title="Snooze"
+                className={cn(
+                  "size-7 rounded-md inline-flex items-center justify-center transition-colors",
+                  snoozeOpen
+                    ? "bg-slate-100 text-slate-900"
+                    : "text-slate-500 hover:text-slate-900 hover:bg-slate-100",
+                )}
                 disabled={snooze.isPending || unsnooze.isPending}
               >
                 {snooze.isPending || unsnooze.isPending ? (
-                  <Loader2Icon className="w-3 h-3 animate-spin" />
+                  <Loader2Icon className="w-3.5 h-3.5 animate-spin" />
                 ) : (
-                  <MoonIcon className="w-3.5 h-3.5" />
+                  <MoonIcon className="w-[15px] h-[15px]" />
                 )}
-                <span className="hidden sm:inline">Snooze</span>
-                <ChevronDownIcon className="w-3 h-3 text-slate-400" />
               </button>
             </PopoverMenuTrigger>
             <PopoverMenuContent>
@@ -488,27 +542,62 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
             </PopoverMenuContent>
           </PopoverMenu>
 
-          <div className="hidden sm:flex items-center gap-1">
+          <div className="hidden @min-[28rem]/thread:flex items-center gap-0.5">
             <IconAction
               label="Mark as unread"
-              icon={<MailCheckIcon className="w-3.5 h-3.5" />}
+              icon={<MailCheckIcon className="w-[15px] h-[15px]" />}
+              onClick={markUnread}
             />
-            <IconAction
-              label="Archive thread"
-              icon={<ArchiveIcon className="w-3.5 h-3.5" />}
-            />
-            <IconAction
-              label="Delete thread"
-              danger
-              icon={<TrashIcon className="w-3.5 h-3.5" />}
-            />
+            {filed ? (
+              <IconAction
+                label="Move to inbox"
+                icon={<InboxIcon className="w-[15px] h-[15px]" />}
+                disabled={actions.filing}
+                onClick={() => fileThread("inbox")}
+              />
+            ) : (
+              <IconAction
+                label="Archive thread"
+                icon={<ArchiveIcon className="w-[15px] h-[15px]" />}
+                disabled={actions.filing}
+                onClick={() => fileThread("archive")}
+              />
+            )}
+            {urlScope !== "trash" && (
+              <IconAction
+                label="Delete thread"
+                danger
+                icon={<TrashIcon className="w-[15px] h-[15px]" />}
+                disabled={actions.filing}
+                onClick={() => fileThread("trash")}
+              />
+            )}
           </div>
+          <span aria-hidden className="hidden @min-[28rem]/thread:block h-4 w-px bg-slate-200 mx-1" />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setCrmOpen(!crmOpen)}
+                aria-label={crmOpen ? "Hide contact panel" : "Show contact panel"}
+                className={cn(
+                  "size-7 rounded-md inline-flex items-center justify-center transition-colors",
+                  crmOpen
+                    ? "text-sky-700 bg-sky-50"
+                    : "text-slate-500 hover:text-slate-900 hover:bg-slate-100",
+                )}
+              >
+                <UserIcon className="w-[15px] h-[15px]" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{crmOpen ? "Hide contact" : "Show contact"}</TooltipContent>
+          </Tooltip>
           <PopoverMenu align="end" side="bottom">
             <PopoverMenuTrigger asChild>
               <button
                 type="button"
                 aria-label="More thread actions"
-                className="sm:hidden size-7 rounded-md inline-flex items-center justify-center text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors"
+                className="@min-[28rem]/thread:hidden size-7 rounded-md inline-flex items-center justify-center text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors"
               >
                 <MoreVerticalIcon className="w-3.5 h-3.5" />
               </button>
@@ -516,29 +605,66 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
             <PopoverMenuContent>
               <PopoverMenuItem
                 icon={<MailCheckIcon className="w-3.5 h-3.5" />}
+                onSelect={markUnread}
               >
                 Mark as unread
               </PopoverMenuItem>
-              <PopoverMenuItem icon={<ArchiveIcon className="w-3.5 h-3.5" />}>
-                Archive thread
-              </PopoverMenuItem>
-              <PopoverMenuItem
-                danger
-                icon={<TrashIcon className="w-3.5 h-3.5" />}
-              >
-                Delete thread
-              </PopoverMenuItem>
+              {filed ? (
+                <PopoverMenuItem
+                  icon={<InboxIcon className="w-3.5 h-3.5" />}
+                  disabled={actions.filing}
+                  onSelect={() => fileThread("inbox")}
+                >
+                  Move to inbox
+                </PopoverMenuItem>
+              ) : (
+                <PopoverMenuItem
+                  icon={<ArchiveIcon className="w-3.5 h-3.5" />}
+                  disabled={actions.filing}
+                  onSelect={() => fileThread("archive")}
+                >
+                  Archive thread
+                </PopoverMenuItem>
+              )}
+              {urlScope !== "trash" && (
+                <PopoverMenuItem
+                  danger
+                  icon={<TrashIcon className="w-3.5 h-3.5" />}
+                  disabled={actions.filing}
+                  onSelect={() => fileThread("trash")}
+                >
+                  Delete thread
+                </PopoverMenuItem>
+              )}
             </PopoverMenuContent>
           </PopoverMenu>
+          {onClose && (
+            <>
+              <span aria-hidden className="hidden md:block h-4 w-px bg-slate-200 mx-1" />
+              <IconAction
+                label="Close conversation"
+                className="hidden md:inline-flex"
+                icon={<XIcon className="w-[15px] h-[15px]" />}
+                onClick={onClose}
+              />
+            </>
+          )}
         </div>
+        )}
       </div>
 
-      <SectionBar
-        label={`${messages.length} ${messages.length === 1 ? "message" : "messages"}`}
-        count={participants.size}
-      />
-
-      <div className="flex-1 overflow-y-auto divide-y divide-slate-200/60">
+      <motion.div
+        // The thread is keyed on its id, so this runs once per conversation
+        // opened: a short fade in place of the messages popping into an
+        // otherwise settled pane.
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+        role="region"
+        aria-label="Conversation messages"
+        tabIndex={0}
+        className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden divide-y divide-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500"
+      >
         {messages.map((email, i) => (
           <MessageBubble
             key={email.id}
@@ -547,8 +673,16 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
             // still unread. Older read messages stay collapsed so a long
             // thread does not fetch every body at once.
             defaultExpanded={i === messages.length - 1 || !email.is_seen}
-            onReply={() => openReply(email.id, "reply")}
-            onForward={() => openReply(email.id, "forward")}
+            outbound={
+              !!mailboxEmail && bareEmail(email.from).toLowerCase() === mailboxEmail
+            }
+            answersMailbox={
+              email.answers_mailbox_id
+                ? accounts.find((a) => a.id === email.answers_mailbox_id)?.email
+                : undefined
+            }
+            onReply={readOnly ? undefined : () => openReply(email.id, "reply")}
+            onForward={readOnly ? undefined : () => openReply(email.id, "forward")}
           />
         ))}
         {(scheduledQ.data?.data ?? []).map((item) => (
@@ -556,33 +690,27 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
             key={item.task_id}
             item={item}
             cancelling={cancel.isPending && cancel.variables === item.task_id}
-            onCancel={() => cancel.mutate(item.task_id)}
+            onCancel={readOnly ? undefined : () => cancel.mutate(item.task_id)}
           />
         ))}
-      </div>
+      </motion.div>
 
-      <AgentDraftCard threadId={threadId} />
+      {!readOnly && <AgentDraftCard threadId={threadId} />}
 
+      {!readOnly && (
       <AnimatePresence mode="wait" initial={false}>
-        {replyState ? (
-          (() => {
-            const target =
-              messages.find((m) => m.id === replyState.messageId) ??
-              messages[messages.length - 1];
-            return target ? (
-              <ReplyComposer
-                key={`${replyState.messageId}-${replyState.mode}`}
-                threadId={threadId}
-                replyTo={target}
-                mode={replyState.mode}
-                seed={replySeed ?? undefined}
-                onClose={() => {
-                  setReplyState(null);
-                  setReplySeed(null);
-                }}
-              />
-            ) : null;
-          })()
+        {replyState && replyTarget ? (
+          <ReplyComposer
+            key={`${userId}-${orgId}-${replyState.messageId}-${replyState.mode}`}
+            threadId={threadId}
+            replyTo={replyTarget}
+            mode={replyState.mode}
+            seed={replySeed ?? undefined}
+            onClose={() => {
+              setReplyState(null);
+              setReplySeed(null);
+            }}
+          />
         ) : (
           <motion.div
             key="reply-rail"
@@ -590,7 +718,7 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 6 }}
             transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
-            className="border-t border-slate-200 bg-white px-3 py-2 flex items-center gap-1.5 shrink-0"
+            className="border-t border-slate-200 bg-white px-4 sm:px-5 py-2.5 flex items-center gap-1.5 shrink-0"
           >
             <button
               type="button"
@@ -616,21 +744,69 @@ export function ThreadView({ threadId, emailId }: ThreadViewProps) {
               <ForwardIcon className="w-3 h-3" />
               Forward
             </button>
-            <span className="ml-auto hidden md:inline text-[10.5px] text-slate-400">
-              Hover any message to reply to it directly.
-            </span>
           </motion.div>
         )}
       </AnimatePresence>
+      )}
       </div>
 
-      {crmOpen && (
+      {crmOpen && !readOnly && (
         <ContactContextPanel
           email={contactEmail}
-          mailboxId={mailbox?.id}
+          name={contactName}
+          mailboxId={mailbox?.id ?? messages[0]?.account_id}
+          threadId={threadId}
+          threadMailboxId={emailId}
+          wroteBack={!!externalFrom}
           onClose={() => setCrmOpen(false)}
         />
       )}
+    </div>
+  );
+}
+
+// The pane's own shape while the thread loads: a header block, then two
+// messages. Nothing is centred and nothing spins, so the layout the messages
+// land in is already on screen.
+function ThreadSkeleton() {
+  return (
+    <div className="flex h-full min-h-0" aria-busy aria-label="Loading conversation">
+      <div className="flex-1 flex flex-col min-w-0 bg-white">
+        <div className="min-h-12 px-4 sm:px-5 py-2 border-b border-slate-200 flex items-center gap-3 shrink-0">
+          <div className="min-w-0 flex-1 space-y-2">
+            <div className="h-3 w-2/3 max-w-[320px] rounded bg-slate-100 animate-pulse" />
+            <div className="h-2.5 w-40 rounded bg-slate-100/80 animate-pulse" />
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="size-7 rounded-md bg-slate-50" />
+            ))}
+          </div>
+        </div>
+        <div className="flex-1 divide-y divide-slate-100">
+          <div className="px-4 sm:px-5 py-2.5 flex items-center gap-3">
+            <div className="size-7 rounded-full bg-slate-100 animate-pulse shrink-0" />
+            <div className="h-2.5 w-28 rounded bg-slate-100 animate-pulse" />
+            <div className="h-2.5 flex-1 max-w-[280px] rounded bg-slate-100/70 animate-pulse" />
+          </div>
+          <div className="px-4 sm:px-5 py-4">
+            <div className="flex items-start gap-3">
+              <div className="size-7 rounded-full bg-slate-100 animate-pulse shrink-0" />
+              <div className="flex-1 space-y-2 pt-1">
+                <div className="h-2.5 w-36 rounded bg-slate-100 animate-pulse" />
+                <div className="h-2.5 w-24 rounded bg-slate-100/80 animate-pulse" />
+              </div>
+            </div>
+            <div className="sm:pl-10 mt-4 space-y-2.5">
+              <div className="h-2.5 w-[92%] rounded bg-slate-100 animate-pulse" />
+              <div className="h-2.5 w-[84%] rounded bg-slate-100 animate-pulse" />
+              <div className="h-2.5 w-[60%] rounded bg-slate-100 animate-pulse" />
+              <div className="h-2.5 w-[76%] rounded bg-slate-100/80 animate-pulse mt-4" />
+              <div className="h-2.5 w-[40%] rounded bg-slate-100/80 animate-pulse" />
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -639,11 +815,15 @@ function IconAction({
   label,
   icon,
   danger,
+  disabled,
+  className,
   onClick,
 }: {
   label: string;
   icon: React.ReactNode;
   danger?: boolean;
+  disabled?: boolean;
+  className?: string;
   onClick?: () => void;
 }) {
   return (
@@ -652,13 +832,15 @@ function IconAction({
         <button
           type="button"
           onClick={onClick}
+          disabled={disabled}
           aria-label={label}
-          className={
-            "size-7 rounded-md inline-flex items-center justify-center transition-colors " +
-            (danger
+          className={cn(
+            "size-7 rounded-md inline-flex items-center justify-center transition-colors disabled:opacity-40 disabled:pointer-events-none",
+            danger
               ? "text-slate-500 hover:text-red-600 hover:bg-red-50"
-              : "text-slate-500 hover:text-slate-900 hover:bg-slate-100")
-          }
+              : "text-slate-500 hover:text-slate-900 hover:bg-slate-100",
+            className,
+          )}
         >
           {icon}
         </button>
@@ -670,9 +852,9 @@ function IconAction({
 
 // Friendly relative-or-absolute time used for scheduled cards.
 // Examples: "in 12 min", "in 3 h", "tomorrow, 09:00", "Mar 5, 17:00".
-function formatScheduled(iso: string): string {
+function formatScheduled(iso: string | Date): string {
   const d = new Date(iso);
-  if (!Number.isFinite(d.getTime())) return iso;
+  if (!Number.isFinite(d.getTime())) return String(iso);
   const now = new Date();
   const diffMs = d.getTime() - now.getTime();
   const diffMin = Math.round(diffMs / 60_000);
@@ -720,7 +902,7 @@ function ScheduledMessageBubble({
 }: {
   item: UniboxScheduledItem;
   cancelling: boolean;
-  onCancel: () => void;
+  onCancel?: () => void;
 }) {
   const when = formatScheduled(item.scheduled_at);
   const recipients = [...item.to, ...(item.cc ?? []), ...(item.bcc ?? [])];
@@ -754,6 +936,7 @@ function ScheduledMessageBubble({
               </span>
             </div>
           </div>
+          {onCancel && (
           <button
             type="button"
             onClick={onCancel}
@@ -768,6 +951,7 @@ function ScheduledMessageBubble({
             )}
             {cancelling ? "Cancelling" : "Cancel"}
           </button>
+          )}
         </header>
         <div className="mt-2.5 ml-10">
           {item.subject && (

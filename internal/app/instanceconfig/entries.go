@@ -26,6 +26,11 @@ const (
 	docsCaptcha    = "/development/configuration/#captcha"
 	docsSSO        = "/development/accounts-and-access/#single-sign-on"
 	docsFirstOwner = "/development/accounts-and-access/#first-owner"
+	docsUpdates    = "/development/updates/"
+	docsAI         = "/development/configuration/#ai-and-search"
+	// The database-backed settings document, which is the one tier the
+	// environment does not own.
+	docsSettingsDoc = "/development/configuration/#settings-stored-in-the-database"
 )
 
 // table is the static inventory. Declaration order is display order.
@@ -97,9 +102,9 @@ var table = []Entry{
 	},
 	{
 		Key: "WARMBLY_ALLOW_UNSAFE_WEBHOOK_URLS", Group: GroupDeployment, RuntimeChangeable: ChangePerRequest,
-		Effect:     "true lets customer webhooks point at http:// and private addresses. Development only.",
+		Effect:     "true lets customer webhooks point at http:// and private addresses. Honoured only on a self-hosted or development instance.",
 		DocsAnchor: docsDeployment,
-		Resolve:    boolOr("WARMBLY_ALLOW_UNSAFE_WEBHOOK_URLS", false),
+		Resolve:    func(*Runtime) string { return yesNo(config.UnsafeWebhookURLsAllowed()) },
 	},
 	{
 		Key: "AI_PROVIDER", Group: GroupDeployment, RuntimeChangeable: ChangeBootOnly,
@@ -124,6 +129,18 @@ var table = []Entry{
 		Effect:     "Credential for the AI provider. An empty AI_PROVIDER with this set sends the key to api.openai.com.",
 		DocsAnchor: docsDeployment,
 		Resolve:    envValue("AI_API_KEY"),
+	},
+	{
+		Key: "TYPESAFE_API_KEY", Group: GroupDeployment, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Credential for the TypeSafe judgments: reply classification, copy judgment, warmup content lint, bounce classification and form triage. Inbox tagging also needs INBOX_TAGGING_ENABLED.",
+		DocsAnchor: docsAI,
+		Resolve:    envValue("TYPESAFE_API_KEY"),
+	},
+	{
+		Key: "INBOX_TAGGING_ENABLED", Group: GroupDeployment, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Enables TypeSafe classification of inbound message content when its API key is configured.",
+		DocsAnchor: docsAI,
+		Resolve:    boolOr("INBOX_TAGGING_ENABLED", false),
 	},
 
 	// Addresses.
@@ -192,6 +209,12 @@ var table = []Entry{
 		Effect:     "Path to a GeoLite2 database. It must be set on the backend in every environment; a missing file at that path is tolerated and only costs city labels.",
 		DocsAnchor: docsGeoIP,
 		Resolve:    envValue("GEODB_PATH"),
+	},
+	{
+		Key: "GEODB_URL", Group: GroupDatabase, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Where to download the database at GEODB_PATH from when that path holds no file. A file already there is never replaced.",
+		DocsAnchor: docsGeoIP,
+		Resolve:    envValue("GEODB_URL"),
 	},
 	{
 		Key: "REDIS", Group: GroupCache, RuntimeChangeable: ChangeBootOnly,
@@ -302,6 +325,46 @@ var table = []Entry{
 
 	// Authentication and access.
 	{
+		Key: "DOMAIN_PROOF_SECRET", Group: GroupAuth, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Keys DNS ownership proofs independently of AUTH_SECRET when configured.",
+		DocsAnchor: docsSecrets, WhenUnset: SourceDerived,
+		Resolve: func(*Runtime) string {
+			if value := os.Getenv("DOMAIN_PROOF_SECRET"); value != "" {
+				return value
+			}
+			return os.Getenv("AUTH_SECRET")
+		},
+	},
+	{
+		Key: "UNSUBSCRIBE_SIGNING_READ_UNTIL", Group: GroupAuth, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "RFC3339 cutoff for previous unsubscribe signatures and their maximum expiry.",
+		DocsAnchor: docsSecrets,
+		Resolve:    envValue("UNSUBSCRIBE_SIGNING_READ_UNTIL"),
+	},
+	{
+		Key: "UNSUBSCRIBE_SIGNING_READ_SECRETS", Group: GroupAuth, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Previous unsubscribe signing secrets as a JSON array, accepted only through the configured cutoff.",
+		DocsAnchor: docsSecrets,
+		Resolve:    envValue("UNSUBSCRIBE_SIGNING_READ_SECRETS"),
+	},
+	{
+		Key: "UNSUBSCRIBE_SIGNING_SECRET", Group: GroupAuth, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Signs recipient unsubscribe links independently of AUTH_SECRET when configured.",
+		DocsAnchor: docsSecrets, WhenUnset: SourceDerived,
+		Resolve: func(*Runtime) string {
+			if value := os.Getenv("UNSUBSCRIBE_SIGNING_SECRET"); value != "" {
+				return value
+			}
+			return os.Getenv("AUTH_SECRET")
+		},
+	},
+	{
+		Key: "TWOFA_READ_SECRETS", Group: GroupAuth, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Additional TOTP decryption secrets as a JSON array. New enrollments use TWOFA_SECRET.",
+		DocsAnchor: docsSecrets,
+		Resolve:    envValue("TWOFA_READ_SECRETS"),
+	},
+	{
 		Key: "AUTH_SECRET", Group: GroupAuth, RuntimeChangeable: ChangeBootOnly,
 		Effect:     "Signs every session and JWT. It must be byte-identical to the realtime service's JWT_SECRET; compare the fingerprints.",
 		DocsAnchor: docsSecrets,
@@ -309,7 +372,7 @@ var table = []Entry{
 	},
 	{
 		Key: "TWOFA_SECRET", Group: GroupAuth, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "Seals stored TOTP secrets. Falls back to AUTH_SECRET; rotating it invalidates every enrolled authenticator.",
+		Effect:     "Seals stored TOTP secrets. Falls back to AUTH_SECRET; retain matching read secrets while resealing existing enrollments.",
 		DocsAnchor: docsSecrets, WhenUnset: SourceDerived,
 		Resolve: func(*Runtime) string {
 			if v := trimmed("TWOFA_SECRET"); v != "" {
@@ -507,6 +570,12 @@ var table = []Entry{
 		DocsAnchor: docsFirstOwner,
 		Resolve:    envValue("WARMBLY_BOOTSTRAP_ORG"),
 	},
+	{
+		Key: "WARMBLY_SETTINGS_BOOTSTRAP", Group: GroupDeployment, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Seeds the database-backed settings document (sync budgets, retention windows) on an instance that has never saved one. A no-op from the first save in Instance settings onwards, so leaving it here cannot undo an edit made there.",
+		DocsAnchor: docsSettingsDoc,
+		Resolve:    envValue("WARMBLY_SETTINGS_BOOTSTRAP"),
+	},
 
 	// Captcha.
 	{
@@ -536,8 +605,14 @@ var table = []Entry{
 
 	// Encryption.
 	{
+		Key: "CREDENTIALS_ENCRYPTION_READ_KEYS", Group: GroupEncryption, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Additional credential decryption keys as a JSON array. New ciphertext uses CREDENTIALS_ENCRYPTION_KEY.",
+		DocsAnchor: docsEncryption,
+		Resolve:    envValue("CREDENTIALS_ENCRYPTION_READ_KEYS"),
+	},
+	{
 		Key: "KMS_PROVIDER", Group: GroupEncryption, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "local wraps organization keys with the master key below; aws wraps them with AWS KMS.",
+		Effect:     "local wraps organization keys with the master key below; aws wraps them with AWS KMS; brokered holds no key material and asks this instance to unwrap, which is what a node off this machine should run.",
 		DocsAnchor: docsEncryption,
 		Resolve:    func(*Runtime) string { return config.KMSProvider() },
 	},
@@ -575,7 +650,7 @@ var table = []Entry{
 	// Storage.
 	{
 		Key: "BLOB_PROVIDER", Group: GroupStorage, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "filesystem stores email bodies, attachments and avatars on disk; s3 stores them in any S3-compatible bucket.",
+		Effect:     "filesystem stores email bodies, attachments and avatars on disk; s3 stores them in any S3-compatible bucket; brokered holds no bucket credential and asks this instance to sign each operation, which is what a node off this machine should run.",
 		DocsAnchor: docsStorage,
 		Resolve:    func(*Runtime) string { return config.BlobProvider() },
 	},
@@ -625,7 +700,7 @@ var table = []Entry{
 	},
 	{
 		Key: "CODEC_PROVIDER", Group: GroupEventBus, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "json is required wherever workers run: worker command and result envelopes carry untyped bodies Avro cannot serialize.",
+		Effect:     "json needs nothing; avro resolves every event against SCHEMA_REGISTRY_URL and is only compiled into the -kafka images. Producers and consumers have to agree, so it is changed by draining the bus, not in place.",
 		DocsAnchor: docsEventBus,
 		Resolve:    func(*Runtime) string { return config.CodecProvider() },
 	},
@@ -661,17 +736,52 @@ var table = []Entry{
 	},
 	{
 		Key: "EVENTBUS_HANDLER_TIMEOUT", Group: GroupEventBus, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "How long one consumer handler may run before the message is redelivered.",
+		Effect:     "How long one consumer handler may run before the message is redelivered. Worker commands carry a longer budget of their own.",
 		DocsAnchor: docsEventBus,
 		Resolve:    envValue("EVENTBUS_HANDLER_TIMEOUT"),
 	},
 
 	// Workers.
 	{
+		Key: "NODE_BROKER_PREVIOUS_UNTIL", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "RFC3339 cutoff for previous fleet broker bearer tokens.",
+		DocsAnchor: docsWorkers,
+		Resolve:    envValue("NODE_BROKER_PREVIOUS_UNTIL"),
+	},
+	{
+		Key: "NODE_BROKER_PREVIOUS_TOKENS", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Previous fleet broker bearer tokens as a JSON array, accepted only before the explicit cutoff.",
+		DocsAnchor: docsWorkers,
+		Resolve:    envValue("NODE_BROKER_PREVIOUS_TOKENS"),
+	},
+	{
+		Key: "INTERNAL_API_PREVIOUS_UNTIL", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "RFC3339 cutoff for previous tracking and forms bearer tokens.",
+		DocsAnchor: docsWorkers,
+		Resolve:    envValue("INTERNAL_API_PREVIOUS_UNTIL"),
+	},
+	{
+		Key: "INTERNAL_API_PREVIOUS_TOKENS", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Previous tracking and forms bearer tokens as a JSON array, accepted only before the explicit cutoff.",
+		DocsAnchor: docsWorkers,
+		Resolve:    envValue("INTERNAL_API_PREVIOUS_TOKENS"),
+	},
+	{
 		Key: "INTERNAL_API_TOKEN", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "The shared token on /api/v1/internal. Workers fetch organization keys with it and the tracking service resolves click links with it.",
+		Effect:     "The token on the internal routes the tracking and forms services call. Fleet nodes use it too unless NODE_BROKER_TOKEN is set.",
 		DocsAnchor: docsWorkers,
 		Resolve:    envValue("INTERNAL_API_TOKEN"),
+	},
+	{
+		Key: "NODE_BROKER_TOKEN", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "The token on the internal routes only fleet nodes call (keys, blob signing, sync, heartbeat). Falls back to INTERNAL_API_TOKEN.",
+		DocsAnchor: docsWorkers, WhenUnset: SourceDerived,
+		Resolve: func(*Runtime) string {
+			if v := trimmed("NODE_BROKER_TOKEN"); v != "" {
+				return v
+			}
+			return trimmed("INTERNAL_API_TOKEN")
+		},
 	},
 	{
 		Key: "ENCRYPTED_KEYS_BACKEND_URL", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
@@ -681,7 +791,7 @@ var table = []Entry{
 	},
 	{
 		Key: "ENCRYPTED_KEYS_WORKER_TOKEN", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "The worker's copy of INTERNAL_API_TOKEN. It must match the backend's value exactly.",
+		Effect:     "The worker's copy of the node token (NODE_BROKER_TOKEN, else INTERNAL_API_TOKEN). It must match the backend's value exactly.",
 		DocsAnchor: docsWorkers,
 		Resolve:    envValue("ENCRYPTED_KEYS_WORKER_TOKEN"),
 	},
@@ -692,16 +802,22 @@ var table = []Entry{
 		Resolve:    envValue("WORKER_ID"),
 	},
 	{
-		Key: "WORKER_TIER", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "Which placement tier a worker accepts. Free-trial organizations place onto free workers, paid ones onto premium.",
+		Key: "WARMBLY_NODE_REGION", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Where this node egresses from, as a free-form label. Placement prefers a worker near where a mailbox's provider expects sign-ins; unset scores neutral.",
 		DocsAnchor: docsWorkers,
-		Resolve:    envValue("WORKER_TIER"),
+		Resolve:    envValue("WARMBLY_NODE_REGION"),
 	},
 	{
 		Key: "MAIL_TLS_INSECURE", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "true disables certificate verification on customer mailbox connections.",
+		Effect:     "true disables certificate verification on customer mailbox connections. Honoured on a self-hosted or development instance; hosted production ignores it, and a mailbox there trusts its server in its own settings, which pins the server's certificate.",
 		DocsAnchor: docsWorkers,
-		Resolve:    boolOr("MAIL_TLS_INSECURE", false),
+		Resolve:    func(*Runtime) string { return yesNo(config.MailTLSInsecureAllowed()) },
+	},
+	{
+		Key: "MAIL_ALLOW_PRIVATE_HOSTS", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "false refuses customer mailbox connections to private, loopback and link-local addresses on a self-hosted or development instance. Hosted production always refuses them.",
+		DocsAnchor: docsWorkers,
+		Resolve:    func(*Runtime) string { return yesNo(config.PrivateMailHostsAllowed()) },
 	},
 	{
 		Key: "BOX_GOOGLE_CLIENT_ID", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
@@ -716,6 +832,16 @@ var table = []Entry{
 		Resolve:    envValue("BOX_GOOGLE_CLIENT_SECRET"),
 	},
 	{
+		Key: "BOX_GOOGLE_OAUTH_CONNECT", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "true lets new Gmail mailboxes connect with Google sign-in. Off, the connect dialog walks through an app password over IMAP and SMTP instead; mailboxes already on Google sign-in keep working and can be re-authorized either way.",
+		DocsAnchor: docsWorkers,
+		// Through the config helper, not boolOr: boolOr accepts yes/on and
+		// GoogleOAuthConnect parses with strconv.ParseBool, which does not, so
+		// reading the raw value here would report true on a setting the gate
+		// treats as false.
+		Resolve: func(*Runtime) string { return yesNo(config.GoogleOAuthConnect()) },
+	},
+	{
 		Key: "BOX_OUTLOOK_CLIENT_ID", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
 		Effect:     "Your Microsoft 365 OAuth client for connecting Outlook mailboxes.",
 		DocsAnchor: docsWorkers,
@@ -726,6 +852,30 @@ var table = []Entry{
 		Effect:     "The secret for the Outlook mailbox OAuth client.",
 		DocsAnchor: docsWorkers,
 		Resolve:    envValue("BOX_OUTLOOK_CLIENT_SECRET"),
+	},
+	{
+		Key: "GOOGLE_WORKSPACE_DELEGATION_KEY", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "A Google Cloud service account key (JSON) for connecting whole Google Workspace domains through domain-wide delegation. Unset hides that option.",
+		DocsAnchor: docsWorkers,
+		Resolve:    envValue("GOOGLE_WORKSPACE_DELEGATION_KEY"),
+	},
+	{
+		Key: "GOOGLE_WORKSPACE_DELEGATION_KEY_FILE", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "A path to the same service account key, read when GOOGLE_WORKSPACE_DELEGATION_KEY is unset.",
+		DocsAnchor: docsWorkers,
+		Resolve:    envValue("GOOGLE_WORKSPACE_DELEGATION_KEY_FILE"),
+	},
+	{
+		Key: "MAILHOST_ISPDB", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "true lets mailbox server detection ask Thunderbird's ISPDB about unknown domains, which sends it the domain name. Off by default on a self-host.",
+		DocsAnchor: docsWorkers,
+		Resolve:    func(*Runtime) string { return yesNo(config.MailhostISPDB()) },
+	},
+	{
+		Key: "MAILVENDOR_SANDBOX_URL", Group: GroupWorkers, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Development only: points every inbox vendor client at the sandbox's mock vendor API. Ignored unless APP_ENV is dev.",
+		DocsAnchor: docsWorkers,
+		Resolve:    func(*Runtime) string { return config.MailvendorSandboxURL() },
 	},
 
 	// Tracking.
@@ -765,13 +915,110 @@ var table = []Entry{
 		DocsAnchor: docsAddresses,
 		Resolve:    envOr("TRACKING_RATE_LIMIT_PER_MIN", "300"),
 	},
+	{
+		Key: "TRACKING_SCANNER_BUILTINS", Group: GroupTracking, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Loads the known-scanner network catalogue shipped with Warmbly. Off leaves only the networks you name.",
+		DocsAnchor: docsAddresses,
+		Resolve:    boolOr("TRACKING_SCANNER_BUILTINS", true),
+	},
+	{
+		Key: "TRACKING_SCANNER_NETWORKS", Group: GroupTracking, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Extra scanner sources whose opens and clicks are both recorded as automated.",
+		DocsAnchor: docsAddresses,
+		Resolve:    envValue("TRACKING_SCANNER_NETWORKS"),
+	},
+	{
+		Key: "TRACKING_SCANNER_CLICK_NETWORKS", Group: GroupTracking, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Extra scanner sources judged on clicks only, for networks that also proxy a mail client's image fetches.",
+		DocsAnchor: docsAddresses,
+		Resolve:    envValue("TRACKING_SCANNER_CLICK_NETWORKS"),
+	},
+	{
+		Key: "TRACKING_SCANNER_ASN_HEADER", Group: GroupTracking, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Header a trusted proxy sets with the source ASN. Where it is set it wins over the database below.",
+		DocsAnchor: docsAddresses,
+		Resolve:    envValue("TRACKING_SCANNER_ASN_HEADER"),
+	},
+	{
+		Key: "TRACKING_SCANNER_ASN_DB", Group: GroupTracking, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Path to a GeoLite2-ASN database on the tracking service, which makes asn: entries match with no ASN header and no edge transform rule. It reads the client address, so behind a reverse proxy it still needs TRACKING_TRUSTED_PROXIES. A separate file from GEODB_PATH; missing is tolerated and only costs ASN matching.",
+		DocsAnchor: docsGeoIP,
+		Resolve:    envValue("TRACKING_SCANNER_ASN_DB"),
+	},
+	{
+		Key: "TRACKING_SCANNER_ASN_DB_URL", Group: GroupTracking, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Where the tracking service downloads its GeoLite2-ASN database from. It holds the result in memory, so it needs no writable path and TRACKING_SCANNER_ASN_DB can stay unset.",
+		DocsAnchor: docsGeoIP,
+		Resolve:    envValue("TRACKING_SCANNER_ASN_DB_URL"),
+	},
 
 	// Observability.
 	{
+		Key: "POSTHOG_KEY", Group: GroupObservability, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "PostHog project key. Carries error tracking and product analytics; unset means neither is sent and no host is contacted.",
+		DocsAnchor: docsDeployment,
+		Resolve:    envValue("POSTHOG_KEY"),
+	},
+	{
+		Key: "POSTHOG_HOST", Group: GroupObservability, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Where those events go. Empty means PostHog Cloud US; set it to your own PostHog.",
+		DocsAnchor: docsDeployment,
+		Resolve:    envValue("POSTHOG_HOST"),
+	},
+	{
+		Key: "POSTHOG_ERROR_TRACKING", Group: GroupObservability, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "false keeps the key for product analytics and reports no exceptions to PostHog.",
+		DocsAnchor: docsDeployment,
+		Resolve:    boolOr("POSTHOG_ERROR_TRACKING", true),
+	},
+	{
 		Key: "SENTRY_DSN", Group: GroupObservability, RuntimeChangeable: ChangeBootOnly,
-		Effect:     "Error reporting. Optional in every environment; unset simply logs instead.",
+		Effect:     "Error reporting to Sentry, alongside or instead of PostHog. Optional in every environment; unset simply logs instead.",
 		DocsAnchor: docsDeployment,
 		Resolve:    envValue("SENTRY_DSN"),
+	},
+
+	// Updates.
+	{
+		Key: "UPDATE_CHECK_ENABLED", Group: GroupUpdates, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "Polls GitHub Releases for a newer Warmbly and shows it in the admin panel's top bar and on Setup and health.",
+		DocsAnchor: docsUpdates,
+		Resolve:    boolOr("UPDATE_CHECK_ENABLED", true),
+	},
+	{
+		Key: "UPDATE_CHECK_INTERVAL", Group: GroupUpdates, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "How often the release check runs. Minimum 5m.",
+		DocsAnchor: docsUpdates,
+		Resolve:    envOr("UPDATE_CHECK_INTERVAL", "30m"),
+	},
+	{
+		Key: "UPDATE_CHANNEL", Group: GroupUpdates, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "stable follows releases; dev also offers prereleases.",
+		DocsAnchor: docsUpdates,
+		Resolve:    envOr("UPDATE_CHANNEL", "stable"),
+	},
+	{
+		Key: "RELEASES_GITHUB_REPO", Group: GroupUpdates, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "The owner/repo whose releases count as Warmbly versions. Point a fork's instance at the fork.",
+		DocsAnchor: docsUpdates,
+		Resolve:    envOr("RELEASES_GITHUB_REPO", "warmbly/warmbly"),
+	},
+	{
+		Key: "UPDATER_URL", Group: GroupUpdates, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "The host-side updater that applies an update (pull, rebuild, restart). Unset leaves the panel report-only.",
+		DocsAnchor: docsUpdates,
+		Resolve:    envValue("UPDATER_URL"),
+	},
+	{
+		Key: "UPDATER_TOKEN", Group: GroupUpdates, RuntimeChangeable: ChangeBootOnly,
+		Effect:     "The bearer token the backend presents to the updater. Falls back to INTERNAL_API_TOKEN.",
+		DocsAnchor: docsUpdates, WhenUnset: SourceDerived,
+		Resolve: func(*Runtime) string {
+			if v := trimmed("UPDATER_TOKEN"); v != "" {
+				return v
+			}
+			return trimmed("INTERNAL_API_TOKEN")
+		},
 	},
 }
 

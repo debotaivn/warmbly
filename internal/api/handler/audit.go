@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/api/middleware"
+	"github.com/warmbly/warmbly/internal/app/advisor"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/utils/paging"
@@ -26,11 +27,33 @@ func (h *Handler) auditOrg(c *gin.Context, action models.AuditAction, entityType
 	if orgID == nil {
 		return
 	}
+	h.auditInOrg(c, *orgID, action, entityType, entityID, changes, metadata)
+}
+
+// auditInOrg is auditOrg for an entity whose organization is not the session's.
+func (h *Handler) auditInOrg(c *gin.Context, orgID uuid.UUID, action models.AuditAction, entityType models.AuditEntityType, entityID *uuid.UUID, changes, metadata map[string]string) {
 	actorID, err := middleware.GetUserUUID(c)
 	if err != nil {
 		return
 	}
-	h.AuditService.LogAction(c.Request.Context(), *orgID, actorID, action, entityType, entityID, c.ClientIP(), c.Request.UserAgent(), changes, metadata)
+	h.AuditService.LogAction(c.Request.Context(), orgID, actorID, action, entityType, entityID, c.ClientIP(), c.Request.UserAgent(), changes, metadata)
+	h.refreshAdvisorAfter(orgID, entityType)
+}
+
+// Campaign and step edits refresh findings; concurrent refreshes coalesce per org.
+func (h *Handler) refreshAdvisorAfter(orgID uuid.UUID, entityType models.AuditEntityType) {
+	switch entityType {
+	case models.AuditEntityEmailAccount, models.AuditEntityCampaign, models.AuditEntitySequence:
+		h.refreshAdvisorNow(orgID)
+	}
+}
+
+// refreshAdvisorNow requests a background evaluation of the organization's current state.
+func (h *Handler) refreshAdvisorNow(orgID uuid.UUID) {
+	if h.AdvisorService == nil {
+		return
+	}
+	advisor.RefreshNow(h.AdvisorService, orgID, "change")
 }
 
 // GetAuditLogs returns the organization-wide activity trail for the caller's
@@ -180,7 +203,7 @@ func (h *Handler) UpdateUserRateLimits(c *gin.Context) {
 
 	var data models.UpdateUserRateLimits
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.New(errx.BadRequest, "Invalid request body"))
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 

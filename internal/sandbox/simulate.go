@@ -36,6 +36,9 @@ type simulator struct {
 type hostedMailbox struct {
 	Email string
 	Name  string
+	// Seed and Host mark a placement seed inbox and who it stands in for.
+	Seed bool
+	Host string
 }
 
 type contactInfo struct {
@@ -97,13 +100,13 @@ func Simulate(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 // accounts, which the seeder pointed at the local stack) and seeded contacts.
 func (s *simulator) refreshDirectory(ctx context.Context) error {
 	hosted := map[string]hostedMailbox{}
-	rows, err := s.pool.Query(ctx, `SELECT email, name FROM email_accounts WHERE provider = 'smtp_imap'`)
+	rows, err := s.pool.Query(ctx, `SELECT email, name, seed_scope IS NOT NULL, mail_host FROM email_accounts WHERE provider = 'smtp_imap'`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		var m hostedMailbox
-		if err := rows.Scan(&m.Email, &m.Name); err != nil {
+		if err := rows.Scan(&m.Email, &m.Name, &m.Seed, &m.Host); err != nil {
 			rows.Close()
 			return err
 		}
@@ -186,17 +189,28 @@ func (s *simulator) handleMessage(ctx context.Context, summary mailpitSummary) e
 		// Hosted recipient (another sandbox/warmup mailbox): final delivery
 		// into its dovecot INBOX; the worker's real IMAP sync takes it from
 		// there (warmup token verification, unibox, engagement actions).
-		if _, ok := hosted[addr]; ok {
-			if err := deliverToInbox(s.cfg.IMAPAddr, addr, s.cfg.IMAPPassword, raw); err != nil {
+		if m, ok := hosted[addr]; ok {
+			// A seed inbox stands in for a real provider, so something has to
+			// play that provider's spam filter.
+			folder := "INBOX"
+			if m.Seed {
+				folder = seedFolder(m.Host, detail)
+			}
+			if err := deliverToFolder(s.cfg.IMAPAddr, addr, s.cfg.IMAPPassword, folder, raw); err != nil {
 				return fmt.Errorf("deliver to %s: %w", addr, err)
 			}
-			fmt.Printf("delivered  %-34s %q\n", addr, detail.Subject)
+			fmt.Printf("delivered  %-34s %q (%s)\n", addr, detail.Subject, folder)
 			continue
 		}
 
 		// Contact recipient: play the human.
 		if c, ok := contacts[addr]; ok {
-			sender, senderHosted := hosted[strings.ToLower(detail.From.Address)]
+			// A mail client answers the Reply-To when the message has one.
+			answer := detail.From.Address
+			if len(detail.ReplyTo) > 0 {
+				answer = detail.ReplyTo[0].Address
+			}
+			sender, senderHosted := hosted[strings.ToLower(answer)]
 			go s.actAsContact(ctx, c, detail, sender, senderHosted)
 		}
 	}
@@ -212,9 +226,25 @@ func (s *simulator) actAsContact(ctx context.Context, c contactInfo, msg *mailpi
 		body = msg.Text
 	}
 
+	// A security gateway scans the message at delivery: pixel plus every
+	// link, one after another, before anyone could have read it. The
+	// consumer must label these as machine and never count them as clicks.
+	if p.Scanned {
+		s.sleep(ctx, 500*time.Millisecond, 2*time.Second)
+		if task := firstMatch(pixelRe, body); task != "" {
+			s.hitTracking(ctx, "/t/o/"+task+".png", c.Email)
+		}
+		for _, ticket := range allMatches(clickRe, body) {
+			s.hitTracking(ctx, "/c/"+ticket, c.Email)
+		}
+		fmt.Printf("scanned    %-34s %q\n", c.Email, msg.Subject)
+	}
+
 	if p.Opens {
 		if task := firstMatch(pixelRe, body); task != "" {
-			s.sleep(ctx, 5*time.Second, 40*time.Second)
+			// Never inside the machine window: a person needs the message
+			// delivered, noticed and opened first.
+			s.sleep(ctx, 15*time.Second, 40*time.Second)
 			s.hitTracking(ctx, "/t/o/"+task+".png", c.Email)
 			fmt.Printf("opened     %-34s %q\n", c.Email, msg.Subject)
 		}
@@ -273,4 +303,18 @@ func firstMatch(re *regexp.Regexp, body string) string {
 		return ""
 	}
 	return m[1]
+}
+
+// allMatches returns every distinct first capture group, in document order.
+func allMatches(re *regexp.Regexp, body string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
+		if len(m) < 2 || seen[m[1]] {
+			continue
+		}
+		seen[m[1]] = true
+		out = append(out, m[1])
+	}
+	return out
 }

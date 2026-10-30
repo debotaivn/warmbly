@@ -18,6 +18,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/aiagent"
 	"github.com/warmbly/warmbly/internal/app/aitools"
 	"github.com/warmbly/warmbly/internal/errx"
+	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/utils/paging"
 )
 
@@ -36,13 +37,18 @@ func (h *Handler) jwtInvocation(c *gin.Context) (aitools.Invocation, *errx.Error
 	if xerr != nil || member == nil {
 		return aitools.Invocation{}, errx.New(errx.Forbidden, "not a member of this organization")
 	}
+	perms := member.Permissions
+	if member.IsOwner() {
+		perms = models.AllPermissions
+	}
 	return aitools.Invocation{
-		OrgID:     *orgID,
-		UserID:    userID,
-		OrgPerms:  member.Permissions,
-		IsAPIKey:  false,
-		IP:        c.ClientIP(),
-		UserAgent: c.Request.UserAgent(),
+		OrgID:       *orgID,
+		UserID:      userID,
+		OrgPerms:    perms,
+		IsAPIKey:    false,
+		FreshAuthed: middleware.SessionFresh(c),
+		IP:          c.ClientIP(),
+		UserAgent:   c.Request.UserAgent(),
 	}, nil
 }
 
@@ -131,7 +137,7 @@ func (h *Handler) AgentSessionMessages(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.NotFound, "session not found"))
 		return
 	}
-	turns, terr := h.AIAgentService.Transcript(c.Request.Context(), inv.OrgID, inv.UserID, sessionID)
+	turns, pending, terr := h.AIAgentService.Transcript(c.Request.Context(), inv, sessionID)
 	if terr != nil {
 		errx.JSON(c, terr)
 		return
@@ -139,7 +145,7 @@ func (h *Handler) AgentSessionMessages(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"title":      sess.Title,
 		"turns":      turns,
-		"pending":    sess.Context.Pending,
+		"pending":    pending,
 		"free_model": sess.Context.FreeModel,
 	})
 }
@@ -211,14 +217,14 @@ func (h *Handler) AgentMessage(c *gin.Context) {
 		Resource  string `json:"resource"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 	if req.MessageID == "" {
 		req.MessageID = uuid.NewString()
 	}
 
-	emit := sseEmitter(c)
+	emit := sseEmitter[aiagent.StreamEvent](c)
 	if serr := h.AIAgentService.RunMessage(c.Request.Context(), inv, sessionID, req.MessageID, req.Text, req.Page, req.Resource, emit); serr != nil {
 		emit(aiagent.StreamEvent{Type: "error", Code: string(codeIdentifier(serr)), Message: serr.Message})
 	}
@@ -241,10 +247,11 @@ func (h *Handler) AgentApprove(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Decision string `json:"decision"` // approve | deny | always_allow
+		Decision   string `json:"decision"` // approve | deny | always_allow
+		ToolCallID string `json:"tool_call_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.New(errx.BadRequest, "invalid request body"))
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 	switch req.Decision {
@@ -253,19 +260,60 @@ func (h *Handler) AgentApprove(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.BadRequest, "decision must be approve, deny, or always_allow"))
 		return
 	}
+	if req.ToolCallID == "" {
+		errx.JSON(c, errx.New(errx.BadRequest, "tool_call_id is required"))
+		return
+	}
 
-	emit := sseEmitter(c)
-	if serr := h.AIAgentService.Resume(c.Request.Context(), inv, sessionID, req.Decision, emit); serr != nil {
+	emit := sseEmitter[aiagent.StreamEvent](c)
+	if serr := h.AIAgentService.Resume(c.Request.Context(), inv, sessionID, req.ToolCallID, req.Decision, emit); serr != nil {
 		emit(aiagent.StreamEvent{Type: "error", Code: string(codeIdentifier(serr)), Message: serr.Message})
 	}
 }
 
+// ListAIToolPolicies — GET /ai/tool-policies lists the tools the assistant runs without asking.
+func (h *Handler) ListAIToolPolicies(c *gin.Context) {
+	if h.AIAgentService == nil {
+		errx.JSON(c, errx.New(errx.ServiceUnavailable, "the AI assistant is not configured"))
+		return
+	}
+	inv, xerr := h.jwtInvocation(c)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	policies, lerr := h.AIAgentService.ListToolPolicies(c.Request.Context(), inv.OrgID)
+	if lerr != nil {
+		errx.JSON(c, lerr)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": policies})
+}
+
+// RevokeAIToolPolicy — DELETE /ai/tool-policies/:tool makes the tool ask again.
+func (h *Handler) RevokeAIToolPolicy(c *gin.Context) {
+	if h.AIAgentService == nil {
+		errx.JSON(c, errx.New(errx.ServiceUnavailable, "the AI assistant is not configured"))
+		return
+	}
+	inv, xerr := h.jwtInvocation(c)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	if rerr := h.AIAgentService.RevokeToolPolicy(c.Request.Context(), inv, c.Param("tool")); rerr != nil {
+		errx.JSON(c, rerr)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "policy revoked"})
+}
+
 // sseEmitter prepares the response for Server-Sent Events and returns a
 // flush-per-event emitter. Safe to call once per request.
-func sseEmitter(c *gin.Context) func(aiagent.StreamEvent) {
+func sseEmitter[T any](c *gin.Context) func(T) {
 	h := c.Writer.Header()
 	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", "no-cache, no-store")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no") // disable proxy buffering so deltas flush
 	c.Writer.WriteHeader(http.StatusOK)
@@ -273,7 +321,7 @@ func sseEmitter(c *gin.Context) func(aiagent.StreamEvent) {
 	if flusher != nil {
 		flusher.Flush()
 	}
-	return func(ev aiagent.StreamEvent) {
+	return func(ev T) {
 		b, err := json.Marshal(ev)
 		if err != nil {
 			return
@@ -297,6 +345,11 @@ func codeIdentifier(e *errx.Error) string {
 		return "forbidden"
 	case errx.ServiceUnavailable:
 		return "service_unavailable"
+	case errx.Conflict:
+		if e.Identifier != "" {
+			return e.Identifier
+		}
+		return "conflict"
 	default:
 		return "error"
 	}

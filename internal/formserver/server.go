@@ -14,19 +14,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/warmbly/warmbly/internal/api/middleware"
+	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/formwire"
 )
 
 // formMaxSubmitBytes caps a public submit body; the largest legitimate form
 // is dozens of short answers.
 const formMaxSubmitBytes = 64 << 10
+
+// formNotFoundMessage answers a form that does not exist or is not published.
+const formNotFoundMessage = "This form does not exist or is not published."
 
 const (
 	submitWindow       = 10 * time.Minute
@@ -45,6 +52,22 @@ type Config struct {
 	// endpoints, the service's only dependency.
 	BackendURL    string
 	InternalToken string
+	// BrowserPostHogKey and BrowserPostHogHost are stamped into the page shell
+	// so the form app can report pageviews, web vitals and browser errors to
+	// PostHog. An empty key, which is the default, means the app never loads
+	// the SDK. BrowserPostHogErrorTracking false keeps the analytics and
+	// reports no exceptions.
+	BrowserPostHogKey           string
+	BrowserPostHogHost          string
+	BrowserPostHogErrorTracking bool
+	// BrowserSentryDSN is the same for an operator who reports to Sentry
+	// instead. Either backend, both, or neither.
+	BrowserSentryDSN string
+	// Release tags those browser events with the build serving them.
+	Release string
+	// Environment is the deployment label those events carry, so staging and
+	// production form pages are separable in one project.
+	Environment string
 	// StaticDir is the built forms app (forms/dist): index.html is the page
 	// shell, assets/ the hashed bundles.
 	StaticDir string
@@ -54,6 +77,7 @@ type Config struct {
 }
 
 type Server struct {
+	redirects *redirects
 	client    *backendClient
 	views     *ttlSet
 	limits    *ipLimiter
@@ -77,12 +101,25 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("formserver: cannot read %s/index.html (run `pnpm build` in forms/): %w", cfg.StaticDir, err)
 	}
+	// The browser credentials and the release are the same for every request,
+	// so they are stamped once here rather than per shell serve. Left empty the
+	// placeholders stay empty and the page loads no reporting SDK at all.
+	shell = stampMeta(shell, "wf-posthog-key", cfg.BrowserPostHogKey)
+	shell = stampMeta(shell, "wf-posthog-host", cfg.BrowserPostHogHost)
+	if !cfg.BrowserPostHogErrorTracking {
+		shell = stampMeta(shell, "wf-posthog-errors", "false")
+	}
+	shell = stampMeta(shell, "wf-sentry-dsn", cfg.BrowserSentryDSN)
+	shell = stampMeta(shell, "wf-release", cfg.Release)
+	shell = stampMeta(shell, "wf-environment", cfg.Environment)
 	limit := cfg.SubmitLimit
 	if limit <= 0 {
 		limit = submitDefaultLimit
 	}
+	client := newBackendClient(strings.TrimRight(cfg.BackendURL, "/"), cfg.InternalToken)
 	return &Server{
-		client:    newBackendClient(strings.TrimRight(cfg.BackendURL, "/"), cfg.InternalToken),
+		redirects: newRedirects(client),
+		client:    client,
 		views:     newTTLSet(viewDedupeTTL),
 		limits:    newIPLimiter(limit, submitWindow),
 		events:    newIPLimiter(eventWindowLimit, submitWindow),
@@ -93,7 +130,20 @@ func New(cfg Config) (*Server, error) {
 }
 
 func (s *Server) Router(trustedProxies []string) (*gin.Engine, error) {
-	r := gin.Default()
+	// Not gin.Default(): its logger prints the full request URI, and the form
+	// page carries the per-contact prefill ticket as ?t=<uuid>. That ticket
+	// discloses the contact's name, address, company and phone to whoever
+	// holds it, so it must not be written to an access log.
+	//
+	// Release mode too, unless the operator asked for otherwise: this is an
+	// internet-facing service, and debug mode prints the route table and a
+	// warning banner on every start.
+	if env := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))); os.Getenv("GIN_MODE") == "" &&
+		env != "" && env != "dev" && env != "development" && env != "local" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	r := gin.New()
+	r.Use(middleware.ForwardedHeaders(), middleware.RequestLogger(), gin.Recovery(), middleware.PageHeaders(formsHost()))
 	// Same posture as the backend: trust no proxy unless the operator names
 	// it, so a forged X-Forwarded-For cannot dodge the submit limiter.
 	if len(trustedProxies) > 0 {
@@ -103,9 +153,21 @@ func (s *Server) Router(trustedProxies []string) (*gin.Engine, error) {
 	} else if err := r.SetTrustedProxies(nil); err != nil {
 		return nil, err
 	}
+	r.Use(s.domainRedirect)
 	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.GET("/", rootPage)
 	r.GET("/forms.js", s.ServeFormsEmbedJS)
 	r.GET("/f/:publicID", s.ServeFormShell)
+
+	// A scripted caller under /api expects JSON; a human anywhere else gets the
+	// page.
+	r.NoRoute(func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			abortJSON(c, http.StatusNotFound, "not_found", "No forms API route matches this path.")
+			return
+		}
+		notFoundPage(c)
+	})
 
 	// Hashed filenames, so the bundles are immutable by construction.
 	assets := r.Group("/assets", func(c *gin.Context) {
@@ -115,11 +177,29 @@ func (s *Server) Router(trustedProxies []string) (*gin.Engine, error) {
 
 	// Every JSON call needs the render token minted with the page shell, so
 	// scripted clients that never load the page get nothing.
-	api := r.Group("/api", s.requireRenderToken)
+	api := r.Group("/api", singleValued, s.requireRenderToken)
 	api.GET("/forms/:publicID", s.GetPublicForm)
 	api.POST("/forms/:publicID/submit", s.SubmitForm)
 	api.POST("/forms/:publicID/events", s.RecordFormEvent)
 	return r, nil
+}
+
+// singleValued refuses a repeated query parameter or render token; no forms route reads a list.
+func singleValued(c *gin.Context) {
+	if name, dup := middleware.DuplicateQueryParam(c.Request.URL.RawQuery, nil); dup {
+		abortJSON(c, http.StatusBadRequest, "duplicate_query_parameter", middleware.DuplicateMessage("query parameter", name))
+		return
+	}
+	if len(c.Request.Header.Values("X-Warmbly-Render")) > 1 {
+		abortJSON(c, http.StatusBadRequest, "duplicate_header", middleware.DuplicateMessage("header", "X-Warmbly-Render"))
+		return
+	}
+	c.Next()
+}
+
+// abortJSON answers with the same {error, message, code} shape as the API.
+func abortJSON(c *gin.Context, status int, code, message string) {
+	c.AbortWithStatusJSON(status, gin.H{"error": code, "message": message, "code": code})
 }
 
 // requireRenderToken rejects API calls whose X-Warmbly-Render token is
@@ -128,7 +208,7 @@ func (s *Server) Router(trustedProxies []string) (*gin.Engine, error) {
 func (s *Server) requireRenderToken(c *gin.Context) {
 	token := c.GetHeader("X-Warmbly-Render")
 	if token == "" || !verifyRenderToken(s.renderKey, c.Param("publicID"), token, time.Now()) {
-		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "stale_page"})
+		abortJSON(c, http.StatusForbidden, "stale_page", "This page has been open too long. Reload it and try again.")
 		return
 	}
 	c.Next()
@@ -140,12 +220,23 @@ func (s *Server) fetchForm(c *gin.Context) (*formwire.PublicForm, error) {
 	if publicID == "" || len(publicID) > 64 {
 		return nil, errFormNotFound
 	}
-	return s.client.Form(c.Request.Context(), publicID)
+	return s.client.Form(c.Request.Context(), publicID, requestHost(c.Request.Host))
 }
 
 // wfTokenPlaceholder is the meta tag forms/index.html ships; the shell serve
 // stamps the real render token into it.
 const wfTokenPlaceholder = `<meta name="wf-token" content="" />`
+
+// stampMeta fills in one of the empty meta tags forms/index.html ships. An
+// empty value is left alone, and so is a shell built before the tag existed.
+func stampMeta(shell []byte, name, value string) []byte {
+	if value == "" {
+		return shell
+	}
+	placeholder := []byte(`<meta name="` + name + `" content="" />`)
+	stamped := []byte(`<meta name="` + name + `" content="` + html.EscapeString(value) + `" />`)
+	return bytes.Replace(shell, placeholder, stamped, 1)
+}
 
 // ServeFormShell serves the app shell for a published form. Public and
 // unauthenticated: the unguessable public id is the capability. The form is
@@ -194,16 +285,16 @@ func (s *Server) GetPublicForm(c *gin.Context) {
 	var f *formwire.PublicForm
 	var err error
 	if token := c.Query("t"); token != "" && len(token) <= 64 {
-		f, err = s.client.FormWithToken(c.Request.Context(), c.Param("publicID"), token)
+		f, err = s.client.FormWithToken(c.Request.Context(), c.Param("publicID"), token, requestHost(c.Request.Host))
 	} else {
 		f, err = s.fetchForm(c)
 	}
 	if errors.Is(err, errFormNotFound) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+		abortJSON(c, http.StatusNotFound, "not_found", formNotFoundMessage)
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unavailable"})
+		abortJSON(c, http.StatusServiceUnavailable, "unavailable", "This form is temporarily unavailable. Try again in a few minutes.")
 		return
 	}
 	c.Header("Cache-Control", "no-store")
@@ -271,6 +362,7 @@ func (s *Server) RecordFormEvent(c *gin.Context) {
 		LinkToken:  truncateStr(body.LinkToken, 64),
 		RemoteIP:   ip,
 		UserAgent:  truncateStr(c.GetHeader("User-Agent"), 512),
+		Host:       requestHost(c.Request.Host),
 	})
 	c.Status(http.StatusNoContent)
 }
@@ -299,7 +391,7 @@ type submitBody struct {
 // Same-origin with the app, so there is no CORS surface.
 func (s *Server) SubmitForm(c *gin.Context) {
 	fail := func(status int, msg string) {
-		c.JSON(status, gin.H{"error": "form_submit_failed", "message": msg})
+		c.JSON(status, gin.H{"error": "form_submit_failed", "message": msg, "code": "form_submit_failed"})
 	}
 
 	if ip := c.ClientIP(); ip != "" && !s.limits.Allow(ip) {
@@ -341,6 +433,7 @@ func (s *Server) SubmitForm(c *gin.Context) {
 		RenderedAt:     body.WT,
 		LinkToken:      truncateStr(body.LinkToken, 64),
 		VisitorKey:     truncateStr(body.VisitorKey, 64),
+		Host:           requestHost(c.Request.Host),
 	}
 
 	out, err := s.client.Submit(c.Request.Context(), c.Param("publicID"), req)
@@ -350,7 +443,7 @@ func (s *Server) SubmitForm(c *gin.Context) {
 	}
 	switch {
 	case out.NotFound:
-		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+		abortJSON(c, http.StatusNotFound, "not_found", formNotFoundMessage)
 		return
 	case out.Rejected != "":
 		fail(http.StatusBadRequest, out.Rejected)
@@ -364,4 +457,13 @@ func (s *Server) SubmitForm(c *gin.Context) {
 func (s *Server) ServeFormsEmbedJS(c *gin.Context) {
 	c.Header("Cache-Control", "public, max-age=3600")
 	c.Data(http.StatusOK, "application/javascript; charset=utf-8", formsEmbedJS)
+}
+
+// formsHost is the hostname of FORMS_DOMAIN, the one host the forms service sends HSTS for.
+func formsHost() string {
+	u, err := url.Parse(config.FormsBaseURL())
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }

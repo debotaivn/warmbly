@@ -14,6 +14,12 @@ type ContactCampaignState struct {
 	CampaignStatus string    `json:"campaign_status"`
 	// LeadStatus follows ContactCampaignProgress.Status exactly.
 	LeadStatus string `json:"lead_status"`
+
+	// SenderID / SenderEmail are the mailbox this lead's whole sequence sends
+	// from, fixed when its first email went out. Empty until then: rotation
+	// picks it for the first step and every follow-up follows.
+	SenderID    *uuid.UUID `json:"sender_id,omitempty"`
+	SenderEmail string     `json:"sender_email,omitempty"`
 	// FailureReason is the worker's reason for the last failed send.
 	FailureReason string `json:"failure_reason,omitempty"`
 
@@ -25,6 +31,14 @@ type ContactCampaignState struct {
 	CurrentStep  *ContactCampaignStep `json:"current_step,omitempty"`
 	LastAction   string               `json:"last_action,omitempty"`
 	LastActionAt *time.Time           `json:"last_action_at,omitempty"`
+
+	// Hold is the per-lead pause, present only while it is live: an
+	// out-of-office auto-reply parked the contact, or a member paused them by
+	// hand. The drawer renders it with "resume now" and "stop" next to it.
+	Hold *LeadHold `json:"hold,omitempty"`
+
+	// CC is the contacts copied on every email to this lead in this campaign.
+	CC []CampaignLeadCC `json:"cc"`
 
 	// Next is nil once the flow has ended for the contact; EndedReason says why.
 	Next        *ContactNextAction `json:"next,omitempty"`
@@ -51,7 +65,7 @@ type ContactCampaignStep struct {
 }
 
 // ContactNextActionState says how firm the next action's timing is; only
-// "due" carries a slot.
+// "due" carries the campaign's next wakeup.
 type ContactNextActionState string
 
 const (
@@ -70,8 +84,11 @@ type ContactNextAction struct {
 	Subject   string     `json:"subject,omitempty"`
 
 	State ContactNextActionState `json:"state"`
-	// ScheduledAt is set only when due; NotBefore is the earliest the hard
-	// constraints allow; Constraint names the gate in user-facing words.
+	// ScheduledAt is set only when due, and is then when the campaign's chain
+	// next wakes up and works its queue — a stored wakeup, so it reads the same
+	// on every refresh instead of a freshly paced slot that walked forward
+	// every time the drawer polled (issue #437). NotBefore is the earliest the
+	// hard constraints allow; Constraint names the gate in user-facing words.
 	ScheduledAt *time.Time `json:"scheduled_at,omitempty"`
 	NotBefore   *time.Time `json:"not_before,omitempty"`
 	Constraint  string     `json:"constraint,omitempty"`

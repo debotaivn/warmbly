@@ -2,7 +2,10 @@ package scheduler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,6 +49,17 @@ func (s *schedulerService) CalculateNextCampaignTime(ctx context.Context, campai
 		return time.Time{}, nil, uuid.Nil, ErrNoEmailAccounts
 	}
 
+	// STEP 2.5: What the pool can do this pass, resolved once. `paced` is the
+	// mailboxes that are simply busy right now (today's budget spent, hours
+	// closed); routing holds back the leads already bound to one so the rest of
+	// the campaign keeps sending, instead of parking every lead behind the
+	// first one whose mailbox is full.
+	pass := s.newCampaignPass(ctx, campaign, accounts)
+	if err := s.prefillPool(ctx, pass, accounts); err != nil {
+		return time.Time{}, nil, uuid.Nil, err
+	}
+	paced := s.pacedSenders(ctx, pass, accounts)
+
 	// STEP 3: Get campaign progress - find next contact/sequence to send.
 	// Honor the new-lead-per-day cap and the prioritize-new-leads ordering.
 	orderField := ""
@@ -62,7 +76,10 @@ func (s *schedulerService) CalculateNextCampaignTime(ctx context.Context, campai
 			excludeNewLeads = true
 		}
 	}
-	nextPair, recheckAt, err := s.campaignProgressRepo.FindNextRoutedPair(
+	// The due leads this pass may try, in routing order. More than one, because
+	// placement can refuse a lead for a reason that is that lead's alone while
+	// the lead behind them is sendable this second (issue #437).
+	candidates, recheckAt, senderWait, err := s.campaignProgressRepo.FindRoutedPairs(
 		ctx,
 		campaignID,
 		campaign.ContactOrderBy,
@@ -70,25 +87,31 @@ func (s *schedulerService) CalculateNextCampaignTime(ctx context.Context, campai
 		orderField,
 		campaign.PrioritizeNewLeads,
 		excludeNewLeads,
+		paced,
+		config.CampaignPlacementCandidates,
 	)
 	if err != nil {
 		return time.Time{}, nil, uuid.Nil, err
 	}
 
-	if nextPair == nil {
+	if len(candidates) == 0 {
 		// When the new-lead cap is active and only new-lead pairs remain,
-		// FindNextRoutedPair returns nil with exclude on but WOULD return a pair
-		// without it. In that case defer to the next day so follow-ups keep
+		// FindRoutedPairs returns nothing with exclude on but WOULD return a
+		// pair without it. In that case defer to the next day so follow-ups keep
 		// progressing and new leads resume tomorrow — do NOT complete.
 		if excludeNewLeads {
-			if again, _, aerr := s.campaignProgressRepo.FindNextRoutedPair(
+			again, againDue, againSenderWait, aerr := s.campaignProgressRepo.FindRoutedPairs(
 				ctx, campaignID, campaign.ContactOrderBy, campaign.ContactOrderDir, orderField,
-				campaign.PrioritizeNewLeads, false,
-			); aerr == nil && again != nil {
+				campaign.PrioritizeNewLeads, false, paced, 1,
+			)
+			switch {
+			case aerr != nil:
+				// Fall through to the ordinary wait/complete decision below.
+			case len(again) > 0:
 				s.logCampaignDecision(ctx, campaignID, "new_lead_cap_reached",
 					"Daily new-lead cap reached; deferring remaining new leads to tomorrow",
 					map[string]interface{}{"max_new_leads_per_day": campaign.MaxNewLeadsPerDay})
-				deferTime := s.deferToNextDay(campaign)
+				deferTime := s.deferToNextDay(campaign, false)
 				// A follow-up that comes due before tomorrow must not wait for
 				// the new-lead cap to reset.
 				if recheckAt != nil && recheckAt.Before(deferTime) {
@@ -98,6 +121,13 @@ func (s *schedulerService) CalculateNextCampaignTime(ctx context.Context, campai
 				// err for deferrals, so a nil-error here would send a new lead and
 				// blow past the cap. nil pair + sentinel = reschedule, don't send.
 				return deferTime, nil, accounts[0].ID, ErrCampaignDeferred
+			case againDue != nil && (recheckAt == nil || againDue.Before(*recheckAt)):
+				// The excluded pass skips new leads BEFORE routing them, so a new
+				// lead still inside the campaign's entry delay contributes no
+				// re-check time to `recheckAt`. Take the unexcluded pass's, or a
+				// campaign whose only remaining leads are delayed ones completes
+				// while they are still waiting to be sent.
+				recheckAt, senderWait = againDue, againSenderWait
 			}
 		}
 		// Nothing is due yet: every remaining contact is inside a step's wait
@@ -105,22 +135,86 @@ func (s *schedulerService) CalculateNextCampaignTime(ctx context.Context, campai
 		// and re-check exactly when the soonest one elapses, instead of
 		// marking the campaign complete.
 		if recheckAt != nil {
-			s.logCampaignDecision(ctx, campaignID, "awaiting_next_step",
-				"No step is due yet; re-checking when the next wait elapses",
-				map[string]interface{}{"recheck_at": recheckAt.UTC().Format(time.RFC3339)})
+			// Once per day, not once per pass: a deferred chain re-finds this
+			// every ~15 minutes, and a campaign holding its first emails for two
+			// days would otherwise write two hundred identical activity lines.
+			message := "No step is due yet; re-checking when the next wait elapses"
+			metadata := map[string]interface{}{"recheck_at": recheckAt.UTC().Format(time.RFC3339)}
+			if senderWait {
+				// The steps ARE due; their mailboxes are not free. Say that,
+				// rather than blaming a wait nobody configured.
+				message = "Every lead that is due is waiting for its own mailbox: each contact keeps the address they first heard from, and those mailboxes have nothing left for now"
+				metadata["waiting_on_sender"] = true
+			}
+			if !senderWait && campaign.EntryDelayMinutes > 0 {
+				message += fmt.Sprintf(" (this campaign holds the first email for %s after a contact enters it)",
+					humanizeMinutes(campaign.EntryDelayMinutes))
+				metadata["entry_delay_minutes"] = campaign.EntryDelayMinutes
+			}
+			s.logCampaignDecisionOnce(ctx, campaignID, "awaiting_next_step", message, metadata)
 			return *recheckAt, nil, accounts[0].ID, ErrCampaignDeferred
 		}
 		return time.Time{}, nil, uuid.Nil, ErrCampaignCompleted
 	}
 
-	// Branch routing is resolved inside FindNextRoutedPair: the chosen step is the
+	// Branch routing is resolved inside FindRoutedPairs: the chosen step is the
 	// route out of the contact's last-sent step — conditional branches first
 	// (first match wins, evaluated against opened/clicked/replied), then the
 	// explicit "else" catch-all, then linear position+1 only when a step defines
 	// no branches. A step is sent only if the flow reaches it; STOP/end and
 	// already-sent loops drop the contact in the finder. Conditions are evaluated
 	// at schedule time (a known, accepted race vs. last-moment engagement).
-	return s.placeCampaignSend(ctx, campaign, accounts, senderMetaByID, nextPair, false)
+	//
+	// Place the due leads in order and send the first one the pool can take. A
+	// refusal that is about THIS lead (ErrLeadDeferred: ESP-strict has no
+	// mailbox for their provider, their own mailbox is busy, their preferred
+	// hours are hours away) moves to the lead behind them; anything else is the
+	// pool's answer for every lead and ends the pass immediately. Only when
+	// every candidate is refused does the campaign defer, at the soonest of
+	// their slots.
+	var leadSlot time.Time
+	leadAccount := accounts[0].ID
+	busy := 0
+	for i := range candidates {
+		at, sendable, accountID, perr := s.placeCampaignSend(ctx, campaign, accounts, senderMetaByID, &candidates[i], pass, false)
+		if !errors.Is(perr, ErrLeadDeferred) {
+			return at, sendable, accountID, perr
+		}
+		if errors.Is(perr, ErrSenderBusy) {
+			busy++
+		}
+		if leadSlot.IsZero() || (!at.IsZero() && at.Before(leadSlot)) {
+			leadSlot, leadAccount = at, accountID
+		}
+	}
+	// Every due lead was refused for its own reason. Re-check on the deferral
+	// horizon rather than completing: the leads are still there, and what
+	// refuses them (a mailbox under budget again, a recipient's morning) comes
+	// back from outside this chain. Said once a day, so a campaign waiting on
+	// its leads is not a campaign that looks stalled for no reason.
+	s.logCampaignDecisionOnce(ctx, campaignID, "leads_waiting",
+		fmt.Sprintf("None of the %d leads due now can be sent this minute: each is waiting for its own mailbox, a same-provider mailbox or its recipient's working hours", len(candidates)),
+		map[string]interface{}{"leads_tried": len(candidates), "waiting_on_sender": busy, "recheck_at": leadSlot.UTC().Format(time.RFC3339)})
+	return leadSlot, nil, leadAccount, ErrCampaignDeferred
+}
+
+// humanizeMinutes renders a delay as the largest whole unit it divides into
+// ("2 days", "4 hours", "90 minutes") for the campaign activity feed.
+func humanizeMinutes(minutes int) string {
+	unit := func(n int, name string) string {
+		if n == 1 {
+			return "1 " + name
+		}
+		return fmt.Sprintf("%d %ss", n, name)
+	}
+	switch {
+	case minutes%(24*60) == 0:
+		return unit(minutes/(24*60), "day")
+	case minutes%60 == 0:
+		return unit(minutes/60, "hour")
+	default:
+		return unit(minutes, "minute")
+	}
 }
 
 // senderMeta is a mailbox's campaign_senders rotation metadata.
@@ -131,33 +225,16 @@ type senderMeta struct {
 	hasMeta          bool
 }
 
-// campaignSenders resolves the campaign's sending mailboxes. Explicit strategy
-// uses the campaign_senders pool (carrying per-sender rotation metadata); tags
-// strategy keeps the existing tag-based resolution. An empty explicit pool
-// falls back to tags so a misconfigured campaign still sends.
+// campaignSenders resolves the campaign's sending mailboxes through the shared
+// resolver (explicit pool united with tags, "all" when neither is selected),
+// keeping the explicit pool's rotation metadata for the rotation modes.
 func (s *schedulerService) campaignSenders(ctx context.Context, campaign *models.Campaign) ([]models.Email, map[uuid.UUID]senderMeta, error) {
-	campaignID := campaign.ID
-	accounts := []models.Email{}
-	senderMetaByID := map[uuid.UUID]senderMeta{}
-	seen := map[uuid.UUID]bool{}
-	// UNION of the explicit campaign_senders pool and the tag-resolved mailboxes
-	// (one dropdown picks both — they're no longer mutually exclusive). When the
-	// campaign selects NEITHER tags nor explicit accounts, it sends from ALL of
-	// the active mailboxes in the campaign's tenant ("all").
-	//
-	// Tenancy is the campaign's organization, never its owner: a user who belongs
-	// to two organizations must not have organization A's campaign pick up an
-	// organization B mailbox and burn B's reputation, caps and warmup state. A
-	// campaign with no organization resolves to no mailboxes, the same way the
-	// campaign task halts it rather than sending unchecked.
-	scope := repository.NewAccountScope(campaign.OrganizationID)
-	senders, serr := s.emailRepo.GetByCampaignSenders(ctx, scope, campaignID)
-	if serr != nil {
-		return nil, nil, serr
+	pool, err := repository.ResolveCampaignSenderPool(ctx, s.emailRepo, campaign)
+	if err != nil {
+		return nil, nil, err
 	}
-	for _, snd := range senders {
-		accounts = append(accounts, snd.Account)
-		seen[snd.Account.ID] = true
+	senderMetaByID := make(map[uuid.UUID]senderMeta, len(pool.Explicit))
+	for _, snd := range pool.Explicit {
 		senderMetaByID[snd.Account.ID] = senderMeta{
 			weight:           snd.Weight,
 			rotationPosition: snd.RotationPosition,
@@ -165,26 +242,7 @@ func (s *schedulerService) campaignSenders(ctx context.Context, campaign *models
 			hasMeta:          true,
 		}
 	}
-	if len(campaign.EmailTags) > 0 {
-		tagAccounts, terr := s.emailRepo.GetByTags(ctx, scope, campaign.EmailTags)
-		if terr != nil {
-			return nil, nil, terr
-		}
-		for _, ta := range tagAccounts {
-			if !seen[ta.ID] {
-				accounts = append(accounts, ta)
-				seen[ta.ID] = true
-			}
-		}
-	}
-	if len(senders) == 0 && len(campaign.EmailTags) == 0 {
-		allAccts, aerr := s.emailRepo.GetAllActiveInScope(ctx, scope)
-		if aerr != nil {
-			return nil, nil, aerr
-		}
-		accounts = allAccts
-	}
-	return accounts, senderMetaByID, nil
+	return pool.Accounts, senderMetaByID, nil
 }
 
 // placeCampaignSend runs every hard constraint and pacing rule on one
@@ -192,17 +250,28 @@ func (s *schedulerService) campaignSenders(ctx context.Context, campaign *models
 // slot, exactly as the send path uses it. preview makes it read-only (no
 // decision logs, no cached writes) so the contact drawer can ask "when would
 // this step go" through the same rules the scheduler applies.
-func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *models.Campaign, accounts []models.Email, senderMetaByID map[uuid.UUID]senderMeta, nextPair *repository.ContactSequencePair, preview bool) (time.Time, *repository.ContactSequencePair, uuid.UUID, error) {
+func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *models.Campaign, accounts []models.Email, senderMetaByID map[uuid.UUID]senderMeta, nextPair *repository.ContactSequencePair, pass *campaignPass, preview bool) (time.Time, *repository.ContactSequencePair, uuid.UUID, error) {
 	campaignID := campaign.ID
+	if pass == nil {
+		pass = s.newCampaignPass(ctx, campaign, accounts)
+		if err := s.prefillPool(ctx, pass, accounts); err != nil {
+			return time.Time{}, nil, uuid.Nil, err
+		}
+	}
 	logDecision := func(eventType, message string, metadata map[string]interface{}) {
 		if !preview {
 			s.logCampaignDecision(ctx, campaignID, eventType, message, metadata)
 		}
 	}
+	logDecisionOnce := func(eventType, message string, metadata map[string]interface{}) {
+		if !preview {
+			s.logCampaignDecisionOnce(ctx, campaignID, eventType, message, metadata)
+		}
+	}
 
-	// STEP 3.5: Resolve the recipient ESP/provider for ESP matching. Cheap:
-	// prefer the cached contact.esp_provider, else derive from the domain
-	// string. NEVER dial MX on the hot path. Empty => unknown => wildcard.
+	// STEP 3.5: Resolve the recipient ESP/provider for ESP matching from what
+	// the provider sweep stored, else the domain string. NEVER dial MX on the
+	// hot path. Empty => unknown => wildcard.
 	// STEP 3.4: Recipient-timezone policy. Disabled, absent or unreadable all
 	// leave the send on the sending mailbox's clock.
 	sendPref := s.sendTimePreference(ctx, campaign.OrganizationID)
@@ -217,15 +286,7 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 
 	recipientProvider := ""
 	if campaign.ESPMatchMode != "off" && recipientContact != nil {
-		if recipientContact.ESPProvider != "" {
-			recipientProvider = recipientContact.ESPProvider
-		} else {
-			recipientProvider = providerForEmailDomain(recipientContact.Email)
-			// Opportunistically cache the derived provider (best-effort).
-			if recipientProvider != "" && !preview {
-				_ = s.contactRepo.SetContactESP(ctx, recipientContact.ID, recipientProvider)
-			}
-		}
+		recipientProvider = recipientESP(recipientContact)
 	}
 
 	// STEP 4: Calculate base time from sequence wait_after
@@ -244,15 +305,39 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 			return time.Time{}, nil, uuid.Nil, err
 		}
 
-		// Add wait_after days to last sent time
-		waitDuration := time.Hour * 24 * time.Duration(sequence.WaitAfter)
+		// Add wait_after days to last sent time. A pair an instant branch chose
+		// carries no wait: routing already resolved the branch's flag against
+		// the target step's own wait_after, and re-adding it here would put the
+		// delay straight back (issue #583).
+		waitDuration := time.Hour * 24 * time.Duration(repository.BranchWaitAfter(sequence.WaitAfter, nextPair.Instant))
 		baseTime = lastSentTime.Add(waitDuration)
+	}
+
+	// Routing's own floor for this pair: the campaign's entry delay for a first
+	// step, a preceding wait node's minutes for a follow-up. Honouring it here
+	// keeps the placer from handing back a slot the router would refuse.
+	if nextPair.NotBefore != nil && nextPair.NotBefore.After(baseTime) {
+		baseTime = *nextPair.NotBefore
+	}
+
+	// An OVERDUE step's earliest possible send is now, never the moment it
+	// became due. Every schedule gate below is asked about `baseTime`, and for
+	// a follow-up whose wait elapsed hours ago that instant is in the past —
+	// where nextScheduleSlot deliberately keeps an instant that was already
+	// inside a sending window, and the end-date comparison finds a candidate
+	// that predates the end date. So a step that came due at 2pm passed both
+	// gates at 11pm: hardFloor sat in the past, STEP 14.5 read it as due, and
+	// the task sent it hours after the window closed, or days after the
+	// campaign ended. The window has to be asked about the send that is
+	// actually about to happen, which is this one, now.
+	if baseTime.Before(time.Now()) {
+		baseTime = time.Now()
 	}
 
 	// STEP 5: Apply campaign schedule constraints
 	// Fall back to UTC if campaign has no timezone set (account timezone checked later)
-	campaignTZName := campaign.Timezone
-	campaignTZ := loadLocation(campaignTZName)
+	campaignTZName := campaign.ClockTimezone()
+	campaignTZ := pass.location(campaignTZName)
 	// Authoritative per-day sending windows (or derived from the legacy
 	// days/start/end fields). Drives every day-of-week + time-window gate below.
 	windows := effectiveWindows(campaign)
@@ -272,50 +357,14 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 	// intervals per day).
 	candidateTime = nextScheduleSlot(candidateTime, windows, campaignTZ)
 
-	// effectiveCap is the per-mailbox cold cap for THIS campaign, after the ramp
-	// clamp. It is min(per-mailbox cold cap, campaign daily limit) further min()'d
-	// with the day's ramp ceiling. Applied via min() only — it can never RAISE a
-	// mailbox above its cold cap (the mailbox-first safety invariant).
-	// Graduation state for the whole pool in one round trip, so the per-mailbox
-	// ceiling below costs no query inside the candidate loop.
-	coldRamp := s.coldRampStates(ctx, accounts)
-
-	// The organization's own posture, resolved once. A restricted organization
-	// keeps sending at a fraction of the volume; a suspended one does not send
-	// at all, and is stopped here because campaign sends never pass through the
-	// manual send gate.
-	riskState := s.orgRiskState(ctx, campaign.OrganizationID)
-	if riskState.BlocksSending() {
+	// The organization's own posture. A restricted organization keeps sending at
+	// a fraction of the volume (folded into pass.effectiveCap); a suspended one
+	// does not send at all, and is stopped here because campaign sends never
+	// pass through the manual send gate.
+	if pass.risk.BlocksSending() {
 		logDecision("org_suspended",
 			"Sending is paused for this workspace while it is under review", nil)
-		return s.deferToNextDay(campaign), nil, accounts[0].ID, ErrCampaignDeferred
-	}
-	riskMultiplier := riskState.CapMultiplier()
-
-	// Which mailboxes are in cold rotation at all. A resting mailbox keeps its
-	// warmup traffic and its reputation; it just is not offered cold sends.
-	lifecycles, lifecyclesKnown := s.sendLifecycles(ctx, accounts)
-
-	effectiveCap := func(acct models.Email) int {
-		lim := min(acct.CampaignLimit, campaign.DailyLimit)
-		if campaign.RampEnabled {
-			lim = min(lim, campaignRampCeiling(true, campaign.RampStart, campaign.RampIncrement, campaign.RampCeiling, campaign.RampLevel))
-		}
-		// Graduation ceiling: a mailbox at its warmup ceiling must not reach the
-		// full cold cap the day it joins a campaign. min() only, so it can lower
-		// a mailbox but never raise one.
-		lim = min(lim, coldCeilingFor(coldRamp[acct.ID], lim))
-		if riskMultiplier < 1 {
-			risked := int(float64(lim)*riskMultiplier + 0.5)
-			// A restricted organization still sends, just far less. Zeroing it
-			// here would stop the campaign without ever saying why; suspension
-			// is the band that stops sending, and it does so at the send gate.
-			if risked < 1 {
-				risked = 1
-			}
-			lim = min(lim, risked)
-		}
-		return lim
+		return s.deferToNextDay(campaign, preview), nil, accounts[0].ID, ErrCampaignDeferred
 	}
 
 	// providerMatches reports whether a mailbox's provider satisfies the
@@ -335,15 +384,11 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 		return acctProvider == recipientProvider
 	}
 
-	// STEP 8: Build weighted account candidates, gating each mailbox on when it
-	// may next send in its OWN timezone: its rolled workday when it has a
-	// sending-behaviour profile, and the historical 8am-8pm business-hours band
-	// when it does not.
+	// STEP 8: Build weighted account candidates. Each mailbox goes through the
+	// same two-part gate routing's availability pre-pass used: what it can do at
+	// all (authentication, cold rotation, warmup health, today's budget), then
+	// when its own calendar next lets it send.
 	//
-	// Profiles are resolved for the whole pool in one query, so adding
-	// mailboxes to a campaign does not add a query per mailbox to every pass.
-	behaviors := s.behaviorForAll(ctx, accounts)
-
 	// Rotation fallback for mailboxes with no campaign_senders row (tag-resolved
 	// pools and the "all active mailboxes" default). One query for the whole
 	// pool; a failure just leaves the map empty and rotation degrades to its
@@ -361,106 +406,102 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 		}
 	}
 
-	// The sending-domain authentication gate, resolved once for the whole pass.
-	// authGated counts mailboxes dropped by it so an empty candidate set can be
-	// reported as the DNS problem it is rather than as a scheduling one.
-	enforceAuth, authGrace := s.domainAuthGate(ctx)
+	// Why mailboxes were left out. A reason that clears on its own (the budget
+	// resets at midnight, the mailbox's hours reopen, a health hold expires)
+	// makes an empty pool a deferral; only one that never clears makes it a
+	// pause. authGated is counted apart so an empty pool can be reported as the
+	// DNS problem it is rather than as a scheduling one, and reopensAt is the
+	// earliest reopening among hours-closed mailboxes.
+	//
+	// gates keeps the same answer per mailbox, so the lead's own mailbox can be
+	// told apart from the rest: busy today (wait for it) or not sending for this
+	// campaign at all (move the lead off it).
 	authGated := 0
 	lifecycleGated := 0
+	budgetSpent := 0
+	hoursClosed := 0
+	healthHeld := 0
+	noWorker := 0
+	recoveryHeld := 0
+	cooling := 0
+	var sendRecheck time.Time
+	var reopensAt time.Time
+	gates := map[uuid.UUID]mailboxGate{}
+
+	// The mailbox this lead's conversation belongs to, when it is still one this
+	// campaign can send from. Its gates are the same as everyone else's; what
+	// differs is that a closed hour moves the send rather than dropping the
+	// mailbox, because there is no second address to fall back to.
+	bound := boundSender(accounts, nextPair.AssignedSender)
+
+	// A lead can have steps but no recorded binding: it was removed from the
+	// campaign and added back, which keeps its progress and starts a new lead
+	// row. The address it last actually heard from is still the one to keep, so
+	// it is PREFERRED — used when that mailbox is free, and given up when it is
+	// not. It cannot be waited for the way a recorded binding is: routing does
+	// not know about it, so a lead waiting on one would hold up every lead
+	// behind it. The next send records it, and from then on it is a rule.
+	prefer := bound
+	if bound == nil && nextPair.AssignedSender == nil && !nextPair.IsNewLead {
+		if last, lerr := s.campaignProgressRepo.LastSenderForLead(ctx, campaignID, nextPair.ContactID); lerr == nil {
+			prefer = boundSender(accounts, last)
+		}
+	}
 
 	var candidates []AccountCandidate
 	for _, acct := range accounts {
-		// Sending-domain authentication. This runs before the daily-count query
-		// so a gated mailbox costs nothing, and before every other gate because
-		// unauthenticated mail is rejected outright by Gmail/Yahoo/Outlook: no
-		// amount of budget, window, or rotation makes it deliverable.
-		//
-		// Only a SUSTAINED failure gates. "unknown" (never checked, or DNS
-		// could not answer) and a failure inside the grace window both pass
-		// through, so a resolver hiccup can never stop a campaign.
-		if enforceAuth && acct.DomainAuthBlocked(time.Now(), authGrace) {
-			authGated++
-			continue
-		}
-
-		// Not in cold rotation. Checked here, beside the authentication gate,
-		// so a resting mailbox costs no capacity query. Applied only when the
-		// states were actually read.
-		if lifecyclesKnown && !lifecycles[acct.ID].State.SendsCold() {
-			lifecycleGated++
-			continue
-		}
-
-		sentToday, err := s.taskRepo.CountCampaignEmailsSentToday(ctx, acct.ID)
+		sentToday, err := s.sentTodayFor(ctx, pass, acct.ID)
 		if err != nil {
 			return time.Time{}, nil, uuid.Nil, err
 		}
 
-		acctLimit := effectiveCap(acct)
-		remaining := acctLimit - sentToday
-
-		// Skip accounts that have reached their daily limit
-		if remaining <= 0 {
+		acctLimit := pass.effectiveCap(acct)
+		// Authentication, cold rotation, warmup health and today's budget, in
+		// the order the gate applies them. Same answer routing's availability
+		// pre-pass got, from the same reads.
+		gate, remaining := s.gateFor(ctx, pass, acct, acctLimit-sentToday)
+		if !gate.open() {
+			gates[acct.ID] = gate
+			switch gate.reason {
+			case gateAuth:
+				authGated++
+			case gateResting:
+				lifecycleGated++
+			case gateHealth:
+				healthHeld++
+			case gateBudget:
+				budgetSpent++
+			case gateNoWorker:
+				noWorker++
+			case gateRecovery, gateAdmission:
+				recoveryHeld++
+			case gateCooldown:
+				cooling++
+			}
+			if !gate.reopensAt.IsZero() && (sendRecheck.IsZero() || gate.reopensAt.Before(sendRecheck)) {
+				sendRecheck = gate.reopensAt
+			}
 			continue
 		}
 
-		bhv := behaviors[acct.ID]
-
-		// Health-gate cold sends on the SAME warmup health state used for pool
-		// selection, so a mailbox in deliverability trouble doesn't keep blasting
-		// cold volume (the concentration risk the safety policy warns about):
-		//   - quarantined/blocked (still within blocked_until) → don't send at all
-		//   - watch/throttled → dampen today's budget by the same multiplier warmup
-		//     uses for that band (watch 0.7x, throttled 0.5x), via adjustmentFor so
-		//     the warmup and cold schedulers can't drift; the wider min-gap still applies
-		// This gate runs FIRST, before any rotation/ESP logic, so a degraded
-		// mailbox is always dropped regardless of weighting.
-		if state, blockedUntil, herr := s.warmupRepo.GetHealthState(ctx, acct.ID); herr == nil {
-			switch state {
-			case models.WarmupHealthQuarantined, models.WarmupHealthBlocked:
-				if blockedUntil == nil || blockedUntil.After(time.Now()) {
-					continue
-				}
-			case models.WarmupHealthWatch, models.WarmupHealthThrottled:
-				remaining = int(float64(remaining) * adjustmentFor(state).volumeMultiplier)
-				if remaining <= 0 {
-					continue
+		// Where the mailbox may next send, on its OWN calendar. The lead's own
+		// mailbox is allowed to WAIT for its next opening rather than drop out
+		// of the pass: there is no second address this conversation could come
+		// from, so a closed hour moves the send instead of refusing it.
+		openAt, openLoc, remaining, wgate := s.windowFor(
+			ctx, pass, acct, candidateTime, acctLimit, remaining, bound != nil && bound.ID == acct.ID)
+		if !wgate.open() {
+			gates[acct.ID] = wgate
+			switch wgate.reason {
+			case gateBudget:
+				budgetSpent++
+			case gateHours:
+				hoursClosed++
+				if reopensAt.IsZero() || wgate.reopensAt.Before(reopensAt) {
+					reopensAt = wgate.reopensAt
 				}
 			}
-		}
-
-		// Where the mailbox may next send, in its OWN timezone. With a
-		// behaviour profile this is its rolled workday (start, lunch, end,
-		// working weekdays) with the hourly ceiling already applied; without
-		// one it falls back to the historical 8am-8pm business-hours gate.
-		var behaviorOpenAt *time.Time
-		if bhv.Enabled {
-			openAt, ok := s.placeWithinBehavior(ctx, bhv, candidateTime)
-			if !ok {
-				continue // profile has no working days at all
-			}
-			behaviorOpenAt = &openAt
-
-			// Budget the send against the day it will actually land on. When
-			// today is spent, placeWithinBehavior has already walked to a later
-			// day, and that day starts with the mailbox's full cold cap.
-			if !sameLocalDay(openAt, time.Now(), bhv.Loc) {
-				remaining = acctLimit
-			}
-			// The day's rolled cold budget, folded in by min(): a persona can
-			// only lower a mailbox's remaining sends, never lift it above the
-			// cold cap.
-			remaining = s.behaviorDailyCap(ctx, bhv, remaining, openAt)
-			if remaining <= 0 {
-				continue
-			}
-		} else if acct.Timezone != "" && acct.Timezone != campaign.Timezone {
-			acctTZ := loadLocation(acct.Timezone)
-			acctLocal := candidateTime.In(acctTZ)
-			acctHour := acctLocal.Hour()
-			if acctHour < 8 || acctHour >= 20 {
-				continue // outside account's business hours
-			}
+			continue
 		}
 
 		warmupAgeDays := 0
@@ -473,9 +514,10 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 			RemainingToday: remaining,
 			WarmupAgeDays:  warmupAgeDays,
 			Weight:         computeWeight(remaining, warmupAgeDays),
-			ProviderMatch:  providerMatches(acct.Provider),
-			Behavior:       bhv,
-			BehaviorOpenAt: behaviorOpenAt,
+			ProviderMatch:  providerMatches(senderESP(acct)),
+			Behavior:       pass.behaviors[acct.ID],
+			OpenAt:         openAt,
+			OpenLoc:        openLoc,
 		}
 		if meta, ok := senderMetaByID[acct.ID]; ok {
 			cand.HasSenderMetadata = true
@@ -512,21 +554,135 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 		return time.Time{}, nil, uuid.Nil, ErrDomainAuthFailing
 	}
 
-	// Every mailbox is out of cold rotation. Say so rather than letting the
-	// campaign look stalled for no visible reason; they return on their own.
-	if len(candidates) == 0 && lifecycleGated == len(accounts) {
-		logDecision("mailboxes_resting",
-			"No mailbox is in cold rotation: all are resting or held in reserve",
-			map[string]interface{}{"resting_mailboxes": lifecycleGated, "pool_size": len(accounts)})
-		return s.deferToNextDay(campaign), nil, accounts[0].ID, ErrCampaignDeferred
+	// An empty pool is a pause only when nothing in it will change on its own.
+	// A pool with every mailbox at its daily cap used to fall through to the
+	// pause below, and the campaign had to be restarted by hand the next
+	// morning (issue #306); it is a deferral, like every other gate that lifts
+	// by itself. The conditions a deferred chain re-finds every few minutes
+	// until midnight are logged once a day, or the feed drowns in them.
+	if len(candidates) == 0 {
+		switch {
+		case recoveryHeld > 0 || cooling > 0:
+			resume := time.Now().Add(workerRecheck)
+			if !sendRecheck.IsZero() && sendRecheck.Before(resume) {
+				resume = sendRecheck
+			}
+			logDecisionOnce("mailboxes_send_recovery",
+				fmt.Sprintf("No mailbox can send right now: %d require send recovery, %d cooling down", recoveryHeld, cooling),
+				map[string]interface{}{"recovery_held": recoveryHeld, "cooling_down": cooling, "pool_size": len(accounts),
+					"mailboxes": s.poolBudget(pass, accounts, gates, uuid.Nil)})
+			return resume, nil, accounts[0].ID, ErrCampaignDeferred
+		case noWorker > 0:
+			// Mailboxes that could send once a worker holds them again, which
+			// the worker reconciler sees to within minutes, unless a mailbox
+			// whose hours reopen sooner comes back first. A deferral, never a
+			// pause, logged under its own name so an earlier line about
+			// budgets or hours does not hide it for the rest of the day.
+			resume := time.Now().Add(workerRecheck)
+			if hoursClosed > 0 {
+				if open := nextScheduleSlot(reopensAt, windows, campaignTZ); open.Before(resume) {
+					resume = open
+				}
+			}
+			logDecisionOnce("mailboxes_no_worker",
+				fmt.Sprintf("No mailbox can send right now: %d not connected to a running sending worker; sending resumes as soon as one is", noWorker),
+				map[string]interface{}{"no_worker": noWorker, "capped_mailboxes": budgetSpent, "hours_closed": hoursClosed,
+					"health_held": healthHeld, "resting_mailboxes": lifecycleGated, "auth_gated": authGated, "pool_size": len(accounts)})
+			return resume, nil, accounts[0].ID, ErrCampaignDeferred
+		case budgetSpent > 0 || hoursClosed > 0:
+			// Resume when the first of them can send again: tomorrow for a
+			// spent budget, the reopening of the mailbox's own 8am-8pm band
+			// otherwise.
+			var resume time.Time
+			if budgetSpent > 0 {
+				resume = s.deferToNextDay(campaign, preview)
+			}
+			if hoursClosed > 0 {
+				if open := nextScheduleSlot(reopensAt, windows, campaignTZ); resume.IsZero() || open.Before(resume) {
+					resume = open
+				}
+			}
+			// What the feed is told. A closed 8am-8pm band on its own is
+			// routine and short and earns no line. Every usable mailbox capped
+			// earns "sending resumes tomorrow", which is only true while
+			// nothing in the pool is merely asleep: a mailbox that reopens
+			// today makes tomorrow a lie, which is why that line stays off for
+			// a mixed pool.
+			//
+			// The mix itself fell between the two and said NOTHING, so a
+			// campaign whose sending had stopped for hours sat active with an
+			// empty feed and no way for its owner to find out why. It gets its
+			// own line, under the event type the other "the pool cannot serve
+			// you right now" reasons already use, and carries the moment it
+			// comes back rather than promising a day.
+			switch {
+			case budgetSpent > 0 && hoursClosed == 0:
+				logDecisionOnce("daily_cap_reached",
+					"Every available mailbox has used its daily budget; sending resumes tomorrow",
+					map[string]interface{}{"capped_mailboxes": budgetSpent, "pool_size": len(accounts),
+						"mailboxes": s.poolBudget(pass, accounts, gates, uuid.Nil)})
+			case budgetSpent > 0:
+				logDecisionOnce("mailboxes_unavailable",
+					fmt.Sprintf("No mailbox can send right now: %d out of budget for today, %d outside their own sending hours",
+						budgetSpent, hoursClosed),
+					map[string]interface{}{
+						"capped_mailboxes": budgetSpent,
+						"hours_closed":     hoursClosed,
+						"pool_size":        len(accounts),
+						"resumes_at":       resume.UTC().Format(time.RFC3339),
+						"mailboxes":        s.poolBudget(pass, accounts, gates, uuid.Nil),
+					})
+			}
+			return resume, nil, accounts[0].ID, ErrCampaignDeferred
+		case lifecycleGated == len(accounts):
+			// Every mailbox is out of cold rotation. Say so rather than letting
+			// the campaign look stalled for no visible reason; they return on
+			// their own.
+			logDecisionOnce("mailboxes_resting",
+				"No mailbox is in cold rotation: all are resting or held in reserve",
+				map[string]interface{}{"resting_mailboxes": lifecycleGated, "pool_size": len(accounts)})
+			return s.deferToNextDay(campaign, preview), nil, accounts[0].ID, ErrCampaignDeferred
+		case healthHeld > 0 || lifecycleGated > 0:
+			var why []string
+			if healthHeld > 0 {
+				why = append(why, fmt.Sprintf("%d held by warmup health", healthHeld))
+			}
+			if lifecycleGated > 0 {
+				why = append(why, fmt.Sprintf("%d resting or in reserve", lifecycleGated))
+			}
+			if authGated > 0 {
+				why = append(why, fmt.Sprintf("%d failing domain authentication", authGated))
+			}
+			logDecisionOnce("mailboxes_unavailable",
+				"No mailbox can send right now: "+strings.Join(why, ", "),
+				map[string]interface{}{"health_held": healthHeld, "resting_mailboxes": lifecycleGated,
+					"auth_gated": authGated, "pool_size": len(accounts)})
+			return s.deferToNextDay(campaign, preview), nil, accounts[0].ID, ErrCampaignDeferred
+		}
+		// What is left was gated by a sending-behaviour profile with no working
+		// days, which no amount of waiting fixes.
+		return time.Time{}, nil, uuid.Nil, ErrNoEligibleMailbox
 	}
+
+	// STEP 8.2: The lead's own mailbox, if this pass left it able to send. Every
+	// step of one conversation leaves from the address the contact first heard
+	// from, so once this is set there is nothing left to choose: no rotation, no
+	// ESP matching, no weighting. Those decide which mailbox STARTS a lead.
+	boundCand := pickBound(candidates, prefer)
+	// Every mailbox with budget today, before ESP matching narrows the set:
+	// the "last email today" line below must speak for the whole pool.
+	wholePool := candidates
 
 	// STEP 8.25: Apply ESP matching to the under-budget candidate set.
 	//   strict → only matching mailboxes are eligible; if none, DEFER (never
 	//            send cross-provider).
 	//   prefer → restrict to matching mailboxes when at least one has capacity,
 	//            otherwise fall back to the full eligible set (never starves).
-	if campaign.ESPMatchMode != "off" && recipientProvider != "" {
+	//
+	// Skipped for a lead that already has its mailbox: matching picks a sender
+	// for a first email, and re-applying it to a follow-up could only refuse
+	// the one address this contact is allowed to hear from.
+	if boundCand == nil && campaign.ESPMatchMode != "off" && recipientProvider != "" {
 		matching := make([]AccountCandidate, 0, len(candidates))
 		for _, c := range candidates {
 			if c.ProviderMatch {
@@ -536,14 +692,17 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 		switch campaign.ESPMatchMode {
 		case "strict":
 			if len(matching) == 0 {
-				// No matching mailbox under budget today: defer to the next slot
-				// rather than complete or send cross-provider.
-				logDecision("provider_match_deferred",
-					"No same-provider mailbox available; deferring to next slot",
+				// No matching mailbox under budget today: leave THIS lead for
+				// later rather than complete or send cross-provider. It is the
+				// recipient's own domain that has no mailbox, so the lead behind
+				// them may still be sendable; logged once a day, because the
+				// pass now re-finds this for every refused lead.
+				logDecisionOnce("provider_match_deferred",
+					"No same-provider mailbox available; those leads wait for one",
 					map[string]interface{}{"recipient_provider": recipientProvider})
 				// Deferral, not a send: nil pair + sentinel so the caller reschedules
 				// instead of sending this contact from a cross-provider mailbox.
-				return s.deferToNextDay(campaign), nil, accounts[0].ID, ErrCampaignDeferred
+				return s.deferToNextDay(campaign, preview), nil, accounts[0].ID, ErrLeadDeferred
 			}
 			candidates = matching
 		case "prefer":
@@ -553,73 +712,91 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 		}
 	}
 
-	// STEP 8.5: Select best account per the campaign's rotation mode. pool is
-	// the set selection actually ran over, kept for the pacing maths below.
+	// STEP 8.5: Select the mailbox. A lead already bound to one keeps it; only a
+	// lead starting its sequence goes through the campaign's rotation mode. pool
+	// is the set selection ran over, kept for the pacing maths below. Every
+	// candidate has budget left today, so it has weight and the selector always
+	// picks one; the guard only keeps a nil from being dereferenced.
 	pool := candidates
-	selected := selectAccountByRotationMode(campaign.RotationMode, candidates)
+	selected := boundCand
 	if selected == nil {
-		// ALL accounts at capacity today — push to next day and recompute with
-		// tomorrow's full (ramp-clamped) capacity. The ramp clamp AND the ESP
-		// filter MUST be re-applied here, or tomorrow's recompute over-budgets a
-		// mailbox past its ramp ceiling / picks a cross-provider sender.
-		candidateTime = candidateTime.Add(24 * time.Hour)
-		candidateTime = nextScheduleSlot(candidateTime, windows, campaignTZ)
-
-		var tomorrow []AccountCandidate
-		for i := range candidates {
-			acct := candidates[i].Account
-			// ESP-strict: keep only matching mailboxes for tomorrow too.
-			if campaign.ESPMatchMode == "strict" && recipientProvider != "" && !candidates[i].ProviderMatch {
-				continue
+		// The lead is bound to a mailbox that did not survive this pass. Waiting
+		// is right only while the mailbox is coming back: a spent budget resets
+		// at midnight, closed hours reopen. A mailbox that is disconnected,
+		// failing authentication, resting or held by warmup health is not going
+		// to write to this contact again soon, and a week of silence mid-sequence
+		// is worse than a change of address, so the lead moves.
+		if bound != nil {
+			gate := gates[bound.ID]
+			if gate.paced {
+				logDecisionOnce("sender_busy",
+					"Some leads are waiting for their own mailbox: every contact keeps the address they first heard from, and that mailbox has nothing left for now",
+					map[string]interface{}{"mailbox": bound.Email, "reason": gate.reason})
+				resume := gate.reopensAt
+				if resume.IsZero() {
+					resume = s.deferToNextDay(campaign, preview)
+				}
+				return resume, nil, bound.ID, ErrSenderBusy
 			}
-			acctLimit := effectiveCap(acct) // same ramp clamp as STEP 8
-			c := candidates[i]
-			c.RemainingToday = acctLimit
-			c.Weight = computeWeight(acctLimit, candidates[i].WarmupAgeDays)
-			tomorrow = append(tomorrow, c)
 		}
-		// ESP-prefer: restrict tomorrow to matching mailboxes when any exist.
-		if campaign.ESPMatchMode == "prefer" && recipientProvider != "" {
-			var matchingTomorrow []AccountCandidate
-			for _, c := range tomorrow {
-				if c.ProviderMatch {
-					matchingTomorrow = append(matchingTomorrow, c)
+		if preview {
+			// Rotation is a draw, and a read that draws answers a different
+			// mailbox — and so a different min-gap — every time it is called.
+			// A preview picks the same one every time instead; which mailbox
+			// rotation will really hand this lead is not knowable in advance
+			// anyway, and the drawer is reporting a time, not a sender.
+			selected = stableCandidate(candidates)
+		} else {
+			// A new lead starts on a mailbox whose gap has passed. "prefer"
+			// falls back to the whole pool when no matching one is clear.
+			pick := candidates
+			if clear := s.gapClearCandidates(ctx, pass, candidates); len(clear) > 0 {
+				pick = clear
+			} else if campaign.ESPMatchMode == "prefer" && len(candidates) < len(wholePool) {
+				if clear := s.gapClearCandidates(ctx, pass, wholePool); len(clear) > 0 {
+					pick = clear
 				}
 			}
-			if len(matchingTomorrow) > 0 {
-				tomorrow = matchingTomorrow
-			}
+			selected = selectAccountByRotationMode(campaign.RotationMode, pick, campaign.ID)
 		}
-
-		pool = tomorrow
-		selected = selectAccountByRotationMode(campaign.RotationMode, tomorrow)
-		if selected == nil {
-			// ESP-strict with no matching mailbox at all: defer rather than
-			// complete or send cross-provider.
-			if campaign.ESPMatchMode == "strict" && recipientProvider != "" {
-				logDecision("provider_match_deferred",
-					"No same-provider mailbox available tomorrow; deferring",
-					map[string]interface{}{"recipient_provider": recipientProvider})
-				// Deferral, not a send (see above).
-				return s.deferToNextDay(campaign), nil, accounts[0].ID, ErrCampaignDeferred
-			}
-			// The pool was not empty, every mailbox in it was gated out.
-			return time.Time{}, nil, uuid.Nil, ErrNoEligibleMailbox
-		}
+	}
+	if selected == nil {
+		return time.Time{}, nil, uuid.Nil, ErrNoEligibleMailbox
 	}
 
 	account := &selected.Account
 
 	// STEP 8.75: Send-to-send spacing for THIS send. With a behaviour profile
 	// the gap is drawn fresh from the mailbox's range, so the intervals between
-	// its sends are irregular; otherwise it is the mailbox's fixed min gap.
-	gapSeconds := s.behaviorGap(selected.Behavior, candidateTime, account.MinWaitTime)
+	// its sends are irregular; otherwise it is the mailbox's fixed min gap. A
+	// preview takes the shortest gap the profile allows instead of a draw, so
+	// it answers the same question the same way twice.
+	var gapSeconds int
+	if preview {
+		gapSeconds = s.behaviorGapFloor(selected.Behavior, candidateTime, account.MinWaitTime)
+	} else {
+		gapSeconds = s.behaviorGap(selected.Behavior, candidateTime, account.MinWaitTime)
+		// The gap the selection filter drew, while the send is still today.
+		if drawn, ok := pass.gapDraws[account.ID]; ok &&
+			(!selected.Behavior.Enabled || sameLocalDay(time.Now(), candidateTime, selected.Behavior.Loc)) {
+			gapSeconds = drawn
+		}
+	}
+
+	// leadFloor records that the hard floor below belongs to THIS lead and not
+	// to the pool, so a refusal moves the pass to the next lead instead of
+	// parking the campaign (issue #437).
+	leadFloor := false
 
 	// Move the candidate onto the mailbox's own workday before the spacing
 	// maths below runs, so distribution is computed against the window the send
 	// will actually land in.
-	if selected.BehaviorOpenAt != nil && selected.BehaviorOpenAt.After(candidateTime) {
-		candidateTime = *selected.BehaviorOpenAt
+	if selected.OpenAt != nil && selected.OpenAt.After(candidateTime) {
+		candidateTime = *selected.OpenAt
+		// Waiting for a mailbox to reopen is this lead's own wait only when the
+		// lead is BOUND to it, for the reason spelled out at the min-gap below:
+		// an unbound lead is one rotation places, and rotation gets another go.
+		leadFloor = bound != nil && bound.ID == account.ID
 	}
 
 	// hardFloor is the earliest moment this send is ALLOWED: wait_after,
@@ -627,6 +804,14 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 	// with the mailbox min-gap folded in below. Pacing added after this point
 	// (distribution, jitter, curve) shapes the slot but never gates a send.
 	hardFloor := candidateTime
+
+	// A preview reports that FLOOR and stops there. Steps 9 to 13 below are
+	// spacing: drawn fresh from a random source and measured from time.Now(),
+	// so running them for a read made two reads of one unchanged campaign
+	// answer minutes apart, and the drawer showed a time that walked forward on
+	// every refresh while the step sat there marked Due (issue #437). Every
+	// real constraint — the mailbox min-gap, the recipient's hours, the sending
+	// windows — still runs.
 
 	// STEP 9: Even distribution across the candidate day's sending window. With
 	// a behaviour profile that is the mailbox's own rolled workday (lunch
@@ -641,17 +826,19 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 	// and hourly ceiling gated it into this set, and the min-gap plus conflict
 	// resolution below space its own sends.
 	remainingEmails := poolRemainingOn(pool, candidateTime)
-	if remainingEmails > 0 {
+	if !preview && remainingEmails == 1 && poolRemainingOn(wholePool, candidateTime) == 1 {
+		// This send uses the pool's last budget for the day, so the successor
+		// it paces lands tomorrow and no tick runs today to say why. A
+		// campaign sending one email a morning is this line's whole story:
+		// the breakdown names the clamp behind each mailbox's cap.
+		logDecisionOnce("daily_cap_reached",
+			"Sending today's last email: after this one every mailbox on the campaign has used its daily budget, so sending resumes tomorrow",
+			map[string]interface{}{"pool_size": len(accounts), "mailboxes": s.poolBudget(pass, accounts, gates, account.ID)})
+	}
+	if !preview && remainingEmails > 0 {
 		remainingMinutes, ok := remainingSendMinutes(selected, candidateTime, windows, campaignTZ)
 		if ok && remainingMinutes > 0 {
-			// Vary the pace multiplicatively (bursts and lulls) — evenly
-			// metronomed sends are a pattern even with additive jitter.
-			varied := float64(remainingMinutes/remainingEmails) * (0.55 + rand.Float64()*0.9)
-			idealInterval := time.Duration(varied * float64(time.Minute))
-			minInterval := time.Second * time.Duration(gapSeconds)
-			if idealInterval < minInterval {
-				idealInterval = minInterval
-			}
+			idealInterval := poolSendInterval(remainingMinutes, remainingEmails, gapSeconds, len(pool), rand.Float64())
 			distributedTime := time.Now().Add(idealInterval)
 			if distributedTime.After(candidateTime) {
 				candidateTime = distributedTime
@@ -676,6 +863,18 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 		}
 		if hardFloor.Before(earliestNext) {
 			hardFloor = nextScheduleSlot(earliestNext, windows, campaignTZ)
+			// A bound lead has one address and must wait out ITS mailbox's gap,
+			// which is this lead's wait and nobody else's: the lead behind it,
+			// on another mailbox, can still go now.
+			//
+			// An unbound lead keeps the pool-wide answer. Selection already
+			// prefers a mailbox whose gap has elapsed (gapClearCandidates), so
+			// reaching here means none has. Skipping the lead would spend the
+			// whole candidate budget re-deriving one shared gap on a
+			// single-mailbox campaign, which is most of them.
+			if bound != nil && bound.ID == account.ID {
+				leadFloor = true
+			}
 		}
 	}
 
@@ -687,25 +886,30 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 	// the slot, capped at the original 20 minutes, keeps the irregularity
 	// without erasing the pacing. Deliberately NOT rounded to a 5-minute grid —
 	// a fleet that only ever sends at :x0/:x5 marks is a detectable pattern.
-	if spread := min(int(time.Until(candidateTime).Minutes())/2, 20); spread > 0 {
-		candidateTime = candidateTime.Add(time.Minute * time.Duration(randomJitter(-spread, spread)))
+	if !preview {
+		if spread := min(int(time.Until(candidateTime).Minutes())/2, 20); spread > 0 {
+			candidateTime = candidateTime.Add(time.Minute * time.Duration(randomJitter(-spread, spread)))
+		}
 	}
 	candidateTime = notBefore(candidateTime)
 
-	// STEP 12: Check conflicts with other scheduled tasks
-	dateToCheck := candidateTime
-	scheduledTasks, err := s.taskRepo.GetScheduledTasksForAccount(ctx, account.ID, dateToCheck)
-	if err != nil {
-		return time.Time{}, nil, uuid.Nil, err
+	// STEP 12: Keep clear of sends already booked on this mailbox. Another
+	// campaign's parked wake-up is not one (issue #942): it re-picks its
+	// mailbox when it fires, and the gap is enforced then by STEP 10 and the
+	// send claim, so spacing around it only throttles campaigns sharing a pool.
+	if !preview {
+		booked, terr := s.taskRepo.GetBookedSendsForAccount(ctx, account.ID, candidateTime)
+		if terr != nil {
+			return time.Time{}, nil, uuid.Nil, terr
+		}
+		candidateTime = resolveConflicts(candidateTime, booked, gapSeconds)
 	}
-
-	candidateTime = resolveConflicts(candidateTime, scheduledTasks, gapSeconds)
 
 	// STEP 13: Apply human-like distribution (favor morning/afternoon peaks).
 	// Skipped for behaviour-profiled mailboxes: the profile already describes
 	// this mailbox's workday and its own lunch break, and layering the generic
 	// curve on top would drag sends away from the hours the customer chose.
-	if !selected.Behavior.Enabled {
+	if !preview && !selected.Behavior.Enabled {
 		candidateTime = applyDistributionCurve(candidateTime, campaignTZ)
 	}
 
@@ -717,6 +921,9 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 			recipientContact, sendPref, campaign.EndDate); ok && snapped.After(candidateTime) {
 			candidateTime = snapped
 			hardFloor = snapped
+			// One recipient's morning is nobody else's: the lead behind this one
+			// may be awake right now.
+			leadFloor = true
 		}
 	}
 
@@ -732,19 +939,66 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 	// one. Report it deferred instead: the caller reschedules at the computed
 	// slot without sending. A task that fired at its own slot always passes.
 	if time.Until(hardFloor) > config.CampaignNotDueGraceSeconds*time.Second {
-		return finalSlot(candidateTime), nil, account.ID, ErrCampaignDeferred
+		if leadFloor {
+			return scheduledSlot(candidateTime, preview), nil, account.ID, ErrLeadDeferred
+		}
+		return scheduledSlot(candidateTime, preview), nil, account.ID, ErrCampaignDeferred
 	}
 
 	// STEP 15: Randomise the sub-minute component so sends never land on :00.
-	return finalSlot(candidateTime), nextPair, account.ID, nil
+	return scheduledSlot(candidateTime, preview), nextPair, account.ID, nil
+}
+
+// stableCandidate is the preview's stand-in for rotation: the strongest
+// candidate, ties broken by mailbox id so the same pool always answers with the
+// same mailbox.
+func stableCandidate(candidates []AccountCandidate) *AccountCandidate {
+	var best *AccountCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if best == nil || c.Weight > best.Weight ||
+			(c.Weight == best.Weight && c.Account.ID.String() < best.Account.ID.String()) {
+			best = c
+		}
+	}
+	return best
+}
+
+// scheduledSlot is finalSlot for a real scheduled_at and a bare future clamp
+// for a preview: the sub-minute randomisation exists so the fleet does not send
+// at second :00, and a read-only answer that moved by up to a minute between
+// two refreshes was reporting that jitter as if it were news.
+func scheduledSlot(t time.Time, preview bool) time.Time {
+	if preview {
+		return notBefore(t)
+	}
+	return finalSlot(t)
 }
 
 // deferToNextDay pushes a candidate time to the next valid campaign day within
-// the campaign's send window. Used by the ESP-strict and new-lead-cap deferral
-// paths so a campaign reschedules instead of completing or busy-looping.
-func (s *schedulerService) deferToNextDay(campaign *models.Campaign) time.Time {
-	tz := loadLocation(campaign.Timezone)
-	t := nextScheduleSlot(time.Now().Add(24*time.Hour), effectiveWindows(campaign), tz)
+// the campaign's send window. Used by the ESP-strict, new-lead-cap and
+// daily-cap deferral paths so a campaign reschedules instead of completing,
+// pausing or busy-looping.
+//
+// A preview gets the FLOOR of the same answer instead: the first open minute of
+// the campaign's next sending day. Two things made the scheduler's own value
+// wrong to show in a drawer — it is measured from the instant it is asked
+// ("24 hours from now", so 3pm today means 3pm tomorrow) and it then adds up to
+// half an hour of jitter so a fleet of deferred chains does not all wake
+// together. Neither means anything to a reader, and between them they moved the
+// drawer's "not before" on every refresh for the commonest waiting reason
+// there is: every mailbox having spent its daily budget (issue #437). The
+// floor is the honest answer anyway, because what the step is waiting for is
+// the day rolling over, not the wake-up the chain happens to have picked.
+func (s *schedulerService) deferToNextDay(campaign *models.Campaign, preview bool) time.Time {
+	tz := loadLocation(campaign.ClockTimezone())
+	windows := effectiveWindows(campaign)
+	if preview {
+		local := time.Now().In(tz)
+		midnight := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, tz).AddDate(0, 0, 1)
+		return nextScheduleSlot(midnight, windows, tz)
+	}
+	t := nextScheduleSlot(time.Now().In(tz).AddDate(0, 0, 1), windows, tz)
 	// Add a small jitter so deferred tasks don't all wake at the same instant.
 	return t.Add(time.Minute * time.Duration(randomJitter(0, 30)))
 }
@@ -762,4 +1016,25 @@ func (s *schedulerService) logCampaignDecision(ctx context.Context, campaignID u
 		Message:    message,
 		Metadata:   metadata,
 	})
+}
+
+// logCampaignDecisionOnce is logCampaignDecision for a condition the deferred
+// chain re-finds on every wake-up until the day rolls over: one line per UTC
+// day, the day the budgets reset on. Best-effort and nil-safe.
+func (s *schedulerService) logCampaignDecisionOnce(ctx context.Context, campaignID uuid.UUID, eventType, message string, metadata map[string]interface{}) {
+	if s.campaignLogRepo == nil {
+		return
+	}
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	dayStart := time.Now().UTC().Truncate(24 * time.Hour)
+	day := dayStart.Format("2006-01-02")
+	metadata["day"] = day
+	_, _ = s.campaignLogRepo.CreateLogOnce(ctx, &repository.CampaignLogEntry{
+		CampaignID: campaignID,
+		EventType:  eventType,
+		Message:    message,
+		Metadata:   metadata,
+	}, "day", day, dayStart)
 }

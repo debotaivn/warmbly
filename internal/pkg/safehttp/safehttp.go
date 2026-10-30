@@ -18,21 +18,31 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
+	"net/netip"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/warmbly/warmbly/internal/config"
 )
 
 // ErrBlockedAddress is returned when a request targets a non-public address.
 var ErrBlockedAddress = errors.New("destination address is not publicly routable")
 
-// allowUnsafe mirrors the existing WARMBLY_ALLOW_UNSAFE_WEBHOOK_URLS escape hatch
-// so local/self-hosted development can reach private hosts.
-func allowUnsafe() bool {
-	return strings.EqualFold(os.Getenv("WARMBLY_ALLOW_UNSAFE_WEBHOOK_URLS"), "true")
+var blockedIPv6 = []netip.Prefix{
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001:10::/28"),
+	netip.MustParsePrefix("2001:20::/28"),
+	netip.MustParsePrefix("fec0::/10"),
 }
+
+// allowUnsafe is the WARMBLY_ALLOW_UNSAFE_WEBHOOK_URLS opt-out, honoured only off hosted production.
+func allowUnsafe() bool { return config.UnsafeWebhookURLsAllowed() }
 
 // blockedHostnames are denied before DNS resolution: cloud-metadata service
 // names that resolve to link-local IPs (covered by the IP check too, but denying
@@ -95,27 +105,50 @@ func IsBlockedIP(ip net.IP) bool {
 			return true
 		}
 	}
+	if addr, ok := netip.AddrFromSlice(ip); ok && addr.Is6() {
+		for _, prefix := range blockedIPv6 {
+			if prefix.Contains(addr) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
 // portAllowed restricts the dial to web ports. Only 443 and 8443 are reachable
 // for user-supplied URLs (so a host that passes the IP check still cannot reach
 // 22/3306/6379/9200/etc.); the dev flag opens any port for local testing.
-func portAllowed(port string) bool {
-	if allowUnsafe() {
-		return true
+func portAllowed(port string, ports []string) bool {
+	if len(ports) == 0 {
+		return port == "443" || port == "8443"
 	}
-	return port == "443" || port == "8443"
+	for _, p := range ports {
+		if port == p {
+			return true
+		}
+	}
+	return false
 }
 
 // safeDialContext resolves addr's host, blocks the connection if any resolved IP
 // is non-public, and dials the validated IP directly so no rebinding can occur
 // between validation and connect.
-func safeDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+func safeDialContext(dialer *net.Dialer, ports []string) func(context.Context, string, string) (net.Conn, error) {
+	publicDial := publicDialContext(dialer, ports)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if allowUnsafe() {
 			return dialer.DialContext(ctx, network, addr)
 		}
+		return publicDial(ctx, network, addr)
+	}
+}
+
+func publicDialContext(dialer *net.Dialer, ports []string) func(context.Context, string, string) (net.Conn, error) {
+	resolver := dialer.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
@@ -124,11 +157,11 @@ func safeDialContext(dialer *net.Dialer) func(context.Context, string, string) (
 			log.Warn().Str("host", host).Msg("safehttp: blocked request to a denied hostname")
 			return nil, ErrBlockedAddress
 		}
-		if !portAllowed(port) {
+		if !portAllowed(port, ports) {
 			log.Warn().Str("host", host).Str("port", port).Msg("safehttp: blocked request to a non-web port")
 			return nil, ErrBlockedAddress
 		}
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		ips, err := resolver.LookupIP(ctx, "ip", host)
 		if err != nil {
 			return nil, err
 		}
@@ -147,11 +180,15 @@ func safeDialContext(dialer *net.Dialer) func(context.Context, string, string) (
 	}
 }
 
-// Client returns an SSRF-hardened *http.Client with the given overall timeout.
-func Client(timeout time.Duration) *http.Client {
+// NewTransport is the SSRF-hardened transport for the given ports; none means 443 and 8443.
+func NewTransport(ports ...string) *http.Transport {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	transport := &http.Transport{
-		DialContext:           safeDialContext(dialer),
+	return transport(safeDialContext(dialer, ports))
+}
+
+func transport(dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+	return &http.Transport{
+		DialContext:           dial,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -159,9 +196,28 @@ func Client(timeout time.Duration) *http.Client {
 		ResponseHeaderTimeout: 10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+}
+
+// PublicClient never honors the development-only unsafe webhook escape hatch.
+func PublicClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: transport,
+		Transport: transport(publicDialContext(dialer, nil)),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 || req.URL.Scheme != "https" || req.URL.User != nil {
+				return errors.New("image redirect is not allowed")
+			}
+			return nil
+		},
+	}
+}
+
+// Client returns an SSRF-hardened *http.Client with the given overall timeout.
+func Client(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: NewTransport(),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return errors.New("too many redirects")

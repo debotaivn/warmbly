@@ -50,13 +50,21 @@ const (
 type AuditEntityType string
 
 const (
-	AuditEntityCampaign     AuditEntityType = "campaign"
-	AuditEntityContact      AuditEntityType = "contact"
-	AuditEntityEmailAccount AuditEntityType = "email_account"
-	AuditEntityAPIKey       AuditEntityType = "api_key"
-	AuditEntitySequence     AuditEntityType = "step"
-	AuditEntityUser         AuditEntityType = "user"
-	AuditEntityOrganization AuditEntityType = "organization"
+	AuditEntityCampaign AuditEntityType = "campaign"
+	// AuditEntityCampaignLead is ONE contact inside ONE campaign: the entity id
+	// is the contact and metadata carries the campaign. Written when a member
+	// pauses or resumes that lead's flow, or changes who it copies.
+	AuditEntityCampaignLead   AuditEntityType = "campaign_lead"
+	AuditEntityContact        AuditEntityType = "contact"
+	AuditEntityEmailAccount   AuditEntityType = "email_account"
+	AuditEntityMailboxImport  AuditEntityType = "mailbox_import"
+	AuditEntityMailboxGrant   AuditEntityType = "mailbox_grant"
+	AuditEntityMailboxVendor  AuditEntityType = "mailbox_vendor"
+	AuditEntityDomainRedirect AuditEntityType = "domain_redirect"
+	AuditEntityAPIKey         AuditEntityType = "api_key"
+	AuditEntitySequence       AuditEntityType = "step"
+	AuditEntityUser           AuditEntityType = "user"
+	AuditEntityOrganization   AuditEntityType = "organization"
 	// AuditEntityOrgRisk carries a risk-posture transition. It rides the audit
 	// spine like every other entity, so a change reaches every teammate's
 	// dashboard without a bespoke emit site.
@@ -65,21 +73,28 @@ const (
 	AuditEntityAWSCredentials AuditEntityType = "aws_credentials"
 	AuditEntityWorkerProfile  AuditEntityType = "worker_profile"
 	AuditEntityRelease        AuditEntityType = "release"
+	// AuditEntityInstance is the deployment itself: settings and updates.
+	AuditEntityInstance AuditEntityType = "instance"
 
 	// Org-scoped configuration & governance entities
 	AuditEntityOrganizationMember AuditEntityType = "organization_member"
 	AuditEntityInvitation         AuditEntityType = "invitation"
 	AuditEntityTemplate           AuditEntityType = "template"
-	AuditEntityWebhook            AuditEntityType = "webhook"
-	AuditEntityIntegration        AuditEntityType = "integration"
-	AuditEntityWarmupRoutingRule  AuditEntityType = "warmup_routing_rule"
-	AuditEntityFolder             AuditEntityType = "folder"
-	AuditEntityTag                AuditEntityType = "tag"
-	AuditEntityCategory           AuditEntityType = "category"
-	AuditEntitySegment            AuditEntityType = "segment"
-	AuditEntityForm               AuditEntityType = "form"
-	AuditEntitySubscription       AuditEntityType = "subscription"
-	AuditEntitySettings           AuditEntityType = "settings"
+	// AuditEntityEmailImage is one image in the workspace's library for email
+	// bodies. Audited so a teammate's upload or removal reaches every open
+	// composer through the spine.
+	AuditEntityEmailImage        AuditEntityType = "email_image"
+	AuditEntityWebhook           AuditEntityType = "webhook"
+	AuditEntityIntegration       AuditEntityType = "integration"
+	AuditEntityWarmupRoutingRule AuditEntityType = "warmup_routing_rule"
+	AuditEntityFolder            AuditEntityType = "folder"
+	AuditEntityTag               AuditEntityType = "tag"
+	AuditEntityCategory          AuditEntityType = "category"
+	AuditEntitySegment           AuditEntityType = "segment"
+	AuditEntityForm              AuditEntityType = "form"
+	AuditEntitySubscription      AuditEntityType = "subscription"
+	AuditEntitySettings          AuditEntityType = "settings"
+	AuditEntitySuppression       AuditEntityType = "suppression"
 
 	// CRM entities
 	AuditEntityCRMPipeline AuditEntityType = "crm_pipeline"
@@ -118,6 +133,9 @@ const (
 	// AI skill (org playbook) create/update/delete.
 	AuditEntityAISkill AuditEntityType = "ai_skill"
 
+	// Workspace "always allow" policy for one assistant tool, set or revoked.
+	AuditEntityAIToolPolicy AuditEntityType = "ai_tool_policy"
+
 	// Connected MCP server (external tools) connect/update/disconnect.
 	AuditEntityMCPServer AuditEntityType = "mcp_server"
 
@@ -131,6 +149,21 @@ const (
 	// spine so the settings page and mailbox lists refresh for every member.
 	AuditEntityPoolLink  AuditEntityType = "pool_link"
 	AuditEntityCloudLink AuditEntityType = "cloud_link"
+
+	// Community directory listing of one of the workspace's OAuth apps.
+	AuditEntityAppListing AuditEntityType = "app_listing"
+
+	// Operator moderation of an OAuth app, and a block on who may register them.
+	AuditEntityOAuthApplication    AuditEntityType = "oauth_application"
+	AuditEntityOAuthDeveloperBlock AuditEntityType = "oauth_developer_block"
+	// A member's authorization of an OAuth app, revoked by a workspace admin.
+	AuditEntityOAuthAuthorization AuditEntityType = "oauth_authorization"
+
+	// Inbox placement: a test or batch started or cancelled, and a campaign's
+	// scheduled test set up, changed or removed.
+	AuditEntityPlacementTest    AuditEntityType = "placement_test"
+	AuditEntityPlacementMonitor AuditEntityType = "placement_monitor"
+	AuditEntityPlacementBatch   AuditEntityType = "placement_batch"
 )
 
 // AuditActor is the minimal identity of the member who performed an action,

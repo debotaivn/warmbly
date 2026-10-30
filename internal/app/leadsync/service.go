@@ -31,10 +31,9 @@ import (
 // the same amount of data either way.
 const previewRows = models.MaxContactImportPreviewRows + 1
 
-// fullColumnSpan is the widest A1 column range we read. Google Sheets caps at
-// far more, but contact imports are narrow; A:Z is plenty for typical lead
-// sheets and keeps the read cheap.
-const fullColumnSpan = "A:Z"
+// fullColumnSpan runs to Sheets' last column (ZZZ). The API drops trailing empty
+// columns from the response, so a narrow sheet costs no more than it would under A:Z.
+const fullColumnSpan = "A:ZZZ"
 
 // Service is the on-demand lead-sync control-plane surface.
 type Service interface {
@@ -47,7 +46,7 @@ type Service interface {
 	Preview(ctx context.Context, orgID, connID uuid.UUID, sheetID, tabTitle string) (*models.ContactImportPreview, *errx.Error)
 
 	// Source CRUD.
-	List(ctx context.Context, orgID uuid.UUID, campaignID *uuid.UUID) ([]models.LeadSyncSource, error)
+	List(ctx context.Context, orgID uuid.UUID, campaignID, segmentID *uuid.UUID) ([]models.LeadSyncSource, error)
 	Get(ctx context.Context, orgID, id uuid.UUID) (*models.LeadSyncSource, *errx.Error)
 	Create(ctx context.Context, orgID, userID uuid.UUID, in *models.CreateLeadSyncSource) (*models.LeadSyncSource, *errx.Error)
 	Update(ctx context.Context, orgID, id uuid.UUID, in *models.UpdateLeadSyncSource) (*models.LeadSyncSource, *errx.Error)
@@ -103,6 +102,7 @@ func (s *service) Preview(ctx context.Context, orgID, connID uuid.UUID, sheetID,
 		sample = append(sample, padRow(values[i], width))
 	}
 
+	suggested, inferred := s.contacts.SuggestImportMapping(ctx, orgID, headers, sample)
 	return &models.ContactImportPreview{
 		Filename:         "google-sheets-sync.csv",
 		Format:           "csv",
@@ -110,12 +110,13 @@ func (s *service) Preview(ctx context.Context, orgID, connID uuid.UUID, sheetID,
 		Columns:          headers,
 		HasHeader:        true,
 		SampleRows:       sample,
-		SuggestedMapping: suggestMapping(headers),
+		SuggestedMapping: suggested,
+		InferredColumns:  inferred,
 	}, nil
 }
 
-func (s *service) List(ctx context.Context, orgID uuid.UUID, campaignID *uuid.UUID) ([]models.LeadSyncSource, error) {
-	return s.repo.List(ctx, orgID, campaignID)
+func (s *service) List(ctx context.Context, orgID uuid.UUID, campaignID, segmentID *uuid.UUID) ([]models.LeadSyncSource, error) {
+	return s.repo.List(ctx, orgID, campaignID, segmentID)
 }
 
 func (s *service) Get(ctx context.Context, orgID, id uuid.UUID) (*models.LeadSyncSource, *errx.Error) {
@@ -166,6 +167,16 @@ func (s *service) Create(ctx context.Context, orgID, userID uuid.UUID, in *model
 	if cats == nil {
 		cats = []string{}
 	}
+	segs := in.SegmentIDs
+	if segs == nil {
+		segs = []string{}
+	}
+	if xerr := s.contacts.ValidateSegmentTargets(ctx, orgID, segs); xerr != nil {
+		return nil, xerr
+	}
+	if xerr := s.validateLinkTargets(ctx, orgID, in.TargetCampaignID, cats); xerr != nil {
+		return nil, xerr
+	}
 
 	src := &models.LeadSyncSource{
 		OrganizationID:    orgID,
@@ -181,6 +192,7 @@ func (s *service) Create(ctx context.Context, orgID, userID uuid.UUID, in *model
 		Dedup:             in.Dedup,
 		TargetCampaignID:  in.TargetCampaignID,
 		CategoryIDs:       cats,
+		SegmentIDs:        segs,
 		SubscribedDefault: subscribed,
 		Label:             strings.TrimSpace(in.Label),
 		Status:            models.LeadSyncStatusIdle,
@@ -240,6 +252,21 @@ func (s *service) Update(ctx context.Context, orgID, id uuid.UUID, in *models.Up
 	if in.CategoryIDs != nil {
 		src.CategoryIDs = *in.CategoryIDs
 	}
+	if in.TargetCampaignID != nil || in.CategoryIDs != nil {
+		var changedCats []string
+		if in.CategoryIDs != nil {
+			changedCats = *in.CategoryIDs
+		}
+		if xerr := s.validateLinkTargets(ctx, orgID, in.TargetCampaignID, changedCats); xerr != nil {
+			return nil, xerr
+		}
+	}
+	if in.SegmentIDs != nil {
+		if xerr := s.contacts.ValidateSegmentTargets(ctx, orgID, *in.SegmentIDs); xerr != nil {
+			return nil, xerr
+		}
+		src.SegmentIDs = *in.SegmentIDs
+	}
 	if in.SubscribedDefault != nil {
 		src.SubscribedDefault = *in.SubscribedDefault
 	}
@@ -297,14 +324,18 @@ func (s *service) SyncNow(ctx context.Context, triggeringUserID, orgID, sourceID
 	}
 	subscribed := src.SubscribedDefault
 	opts := &models.ContactImportCommit{
-		Mapping:           src.ColumnMapping,
-		Dedup:             src.Dedup,
-		HasHeader:         src.HasHeader,
-		CategoryIDs:       src.CategoryIDs,
-		CampaignIDs:       campaignIDs,
-		SubscribedDefault: &subscribed,
-		Source:            models.ContactSourceSheetSync,
-		SourceDetail:      src.SheetTitle,
+		Mapping:     src.ColumnMapping,
+		Dedup:       src.Dedup,
+		HasHeader:   src.HasHeader,
+		CategoryIDs: src.CategoryIDs,
+		CampaignIDs: campaignIDs,
+		SegmentIDs:  src.SegmentIDs,
+		// A segment deleted after the source was saved is dropped from the run;
+		// a recurring sync must not stop importing because a target is gone.
+		SkipMissingSegments: true,
+		SubscribedDefault:   &subscribed,
+		Source:              models.ContactSourceSheetSync,
+		SourceDetail:        src.SheetTitle,
 	}
 
 	result, ierr := s.contacts.ImportCommit(ctx, triggeringUserID.String(), orgID, bytes.NewReader(csvBytes), "google-sheets-sync.csv", opts)
@@ -337,7 +368,7 @@ func (s *service) recordResult(ctx context.Context, id uuid.UUID, status models.
 func buildA1Range(tabTitle string, maxRows int) string {
 	span := fullColumnSpan
 	if maxRows > 0 {
-		span = "A1:Z" + strconv.Itoa(maxRows)
+		span = "A1:ZZZ" + strconv.Itoa(maxRows)
 	}
 	tab := strings.TrimSpace(tabTitle)
 	if tab == "" {
@@ -397,34 +428,14 @@ func padRow(row []string, n int) []string {
 	return out
 }
 
-// suggestMapping applies the same fuzzy header heuristics the contact importer
-// uses so the dashboard's preview arrives with sensible defaults.
-func suggestMapping(headers []string) []models.ContactImportColumnMapping {
-	out := make([]models.ContactImportColumnMapping, len(headers))
-	for i, h := range headers {
-		out[i] = guessTarget(i, h)
+// validateLinkTargets refuses a target campaign or category that is not the organization's own.
+func (s *service) validateLinkTargets(ctx context.Context, orgID uuid.UUID, campaignID *uuid.UUID, categoryIDs []string) *errx.Error {
+	ok, err := s.repo.TargetsInOrganization(ctx, orgID, campaignID, categoryIDs)
+	if err != nil {
+		return errx.InternalError()
 	}
-	return out
-}
-
-func guessTarget(idx int, header string) models.ContactImportColumnMapping {
-	key := strings.ToLower(header)
-	key = strings.NewReplacer(" ", "", "_", "", "-", "", ".", "").Replace(key)
-	switch key {
-	case "email", "emailaddress", "mail", "primaryemail":
-		return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetEmail}
-	case "firstname", "givenname", "fname", "first":
-		return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetFirstName}
-	case "lastname", "familyname", "surname", "lname", "last":
-		return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetLastName}
-	case "company", "companyname", "organization", "organisation", "employer", "account", "accountname":
-		return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetCompany}
-	case "phone", "phonenumber", "mobile", "cell":
-		return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetPhone}
-	case "subscribed", "optin", "optedin", "subscribe":
-		return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetSubscribed}
-	case "categories", "category", "tags", "tag", "labels", "label":
-		return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetCategories}
+	if !ok {
+		return errx.NewWithIdentifier(errx.BadRequest, "lead_sync_target_not_found", "The target campaign or a category does not exist in this workspace.")
 	}
-	return models.ContactImportColumnMapping{Index: idx, Target: models.ContactImportTargetIgnore}
+	return nil
 }

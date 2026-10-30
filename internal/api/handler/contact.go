@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -12,8 +14,6 @@ import (
 	"github.com/warmbly/warmbly/internal/models"
 )
 
-const maxBulkOperationSize = 1000
-
 func (h *Handler) AddContacts(c *gin.Context) {
 	userIDStr := middleware.GetUserID(c)
 
@@ -23,10 +23,18 @@ func (h *Handler) AddContacts(c *gin.Context) {
 		return
 	}
 
+	var raw json.RawMessage
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		errx.Handle(c, errx.InvalidBody(err))
+		return
+	}
+	// A single contact may be sent as a bare object; it is read as a one-item array.
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 && trimmed[0] == '{' {
+		raw = append(append(json.RawMessage{'['}, trimmed...), ']')
+	}
 	var data []models.AddContact
-
-	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+	if err := json.Unmarshal(raw, &data); err != nil {
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -87,7 +95,7 @@ func (h *Handler) SearchContacts(c *gin.Context) {
 	var data models.SearchContacts
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -149,18 +157,21 @@ func (h *Handler) UpdateContactBulk(c *gin.Context) {
 	var data models.BulkEditContactsData
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
-	if len(data.Contacts) == 0 {
-		errx.Handle(c, errx.New(errx.BadRequest, "no contacts provided"))
+	ids, ok := h.resolveContactSelection(c, *orgID, data.ContactSelection)
+	if !ok {
 		return
 	}
-	if len(data.Contacts) > maxBulkOperationSize {
-		errx.Handle(c, errx.New(errx.BadRequest, fmt.Sprintf("too many contacts, maximum is %d per batch", maxBulkOperationSize)))
-		return
-	}
+	// From here the action names the ids it resolved to, so the service and
+	// the audit entry never see the filter shape. A select-all can cover tens
+	// of thousands of contacts, so its response carries the count rather than
+	// every updated row.
+	selectAll := data.All
+	data.ContactSelection = models.ContactSelection{Contacts: ids}
+	data.SkipRows = selectAll
 
 	resp, err := h.ContactService.BulkUpdate(c.Request.Context(), userIDStr, *orgID, &data)
 	if err != nil {
@@ -188,7 +199,7 @@ func (h *Handler) UpdateContact(c *gin.Context) {
 	var data models.UpdateContact
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -215,29 +226,34 @@ func (h *Handler) DeleteContactBulk(c *gin.Context) {
 		return
 	}
 
-	var data []string
+	// Two accepted bodies: the original bare id array, and a selection object
+	// ({"all":true,"filters":{...}}) for "select all matching". The array form
+	// is the published contract, so it keeps working untouched.
+	var raw json.RawMessage
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		errx.Handle(c, errx.InvalidBody(err))
+		return
+	}
+	var sel models.ContactSelection
+	if err := json.Unmarshal(raw, &sel.Contacts); err != nil {
+		if err := json.Unmarshal(raw, &sel); err != nil {
+			errx.Handle(c, errx.InvalidBody(err))
+			return
+		}
+	}
 
-	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+	ids, ok := h.resolveContactSelection(c, *orgID, sel)
+	if !ok {
 		return
 	}
 
-	if len(data) == 0 {
-		errx.Handle(c, errx.New(errx.BadRequest, "no contacts provided"))
-		return
-	}
-	if len(data) > maxBulkOperationSize {
-		errx.Handle(c, errx.New(errx.BadRequest, fmt.Sprintf("too many contacts, maximum is %d per batch", maxBulkOperationSize)))
-		return
-	}
-
-	if err := h.ContactService.BulkDelete(c.Request.Context(), userIDStr, *orgID, data); err != nil {
+	if err := h.ContactService.BulkDelete(c.Request.Context(), userIDStr, *orgID, ids); err != nil {
 		errx.Handle(c, err)
 		return
 	}
 
 	// Audit log - bulk delete
-	h.auditOrg(c, models.AuditActionDelete, models.AuditEntityContact, nil, nil, map[string]string{"bulk": "true", "count": fmt.Sprintf("%d", len(data))})
+	h.auditOrg(c, models.AuditActionDelete, models.AuditEntityContact, nil, nil, map[string]string{"bulk": "true", "count": fmt.Sprintf("%d", len(ids))})
 
 	c.Status(http.StatusNoContent)
 }

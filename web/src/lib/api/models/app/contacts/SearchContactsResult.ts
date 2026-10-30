@@ -19,8 +19,8 @@ export interface ContactsCounts {
     verification?: ContactVerificationCounts;
 }
 
-// Org contacts by verification verdict. pending is the subset of unknown
-// nobody has checked yet.
+// Org contacts by verification verdict. pending counts contacts never checked
+// plus those with a re-check queued.
 export interface ContactVerificationCounts {
     valid: number;
     risky: number;
@@ -42,6 +42,9 @@ export interface CampaignLeadCounts {
     bounced: number;
     failed: number;
     unsubscribed: number;
+    // Leads whose flow is held (an out-of-office auto-reply, or a member
+    // pausing them) and resumes where it stopped.
+    paused: number;
     // Leads the campaign will never send to: address verification refused them.
     undeliverable: number;
     // Engagement totals matching the `engagement` filter: leads sent at least
@@ -50,6 +53,17 @@ export interface CampaignLeadCounts {
     opened: number;
     clicked: number;
     replied_any: number;
+    // Leads by their inbox's provider family, the grouping ESP matching uses.
+    providers?: CampaignLeadProviderCounts;
+}
+
+export interface CampaignLeadProviderCounts {
+    gmail: number;
+    outlook: number;
+    // Includes checked domains with no known provider; they match like other.
+    other: number;
+    // Leads whose provider the background check has not read yet.
+    undetected: number;
 }
 
 export default interface SearchContactsResult {

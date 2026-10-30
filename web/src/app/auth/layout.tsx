@@ -1,9 +1,10 @@
 import React from "react";
-import { Navigate, useLocation, useNavigate, useOutlet } from "react-router-dom";
+import { Navigate, Outlet, useMatches, useNavigate } from "@tanstack/react-router";
 import { AnimatePresence, motion } from "motion/react";
-import { APP_URL, WEBSITE_URL } from "@/lib/information";
+import { APP_URL } from "@/lib/information";
+import useBrand from "@/hooks/useBrand";
+import BrandMark from "@/components/shared/BrandMark";
 import getToken from "@/lib/helper/getToken";
-import { Logo } from "@/components/svg";
 import AuthShowcase from "./_components/AuthShowcase";
 
 /* ═══════════════════════════════════════════
@@ -20,13 +21,14 @@ export default function AuthLayout({
     redirectIfAuthenticated = true,
 }: { redirectIfAuthenticated?: boolean } = {}) {
     const navigate = useNavigate();
-    const location = useLocation();
-    const outlet = useOutlet();
+    // The rendered page's path, which changes with the Outlet rather than ahead of it.
+    const pathname = useMatches({ select: (m) => m[m.length - 1]?.pathname ?? "" });
+    const brand = useBrand();
 
     React.useEffect(() => {
         const receiveMessage = (event: MessageEvent) => {
             if (event.origin !== APP_URL) return;
-            if (event.data?.type === "auth") navigate("/app/emails");
+            if (event.data?.type === "auth") navigate({ to: "/app/emails" });
         };
         window.addEventListener("message", receiveMessage);
         return () => window.removeEventListener("message", receiveMessage);
@@ -49,20 +51,14 @@ export default function AuthLayout({
 
             <div className="relative z-10 w-full max-w-[400px] lg:max-w-[900px]">
                 {/* Mobile logo — white, on the sky, above the card */}
-                <a href={WEBSITE_URL} className="mb-5 flex w-fit items-center gap-2.5 mx-auto lg:hidden">
-                    <Logo className="w-7 text-white" />
-                    <span className="font-extrabold text-[18px] tracking-tight text-white">Warmbly</span>
-                </a>
+                <BrandMark className="mb-5 flex w-fit items-center gap-2.5 mx-auto lg:hidden" />
 
                 {/* Card */}
                 <div className="animate-card-float grid overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04),0_30px_70px_-32px_rgba(15,23,42,0.32)] lg:grid-cols-2 lg:min-h-[580px]">
                     {/* Showcase — desktop only */}
                     <div className="relative hidden lg:block lg:border-r lg:border-slate-200">
                         <AuthShowcase />
-                        <a href={WEBSITE_URL} className="absolute left-8 top-8 z-20 flex items-center gap-2.5">
-                            <Logo className="w-7 text-white" />
-                            <span className="font-extrabold text-[18px] tracking-tight text-white">Warmbly</span>
-                        </a>
+                        <BrandMark className="absolute left-8 top-8 z-20 flex items-center gap-2.5" />
                     </div>
 
                     {/* Form column */}
@@ -70,16 +66,16 @@ export default function AuthLayout({
                         <div className="mx-auto flex w-full max-w-[360px] flex-1 flex-col">
                             <div className="flex flex-1 items-center">
                                 <div className="w-full">
-                                    {/* Animate full route changes too (login → forgot password) */}
-                                    <AnimatePresence mode="wait" initial={false}>
+                                    {/* Animate full route changes too (login → forgot password).
+                                        Enter only: an exiting <Outlet /> would already render the next page. */}
+                                    <AnimatePresence initial={false}>
                                         <motion.div
-                                            key={location.pathname}
+                                            key={pathname}
                                             initial={{ opacity: 0, x: 12 }}
                                             animate={{ opacity: 1, x: 0 }}
-                                            exit={{ opacity: 0, x: -12 }}
                                             transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
                                         >
-                                            {outlet}
+                                            <Outlet />
                                         </motion.div>
                                     </AnimatePresence>
                                 </div>
@@ -87,21 +83,25 @@ export default function AuthLayout({
 
                             {/* Footer — desktop, inside the card */}
                             <div className="hidden items-center gap-3 pt-9 text-[12px] text-slate-400 lg:flex">
-                                <a href={`${WEBSITE_URL}/terms`} target="_blank" rel="noopener noreferrer" className="hover:text-slate-700 transition-colors">Terms</a>
-                                <a href={`${WEBSITE_URL}/privacy`} target="_blank" rel="noopener noreferrer" className="hover:text-slate-700 transition-colors">Privacy</a>
-                                <span className="ml-auto">© {new Date().getFullYear()} Warmbly</span>
+                                {brand.terms_url && <a href={brand.terms_url} target="_blank" rel="noopener noreferrer" className="hover:text-slate-700 transition-colors">Terms</a>}
+                                {brand.privacy_url && <a href={brand.privacy_url} target="_blank" rel="noopener noreferrer" className="hover:text-slate-700 transition-colors">Privacy</a>}
+                                <span className="ml-auto">© {new Date().getFullYear()} {brand.name}</span>
                             </div>
                         </div>
                     </div>
                 </div>
 
                 {/* Footer — mobile, on the sky below the card */}
-                <div className="mt-5 flex items-center justify-center gap-3 text-[12px] text-white/70 lg:hidden">
-                    <a href={`${WEBSITE_URL}/terms`} target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors">Terms</a>
-                    <span className="text-white/40">·</span>
-                    <a href={`${WEBSITE_URL}/privacy`} target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors">Privacy</a>
-                    <span className="text-white/40">·</span>
-                    <span>© {new Date().getFullYear()} Warmbly</span>
+                <div className="theme-solid mt-5 flex items-center justify-center gap-3 text-[12px] text-white/70 lg:hidden">
+                    {brand.terms_url && <>
+                        <a href={brand.terms_url} target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors">Terms</a>
+                        <span className="text-white/40">·</span>
+                    </>}
+                    {brand.privacy_url && <>
+                        <a href={brand.privacy_url} target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors">Privacy</a>
+                        <span className="text-white/40">·</span>
+                    </>}
+                    <span>© {new Date().getFullYear()} {brand.name}</span>
                 </div>
             </div>
         </div>

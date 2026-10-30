@@ -1,16 +1,17 @@
-// Workers explorer — the managed-worker control plane as a faceted browser.
-// Data is fetched all-at-once from /admin/workers/managed (small N), so search,
-// faceting, and sort run client-side; the Explorer rail mirrors the Users /
-// Organizations / Mailboxes browsers. SSH lifecycle (install / restart /
-// uninstall) lives in each worker's detail page.
+// Fleet explorer: every machine running Warmbly, as a faceted browser.
+//
+// Both roles are here: a worker sends and syncs mail, a consumer processes
+// events. They share one lifecycle (enrol, heartbeat, self-update) so they
+// share one table. Data is fetched all-at-once (small N), so search, faceting
+// and sort run client-side, mirroring the Users / Organizations browsers.
 
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { Plus } from "lucide-react";
 import { PageHeader } from "@/components/layout/PageHeader";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { StatusBadge, StatusDot } from "@/components/ui/kit";
 import {
     Explorer,
     FilterGroup,
@@ -22,8 +23,10 @@ import {
 } from "@/components/data/Explorer";
 import { DataTable, type Column } from "@/components/data/DataTable";
 import { emptyRange, rangeActive, type DateRange } from "@/lib/dateRange";
-import { listManagedWorkers } from "@/lib/api/client/admin/workers";
-import type { ManagedWorker } from "@/lib/api/models/admin";
+import { listFleetNodes, nodeNeedsUpdate, nodeIsLive, type FleetNode } from "@/lib/api/client/admin/fleetNodes";
+import { ResourceUsage } from "./fleet/ResourceUsage";
+import { resourceCSV } from "./fleet/format";
+import { TONE_TEXT, type Tone } from "@/lib/tones";
 
 const OFFLINE_MS = 5 * 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -43,7 +46,7 @@ function inDateRange(iso: string | undefined, r: DateRange): boolean {
 
 type LiveKey = "online" | "stale" | "offline" | "none";
 
-function liveKey(w: ManagedWorker): LiveKey {
+function liveKey(w: FleetNode): LiveKey {
     if (!w.last_seen_at) return "none";
     const age = Date.now() - new Date(w.last_seen_at).getTime();
     if (age < 90_000) return "online";
@@ -51,58 +54,109 @@ function liveKey(w: ManagedWorker): LiveKey {
     return "offline";
 }
 
-const LIVE_LABEL: Record<LiveKey, { label: string; cls: string }> = {
-    online: { label: "online", cls: "text-emerald-600" },
-    stale: { label: "stale", cls: "text-amber-600" },
-    offline: { label: "offline", cls: "text-red-600" },
-    none: { label: "no heartbeat", cls: "text-zinc-400" },
+const LIVE_LABEL: Record<LiveKey, { label: string; tone: Tone }> = {
+    online: { label: "online", tone: "success" },
+    stale: { label: "stale", tone: "warning" },
+    offline: { label: "offline", tone: "danger" },
+    none: { label: "no heartbeat", tone: "neutral" },
 };
 
-const columns: Column<ManagedWorker>[] = [
+const Empty = () => <span className="text-subtle-foreground">—</span>;
+
+const columns: Column<FleetNode>[] = [
     {
         id: "name",
         header: "Worker",
         sortable: true,
         sortKey: "name",
         cell: (w) => (
-            <div>
-                <Link to={`/workers/${w.id}`} onClick={(e) => e.stopPropagation()} className="font-medium text-[var(--admin-accent-strong)] hover:underline">
+            <div className="min-w-0">
+                <Link
+                    to={`/workers/${w.id}`}
+                    onClick={(e) => e.stopPropagation()}
+                    className="font-medium text-foreground hover:underline underline-offset-2"
+                >
                     {w.name || w.id.slice(0, 8)}
                 </Link>
-                <div className="font-mono text-[10px] text-muted-foreground">{w.id}</div>
+                <div className="truncate font-mono text-[11px] text-subtle-foreground">{w.id}</div>
             </div>
         ),
         csv: (w) => w.name || w.id,
     },
     {
-        id: "host",
-        header: "Host",
-        cell: (w) => (
-            <span className="font-mono text-[11px]">
-                {w.ssh_user ? `${w.ssh_user}@` : ""}
-                {w.ssh_host || w.ip_addr}
-                {w.ssh_port ? `:${w.ssh_port}` : ""}
-            </span>
-        ),
-        csv: (w) => w.ssh_host || w.ip_addr,
+        id: "role",
+        header: "Role",
+        sortable: true,
+        sortKey: "role",
+        cell: (w) => <StatusBadge tone={w.role === "worker" ? "accent" : "strong"}>{w.role}</StatusBadge>,
+        csv: (w) => w.role,
+    },
+    {
+        id: "address",
+        header: "Address",
+        cell: (w) => (w.address ? <span className="font-mono text-xs text-muted-foreground">{w.address}</span> : <Empty />),
+        csv: (w) => w.address,
+    },
+    {
+        id: "region",
+        header: "Region",
+        cell: (w) => (w.region ? <span className="font-mono text-xs text-muted-foreground">{w.region}</span> : <Empty />),
+        csv: (w) => w.region,
     },
     {
         id: "live",
         header: "Live",
         cell: (w) => {
             const l = LIVE_LABEL[liveKey(w)];
-            return <span className={`text-xs font-medium ${l.cls}`}>{l.label}</span>;
+            return (
+                <StatusDot tone={l.tone} pulse={l.tone === "success"} className="text-[12.5px] text-muted-foreground">
+                    {l.label}
+                </StatusDot>
+            );
         },
         csv: (w) => LIVE_LABEL[liveKey(w)].label,
     },
-    { id: "mailboxes", header: "Mailboxes", align: "right", sortable: true, sortKey: "mailboxes", cell: (w) => <span className="tabular-nums">{w.account_count}</span>, csv: (w) => w.account_count },
     {
-        id: "image",
-        header: "Image",
-        cell: (w) => (w.image_version ? <span className="font-mono text-xs">{w.image_version}</span> : <span className="text-xs text-muted-foreground">—</span>),
-        csv: (w) => w.image_version || "",
+        id: "mailboxes",
+        header: "Mailboxes",
+        align: "right",
+        sortable: true,
+        sortKey: "mailboxes",
+        cell: (w) =>
+            w.mailbox_count === undefined ? (
+                <Empty />
+            ) : (
+                <span className="tabular-nums">{w.mailbox_count}</span>
+            ),
+        csv: (w) => w.mailbox_count ?? "",
+    },
+    {
+        // The pending update is shown inline, because "which machines are
+        // behind" is the question this table exists to answer.
+        id: "version",
+        header: "Version",
+        cell: (w) =>
+            nodeNeedsUpdate(w) ? (
+                <span className="font-mono text-xs whitespace-nowrap" title="Update pending">
+                    {w.version || "—"}
+                    <span className="text-subtle-foreground"> → </span>
+                    <span className={TONE_TEXT.warning}>{w.desired_version}</span>
+                </span>
+            ) : (
+                <span className="font-mono text-xs text-muted-foreground">{w.version || "—"}</span>
+            ),
+        csv: (w) => w.version || "",
+    },
+    {
+        id: "memory",
+        header: "Process RAM",
+        align: "right",
+        cell: (w) => <ResourceUsage usage={w.usage} kind="resident" live={nodeIsLive(w)} />,
+        csv: (w) => nodeIsLive(w) ? w.usage?.resident_mb ?? "" : "stale",
         defaultHidden: true,
     },
+    { id: "cpu", header: "CPU", align: "right", cell: (w) => <ResourceUsage usage={w.usage} kind="cpu" live={nodeIsLive(w)} />, csv: (w) => resourceCSV(w.usage, "cpu", nodeIsLive(w)), defaultHidden: true },
+    { id: "ram", header: "RAM", align: "right", cell: (w) => <ResourceUsage usage={w.usage} kind="memory" live={nodeIsLive(w)} />, csv: (w) => resourceCSV(w.usage, "memory", nodeIsLive(w)), defaultHidden: true },
     {
         id: "tags",
         header: "Tags",
@@ -110,13 +164,11 @@ const columns: Column<ManagedWorker>[] = [
             w.tags && w.tags.length ? (
                 <div className="flex flex-wrap gap-1">
                     {w.tags.map((t) => (
-                        <Badge key={t} variant="outline" className="text-[10px]">
-                            {t}
-                        </Badge>
+                        <StatusBadge key={t}>{t}</StatusBadge>
                     ))}
                 </div>
             ) : (
-                <span className="text-xs text-muted-foreground">—</span>
+                <Empty />
             ),
         csv: (w) => (w.tags || []).join(" "),
         defaultHidden: true,
@@ -126,7 +178,11 @@ const columns: Column<ManagedWorker>[] = [
         header: "Last seen",
         sortable: true,
         sortKey: "seen",
-        cell: (w) => <span className="text-xs text-muted-foreground">{w.last_seen_at ? new Date(w.last_seen_at).toLocaleString() : "—"}</span>,
+        cell: (w) => (
+            <span className="whitespace-nowrap text-muted-foreground tabular-nums">
+                {w.last_seen_at ? new Date(w.last_seen_at).toLocaleString() : "—"}
+            </span>
+        ),
         csv: (w) => w.last_seen_at || "",
     },
     {
@@ -134,18 +190,24 @@ const columns: Column<ManagedWorker>[] = [
         header: "Created",
         sortable: true,
         sortKey: "created",
-        cell: (w) => <span className="text-xs text-muted-foreground">{new Date(w.created_at).toLocaleDateString()}</span>,
+        cell: (w) => (
+            <span className="whitespace-nowrap text-muted-foreground tabular-nums">
+                {new Date(w.created_at).toLocaleDateString()}
+            </span>
+        ),
         csv: (w) => w.created_at,
         defaultHidden: true,
     },
 ];
 
-function compare(a: ManagedWorker, b: ManagedWorker, by: string): number {
+function compare(a: FleetNode, b: FleetNode, by: string): number {
     switch (by) {
         case "name":
             return (a.name || a.id).localeCompare(b.name || b.id);
+        case "role":
+            return a.role.localeCompare(b.role);
         case "mailboxes":
-            return a.account_count - b.account_count;
+            return (a.mailbox_count ?? -1) - (b.mailbox_count ?? -1);
         case "seen":
             return new Date(a.last_seen_at || 0).getTime() - new Date(b.last_seen_at || 0).getTime();
         case "created":
@@ -159,8 +221,7 @@ export default function WorkersPage() {
     const nav = useNavigate();
     const { data, isLoading, error, refetch } = useQuery({
         queryKey: ["admin", "workers", "managed"],
-        queryFn: listManagedWorkers,
-        refetchInterval: 15_000,
+        queryFn: () => listFleetNodes(),
     });
 
     const [query, setQuery] = useState("");
@@ -180,20 +241,20 @@ export default function WorkersPage() {
         const q = query.trim().toLowerCase();
         if (q) {
             all = all.filter((w) =>
-                `${w.name} ${w.id} ${w.ssh_host ?? ""} ${w.ip_addr} ${w.image_version ?? ""} ${(w.tags || []).join(" ")}`
+                `${w.name} ${w.id} ${w.role} ${w.address} ${w.region} ${w.version} ${(w.tags || []).join(" ")}`
                     .toLowerCase()
                     .includes(q),
             );
         }
         if (live) all = all.filter((w) => liveKey(w) === live);
         if (activeOnly) all = all.filter((w) => w.active);
-        if (hasMailboxes) all = all.filter((w) => w.account_count > 0);
+        if (hasMailboxes) all = all.filter((w) => (w.mailbox_count ?? 0) > 0);
         if (hasError) all = all.filter((w) => !!w.last_error && w.last_error !== "");
         if (hasTags) all = all.filter((w) => (w.tags?.length ?? 0) > 0);
-        if (mbMin !== undefined) all = all.filter((w) => w.account_count >= mbMin);
-        if (mbMax !== undefined) all = all.filter((w) => w.account_count <= mbMax);
+        if (mbMin !== undefined) all = all.filter((w) => (w.mailbox_count ?? 0) >= mbMin);
+        if (mbMax !== undefined) all = all.filter((w) => (w.mailbox_count ?? 0) <= mbMax);
         if (rangeActive(created)) all = all.filter((w) => inDateRange(w.created_at, created));
-        if (rangeActive(lastSeen)) all = all.filter((w) => inDateRange(w.last_seen_at, lastSeen));
+        if (rangeActive(lastSeen)) all = all.filter((w) => inDateRange(w.last_seen_at ?? undefined, lastSeen));
         if (sort.by) {
             all = [...all].sort((a, b) => compare(a, b, sort.by) * (sort.desc ? -1 : 1));
         }
@@ -228,12 +289,17 @@ export default function WorkersPage() {
     return (
         <div>
             <PageHeader
-                title="Workers"
-                description="Physical worker processes managed over SSH. One worker = one machine running the Warmbly worker binary."
+                title="Fleet"
+                meta={
+                    data?.data ? (
+                        <span className="text-[12.5px] text-muted-foreground tabular-nums">{data.data.length}</span>
+                    ) : undefined
+                }
+                description="Every machine running Warmbly. They enrol themselves, report what they are running, and stay on the version you set."
             >
                 <Button size="sm" asChild>
                     <Link to="/workers/new">
-                        <Plus className="size-4" />
+                        <Plus className="size-3.5" />
                         Add worker
                     </Link>
                 </Button>
@@ -264,7 +330,7 @@ export default function WorkersPage() {
                             <div className="flex flex-col gap-2">
                                 <ToggleFilter checked={activeOnly} onChange={setActiveOnly} label="Active only" />
                                 <ToggleFilter checked={hasMailboxes} onChange={setHasMailboxes} label="Has mailboxes" />
-                                <ToggleFilter checked={hasError} onChange={setHasError} label="Has SSH error" />
+                                <ToggleFilter checked={hasError} onChange={setHasError} label="Has node error" />
                                 <ToggleFilter checked={hasTags} onChange={setHasTags} label="Has tags" />
                             </div>
                         </FilterGroup>

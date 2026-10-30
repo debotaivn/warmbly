@@ -2,9 +2,15 @@ package config
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/warmbly/warmbly/internal/pkg/secretset"
 )
 
 type AuthConfig struct {
@@ -30,14 +36,25 @@ type AuthConfig struct {
 	AppleIOSBundleID  string
 	GoogleIOSClientID string
 
-	AuthSecret      string
-	TurnstileSecret string
-	TurnstileBypass string
+	AuthSecret               string
+	UnsubscribeSigningSecret string
+	UnsubscribeReadSecrets   []string
+	UnsubscribeReadUntil     time.Time
+	DomainProofSecret        string
+	TurnstileSecret          string
+	TurnstileBypass          string
+
+	// AppAttestAppIDs are the "<team id>.<bundle id>" values whose App Attest
+	// proofs stand in for the captcha. Empty turns native app proofs off.
+	AppAttestAppIDs []string
+	// AppAttestAllowDevelopment accepts proofs from development-signed builds.
+	AppAttestAllowDevelopment bool
 
 	// TwoFASecret is the server-wide key the TOTP secret is sealed with (AES-GCM).
 	// Must be set when 2FA is in use; falls back to AuthSecret when unset so a
 	// deployment without the env var still functions (sealed under the auth key).
-	TwoFASecret string
+	TwoFASecret      string
+	TwoFAReadSecrets []string
 
 	// WebAuthn / passkey relying-party configuration.
 	//
@@ -54,6 +71,11 @@ type AuthConfig struct {
 	WebAuthnRPDisplayName string
 	WebAuthnRPOrigins     []string
 }
+
+// MinAuthSecretLength is the floor for AUTH_SECRET. HS256 keys shorter than
+// the 256-bit hash output are brute-forceable offline from any token the
+// service has ever issued.
+const MinAuthSecretLength = 32
 
 func (c *Config) LoadAuthConfig(ctx context.Context) (*AuthConfig, error) {
 	// Social sign-in (Google/Apple) and captcha (Turnstile) are optional: a
@@ -77,13 +99,61 @@ func (c *Config) LoadAuthConfig(ctx context.Context) (*AuthConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	// HS256 signs every session, refresh, websocket, reset and challenge token
+	// with this one value, and RFC 7518 section 3.2 requires a key at least as
+	// long as the hash output. Presence was the only check, so a deployment
+	// could sign its whole auth system with a ten-character string. The
+	// realtime service applies the same floor to JWT_SECRET, which is this
+	// same value.
+	if len(authSecret) < MinAuthSecretLength {
+		return nil, fmt.Errorf(
+			"AUTH_SECRET must be at least %d characters (it signs every session token); generate one with: make gen-key",
+			MinAuthSecretLength)
+	}
 
 	turnstileSecret := c.GetSecretOptional(ctx, "TURNSTILE_SECRET", "turnstile/secret", "")
+	SetTurnstileSecretResolved(turnstileSecret != "")
 	turnstileBypass := c.GetSecretOptional(ctx, "TURNSTILE_BYPASS_TOKEN", "turnstile/bypass_token", "")
+
+	// Defaults to the iOS app this instance's Apple team ships, when it names one.
+	appAttestAppIDs := splitCSV(c.GetStringOptional(ctx, "APP_ATTEST_APP_IDS", "app-attest/app_ids", ""))
+	if len(appAttestAppIDs) == 0 && appleTeamID != "" && appleIOSBundleID != "" {
+		appAttestAppIDs = []string{appleTeamID + "." + appleIOSBundleID}
+	}
+	appAttestAllowDev := c.GetBoolOptional(ctx, "APP_ATTEST_ALLOW_DEVELOPMENT", "app-attest/allow_development", false)
 
 	// 2FA sealing key. Optional: falls back to AUTH_SECRET so existing
 	// deployments keep working; rotating it invalidates enrolled TOTP secrets.
 	twoFASecret := c.GetSecretOptional(ctx, "TWOFA_SECRET", "twofa_secret", authSecret)
+	// The fallback is AUTH_SECRET, already floored, so a short value was set explicitly.
+	twoFAShort := len(twoFASecret) < MinAuthSecretLength
+	twoFASecretShort.Store(twoFAShort)
+	if twoFAShort {
+		if HostedProduction() {
+			return nil, fmt.Errorf("TWOFA_SECRET must be at least %d characters on hosted production; generate one with: make gen-key", MinAuthSecretLength)
+		}
+		log.Printf("Warning: TWOFA_SECRET is shorter than %d characters. Generate a replacement with `warmblyctl keys generate TWOFA_SECRET`, keep the current value in TWOFA_READ_SECRETS, then run `warmblyctl keys reseal --apply`.", MinAuthSecretLength)
+	}
+	twoFAReadSecrets, err := secretset.Parse(c.GetSecretOptional(ctx, "TWOFA_READ_SECRETS", "twofa_read_secrets", ""))
+	if err != nil {
+		return nil, fmt.Errorf("TWOFA_READ_SECRETS: %w", err)
+	}
+	unsubscribeSigningSecret := c.GetSecretOptional(ctx, "UNSUBSCRIBE_SIGNING_SECRET", "unsubscribe/signing_secret", authSecret)
+	domainProofSecret := c.GetSecretOptional(ctx, "DOMAIN_PROOF_SECRET", "domain_proof_secret", authSecret)
+	if len(unsubscribeSigningSecret) < MinAuthSecretLength || len(domainProofSecret) < MinAuthSecretLength {
+		return nil, fmt.Errorf("unsubscribe and domain proof signing secrets require at least %d characters", MinAuthSecretLength)
+	}
+	unsubscribeReadSecrets, err := secretset.Parse(c.GetSecretOptional(ctx, "UNSUBSCRIBE_SIGNING_READ_SECRETS", "unsubscribe/signing_read_secrets", ""))
+	if err != nil {
+		return nil, fmt.Errorf("UNSUBSCRIBE_SIGNING_READ_SECRETS: %w", err)
+	}
+	var unsubscribeReadUntil time.Time
+	if len(unsubscribeReadSecrets) > 0 {
+		unsubscribeReadUntil, err = time.Parse(time.RFC3339, c.GetStringOptional(ctx, "UNSUBSCRIBE_SIGNING_READ_UNTIL", "unsubscribe/signing_read_until", ""))
+		if err != nil {
+			return nil, fmt.Errorf("UNSUBSCRIBE_SIGNING_READ_SECRETS requires an RFC3339 UNSUBSCRIBE_SIGNING_READ_UNTIL")
+		}
+	}
 
 	rpDisplayName := c.GetStringOptional(ctx, "WEBAUTHN_RP_DISPLAY_NAME", "webauthn/rp_display_name", "Warmbly")
 	rpIDRaw := c.GetStringOptional(ctx, "WEBAUTHN_RP_ID", "webauthn/rp_id", "")
@@ -104,10 +174,18 @@ func (c *Config) LoadAuthConfig(ctx context.Context) (*AuthConfig, error) {
 		AppleIOSBundleID:  appleIOSBundleID,
 		GoogleIOSClientID: googleIOSClientID,
 
-		AuthSecret:      authSecret,
-		TurnstileSecret: turnstileSecret,
-		TurnstileBypass: turnstileBypass,
-		TwoFASecret:     twoFASecret,
+		AuthSecret:               authSecret,
+		UnsubscribeSigningSecret: unsubscribeSigningSecret,
+		UnsubscribeReadSecrets:   unsubscribeReadSecrets,
+		UnsubscribeReadUntil:     unsubscribeReadUntil,
+		DomainProofSecret:        domainProofSecret,
+		TurnstileSecret:          turnstileSecret,
+		TurnstileBypass:          turnstileBypass,
+
+		AppAttestAppIDs:           appAttestAppIDs,
+		AppAttestAllowDevelopment: appAttestAllowDev,
+		TwoFASecret:               twoFASecret,
+		TwoFAReadSecrets:          twoFAReadSecrets,
 
 		WebAuthnRPID:          rpID,
 		WebAuthnRPDisplayName: rpDisplayName,
@@ -157,3 +235,9 @@ func hostFromOrigin(origin string) string {
 	}
 	return u.Hostname()
 }
+
+// twoFASecretShort records that the resolved TWOFA_SECRET is below MinAuthSecretLength.
+var twoFASecretShort atomic.Bool
+
+// TwoFASecretShort reports whether the last loaded TWOFA_SECRET is below MinAuthSecretLength.
+func TwoFASecretShort() bool { return twoFASecretShort.Load() }

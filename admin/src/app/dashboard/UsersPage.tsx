@@ -1,4 +1,4 @@
-// Users browser — left filter rail + a server-driven, sortable, cursor-paged
+// Users browser: left filter rail + a server-driven, sortable, cursor-paged
 // table. Searchable from every angle: identity, plan/subscription, account
 // state, count ranges, and timeline (signup / admin-granted / banned / updated)
 // date ranges. Row → detail.
@@ -8,7 +8,7 @@ import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { ShieldAlert } from "lucide-react";
 import { PageHeader } from "@/components/layout/PageHeader";
-import { Badge } from "@/components/ui/badge";
+import { StatusBadge, StatusDot } from "@/components/ui/kit";
 import {
     Explorer,
     FilterGroup,
@@ -23,7 +23,6 @@ import { DataTable, type Column } from "@/components/data/DataTable";
 import { useCursorPager } from "@/lib/useCursorPager";
 import { emptyRange, rangeActive, rangeWithin, rangeAfter, rangeBefore, type DateRange } from "@/lib/dateRange";
 import { searchUsers } from "@/lib/api/client/admin/users";
-import { listPlans } from "@/lib/api/client/admin/plans";
 import type { AdminUserDetail } from "@/lib/api/models/admin";
 
 type StatusFilter = "active" | "banned" | "all";
@@ -42,6 +41,12 @@ const SUB_STATUS_OPTIONS: { value: string; label: string }[] = [
 
 const fullName = (u: AdminUserDetail) => `${u.first_name} ${u.last_name}`.trim() || u.email;
 
+function initials(u: AdminUserDetail): string {
+    const a = (u.first_name || "").trim()[0] ?? "";
+    const b = (u.last_name || "").trim()[0] ?? "";
+    return (a + b || u.email[0] || "?").toUpperCase();
+}
+
 const columns: Column<AdminUserDetail>[] = [
     {
         id: "name",
@@ -49,22 +54,22 @@ const columns: Column<AdminUserDetail>[] = [
         sortable: true,
         sortKey: "name",
         cell: (u) => (
-            <div className="flex items-center gap-1.5">
+            <div className="flex min-w-0 items-center gap-2">
+                <span className="grid size-5 shrink-0 place-items-center rounded-full bg-muted text-[10px] font-medium text-muted-foreground">
+                    {initials(u)}
+                </span>
                 <Link
                     to={`/users/${u.id}`}
                     onClick={(e) => e.stopPropagation()}
-                    className="font-medium text-[var(--admin-accent-strong)] hover:underline"
+                    className="truncate font-medium text-foreground hover:underline"
                 >
                     {fullName(u)}
                 </Link>
                 {u.admin_permissions > 0 && (
-                    <Badge
-                        variant="outline"
-                        className="gap-0.5 text-[10px] border-[var(--admin-accent)] text-[var(--admin-accent-strong)]"
-                    >
-                        <ShieldAlert className="size-2.5" />
-                        admin
-                    </Badge>
+                    <StatusBadge tone="accent" className="h-[18px] gap-1 px-1.5 text-[11px]">
+                        <ShieldAlert className="size-3" />
+                        Admin
+                    </StatusBadge>
                 )}
             </div>
         ),
@@ -83,11 +88,13 @@ const columns: Column<AdminUserDetail>[] = [
         header: "Status",
         cell: (u) =>
             u.banned_at ? (
-                <Badge variant="outline" className="text-[10px] border-red-300 bg-red-50 text-red-700">
-                    banned
-                </Badge>
+                <StatusBadge tone="danger" dot>
+                    Banned
+                </StatusBadge>
             ) : (
-                <span className="text-xs text-emerald-600">active</span>
+                <StatusDot tone="success" className="text-muted-foreground">
+                    Active
+                </StatusDot>
             ),
         csv: (u) => (u.banned_at ? "banned" : "active"),
     },
@@ -97,7 +104,7 @@ const columns: Column<AdminUserDetail>[] = [
     {
         id: "joined",
         header: "Joined",
-        cell: (u) => <span className="text-xs text-muted-foreground">{new Date(u.created_at).toLocaleDateString()}</span>,
+        cell: (u) => <span className="tabular-nums text-muted-foreground">{new Date(u.created_at).toLocaleDateString()}</span>,
         csv: (u) => u.created_at,
         defaultHidden: true,
     },
@@ -108,7 +115,6 @@ export default function UsersPage() {
     const [query, setQuery] = useState("");
     const [status, setStatus] = useState<StatusFilter>("active");
     // Plan / subscription
-    const [planId, setPlanId] = useState("");
     const [subStatus, setSubStatus] = useState("");
     const [isEnterprise, setIsEnterprise] = useState(false);
     const [hasSubscription, setHasSubscription] = useState(false);
@@ -142,14 +148,8 @@ export default function UsersPage() {
     const pager = useCursorPager();
     const { reset } = pager;
 
-    const { data: plansData } = useQuery({ queryKey: ["admin", "plans", "facet"], queryFn: listPlans, staleTime: 5 * 60_000 });
-    const planOptions = [
-        { value: "any", label: "Any plan" },
-        ...(plansData?.data ?? []).map((p) => ({ value: p.id, label: p.name || "Untitled plan" })),
-    ];
-
     const filterKey = JSON.stringify({
-        query, status, planId, subStatus, isEnterprise, hasSubscription, hasActiveSubscription,
+        query, status, subStatus, isEnterprise, hasSubscription, hasActiveSubscription,
         adminOnly, hasOverrides, freeTrialUsed, onboardingCompleted, deletionScheduled, hasAvatar,
         hasActiveCampaign, hasBanRecord, hasDedicatedWorker,
         orgMin, orgMax, mbMin, mbMax, campMin, campMax, maxOrgMin, maxOrgMax,
@@ -166,7 +166,6 @@ export default function UsersPage() {
             searchUsers({
                 q: query.trim() || undefined,
                 status: status === "all" ? "" : status,
-                plan_id: planId || undefined,
                 subscription_status: subStatus || undefined,
                 is_enterprise: isEnterprise || undefined,
                 has_subscription: hasSubscription || undefined,
@@ -213,7 +212,6 @@ export default function UsersPage() {
     const activeCount =
         (query ? 1 : 0) +
         (status !== "active" ? 1 : 0) +
-        (planId ? 1 : 0) +
         (subStatus ? 1 : 0) +
         bools.filter(Boolean).length +
         ranges.filter(([a, b]) => a !== undefined || b !== undefined).length +
@@ -223,7 +221,6 @@ export default function UsersPage() {
     function resetAll() {
         setQuery("");
         setStatus("active");
-        setPlanId("");
         setSubStatus("");
         setIsEnterprise(false);
         setHasSubscription(false);
@@ -254,7 +251,17 @@ export default function UsersPage() {
 
     return (
         <div>
-            <PageHeader title="Users" description="Every account on the platform. Filter by identity, plan, subscription, account state, usage, and timeline — then drill in to ban, unban, or override limits." />
+            <PageHeader
+                title="Users"
+                meta={
+                    data?.pagination.total != null ? (
+                        <span className="text-[12.5px] tabular-nums text-muted-foreground">
+                            {data.pagination.total.toLocaleString()}
+                        </span>
+                    ) : undefined
+                }
+                description="Every account on the platform. Filter by identity, subscription, account state, usage, and timeline, then drill in to ban, unban, or override limits."
+            />
             <Explorer
                 activeCount={activeCount}
                 onReset={resetAll}
@@ -272,14 +279,6 @@ export default function UsersPage() {
                                     { value: "banned", label: "Banned" },
                                     { value: "all", label: "All" },
                                 ]}
-                            />
-                        </FilterGroup>
-                        <FilterGroup label="Plan">
-                            <SelectFilter
-                                value={planId || "any"}
-                                onChange={(v) => setPlanId(v === "any" ? "" : v)}
-                                options={planOptions}
-                                placeholder="Any plan"
                             />
                         </FilterGroup>
                         <FilterGroup label="Subscription">

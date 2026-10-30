@@ -10,6 +10,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/cipher"
 	"github.com/warmbly/warmbly/internal/app/credits"
 	"github.com/warmbly/warmbly/internal/app/feature"
+	"github.com/warmbly/warmbly/internal/app/unsublink"
 	warmupapp "github.com/warmbly/warmbly/internal/app/warmup"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/events"
@@ -48,12 +49,18 @@ type TasksService interface {
 	HandleEmailTask(task *proto.ProcessTask) *errx.Error
 	HandleUserEmailTask(task *proto.ProcessTask) *errx.Error
 
-	// Test email support
-	SendTestEmail(ctx context.Context, userID string, accountID uuid.UUID, recipient string, campaign *models.Campaign, sequence *models.Sequence) *errx.Error
+	// Test email and preview support. Both are org-scoped: the mailbox has to
+	// belong to orgID, and the contact (optional) is resolved by the caller.
+	SendTestEmail(ctx context.Context, orgID uuid.UUID, accountID uuid.UUID, recipient string, campaign *models.Campaign, sequence *models.Sequence, contact *models.Contact) *errx.Error
+	PreviewEmail(ctx context.Context, orgID uuid.UUID, in EmailPreviewInput) *EmailPreview
 	GetCampaignSequences(ctx context.Context, campaignID uuid.UUID) ([]models.Sequence, error)
 
 	// Warmup scheduling lifecycle
 	EnsureWarmupScheduled(ctx context.Context, accountID uuid.UUID) error
+	// ReplaceWarmupSchedule re-places the parked warmup wakeup after the mailbox's hours change.
+	ReplaceWarmupSchedule(ctx context.Context, accountID uuid.UUID) error
+	// ReplaceWorkspaceWarmupSchedules does the same for every warming mailbox reading its hours in the workspace timezone.
+	ReplaceWorkspaceWarmupSchedules(ctx context.Context, orgID uuid.UUID)
 	StartWarmupReconciler(ctx context.Context, interval time.Duration)
 
 	// StartCampaignReconciler re-seeds active campaigns whose self-perpetuating
@@ -79,6 +86,11 @@ type TasksService interface {
 	// stops warmup sends from a domain that has been failing SPF/DMARC past
 	// the operator's grace window. Nil leaves the state observe-only.
 	SetDomainAuthPolicy(p DomainAuthPolicy)
+	// SetUnsubscribeLinks wires the two halves of a per-recipient unsubscribe
+	// link (the List-Unsubscribe header and the link-mode footer): the signer
+	// that builds the address, and the store behind short tickets. A nil
+	// store leaves every link in its signed long form.
+	SetUnsubscribeLinks(signer *unsublink.Signer, tickets repository.UnsubscribeLinkRepository)
 	// SetCloudLink wires the self-hosted side of the warmup pool link: a
 	// mailbox the cloud warms gets no local warmup chain.
 	SetCloudLink(r CloudLinkReader)
@@ -86,6 +98,10 @@ type TasksService interface {
 	// SetFormLinks wires the minter that resolves {{form_link:...}} markers
 	// into per-recipient form URLs. Nil-safe: markers drop with a warning.
 	SetFormLinks(m FormLinkMinter)
+	// SetPlacement wires the placement test store; without it a placement
+	// task fails cleanly.
+	SetPlacement(repo repository.PlacementRepository)
+	HandlePlacementTask(task *proto.ProcessTask) *errx.Error
 }
 
 // CloudLinkReader reports whether Warmbly Cloud warms a mailbox.
@@ -158,6 +174,7 @@ type tasksService struct {
 	// warmupSettings caches the warmup generation settings in-process so the
 	// per-send AI-vs-static decision doesn't hit Postgres on every warmup.
 	warmupSettings *warmupSettingsCache
+	staticSeed     staticSeedState
 
 	// domainAuth resolves the operator's sending-domain authentication gate.
 	// Optional/nil-safe: without it the persisted auth state stays
@@ -165,6 +182,23 @@ type tasksService struct {
 	domainAuth DomainAuthPolicy
 	// cloudLink is nil on instances that are not linked to Warmbly Cloud.
 	cloudLink CloudLinkReader
+
+	// unsubLinks builds the per-recipient unsubscribe addresses. Nil or
+	// disabled means no link can be minted: the List-Unsubscribe header is
+	// left off and link-mode footers fall back to the text line.
+	unsubLinks *unsublink.Signer
+	// unsubTickets stores the short form of those links. Nil-safe: without it
+	// the address is the signed token, which is longer but works the same.
+	unsubTickets repository.UnsubscribeLinkRepository
+
+	// placementRepo backs the placement probe handler (SetPlacement).
+	placementRepo repository.PlacementRepository
+}
+
+// SetUnsubscribeLinks wires the unsubscribe link signer and ticket store.
+func (s *tasksService) SetUnsubscribeLinks(signer *unsublink.Signer, tickets repository.UnsubscribeLinkRepository) {
+	s.unsubLinks = signer
+	s.unsubTickets = tickets
 }
 
 // DomainAuthPolicy resolves whether the sending-domain authentication gate is
@@ -173,6 +207,12 @@ type tasksService struct {
 // instancesettings.Service satisfies it.
 type DomainAuthPolicy interface {
 	DomainAuth(ctx context.Context) (enforce bool, grace time.Duration)
+}
+
+// staticSeedState records that the built-in library is mirrored into the content bank.
+type staticSeedState struct {
+	sync.Mutex
+	done bool
 }
 
 // warmupSettingsCache is a tiny TTL cache over the generation settings.

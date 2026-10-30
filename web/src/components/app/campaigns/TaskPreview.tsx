@@ -15,6 +15,8 @@ import { DitherMeter } from "@/components/ui/dither";
 interface TaskPreviewProps {
     campaignId: string;
     campaignStatus?: string;
+    // Active with nothing left to send: waiting for leads.
+    idle?: boolean;
 }
 
 // ── Status pill tones ───────────────────────────────────────────────
@@ -23,6 +25,7 @@ const STATUS_TONE: Record<string, string> = {
     paused: "bg-amber-50 text-amber-700 ring-1 ring-amber-200",
     completed: "bg-sky-50 text-sky-700 ring-1 ring-sky-200",
     draft: "bg-slate-100 text-slate-600 ring-1 ring-slate-200",
+    idle: "bg-sky-50 text-sky-700 ring-1 ring-sky-200",
 };
 
 // ── Activity-type icon + tone ───────────────────────────────────────
@@ -73,7 +76,7 @@ function ActivityRow({ activity }: { activity: ActivityItem }) {
     );
 }
 
-export default function TaskPreview({ campaignId, campaignStatus: initialStatus }: TaskPreviewProps) {
+export default function TaskPreview({ campaignId, campaignStatus: initialStatus, idle }: TaskPreviewProps) {
     const { isConnected, channelState, campaignStatus: realtimeStatus, taskProgress, activities } =
         useCampaignChannel(campaignId);
 
@@ -82,6 +85,7 @@ export default function TaskPreview({ campaignId, campaignStatus: initialStatus 
 
     const currentStatus = realtimeStatus?.status || initialStatus || "draft";
     const isActive = currentStatus === "active";
+    const isIdle = isActive && !!idle;
 
     const connectionLabel = isConnected
         ? "Connected"
@@ -89,13 +93,23 @@ export default function TaskPreview({ campaignId, campaignStatus: initialStatus 
           ? "Connecting…"
           : "Disconnected";
 
-    const showNowSending = !!taskProgress && isActive && taskProgress.status === "active";
+    // Only a send in flight, for a named contact. The chain's wake-ups arrive
+    // as "scheduled" and carry no contact; showing those as "Sending…" is how
+    // this card read "Unknown contact" for a whole day on a campaign that had
+    // sent one email.
+    const showNowSending =
+        !!taskProgress &&
+        isActive &&
+        taskProgress.status === "active" &&
+        !!(taskProgress.contact_email || taskProgress.contact_name);
 
     const progress = Math.min(100, Math.max(0, taskProgress?.progress ?? 0));
     const processed = taskProgress?.processed_count ?? 0;
-    const total = taskProgress?.total_contacts ?? 0;
+    // Sent steps over contacts × steps: a six-step campaign is not done when
+    // every contact has had its first email.
+    const total = taskProgress?.total_emails ?? 0;
 
-    // Conservative estimate: remaining contacts paced roughly one per minute.
+    // Conservative estimate: remaining emails paced roughly one per minute.
     const remainingHint = useMemo(() => {
         if (!taskProgress || total <= 0) return null;
         const remaining = total - processed;
@@ -130,10 +144,10 @@ export default function TaskPreview({ campaignId, campaignStatus: initialStatus 
                 </span>
                 <span
                     className={`inline-flex items-center px-1.5 h-5 rounded-md text-[10.5px] font-medium ${
-                        STATUS_TONE[currentStatus] ?? STATUS_TONE.draft
+                        isIdle ? STATUS_TONE.idle : (STATUS_TONE[currentStatus] ?? STATUS_TONE.draft)
                     }`}
                 >
-                    {statusLabel(currentStatus)}
+                    {isIdle ? "Waiting for leads" : statusLabel(currentStatus)}
                 </span>
                 <div className="ml-auto flex items-center gap-1.5">
                     <span className="relative flex size-2">
@@ -193,7 +207,7 @@ export default function TaskPreview({ campaignId, campaignStatus: initialStatus 
                     <DitherMeter frac={progress / 100} height={6} />
                     <div className="flex items-center justify-between mt-1.5">
                         <span className="font-mono text-[10.5px] text-slate-400 tabular-nums">
-                            {processed.toLocaleString()} of {total.toLocaleString()} contacts
+                            {processed.toLocaleString()} of {total.toLocaleString()} emails
                         </span>
                         {remainingHint && (
                             <span className="text-[10.5px] text-slate-400">{remainingHint}</span>
@@ -266,16 +280,20 @@ export default function TaskPreview({ campaignId, campaignStatus: initialStatus 
                                 ? "All caught up — sending complete"
                                 : currentStatus === "paused"
                                   ? "Campaign paused"
-                                  : isActive
-                                    ? "Waiting for the next send…"
-                                    : "Nothing sending yet"}
+                                  : isIdle
+                                    ? "Waiting for new leads"
+                                    : isActive
+                                      ? "Waiting for the next send…"
+                                      : "Nothing sending yet"}
                         </p>
                         <p className="text-[11.5px] text-slate-400 max-w-[34ch] mx-auto leading-relaxed">
                             {currentStatus === "completed"
                                 ? "Every lead has finished the sequence. Replies and clicks still stream in here as they arrive."
                                 : currentStatus === "paused"
                                   ? "Resume the campaign to keep sending. Replies and clicks still stream in here."
-                                  : isActive
+                                  : isIdle
+                                    ? "Every lead has finished the sequence. The campaign stays active and sends to new leads as they arrive."
+                                    : isActive
                                     ? "Opens, clicks, replies and bounces will stream in here live as your campaign sends."
                                     : "Start the campaign to watch it send live."}
                         </p>

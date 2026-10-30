@@ -39,8 +39,10 @@ type LifecycleCandidate struct {
 	Current        models.SendLifecycle
 	Since          *time.Time
 	// HealthState is empty when the mailbox is in no warmup pool, meaning no
-	// signal rather than a healthy one.
+	// signal rather than a healthy one. It is read from real evidence only.
 	HealthState models.WarmupHealthState
+	// CloudEvidenceUnknown is set while Warmbly Cloud has no current report for the mailbox.
+	CloudEvidenceUnknown bool
 }
 
 type sendLifecycleRepository struct {
@@ -103,14 +105,15 @@ func (r *sendLifecycleRepository) ListLifecycleCandidates(ctx context.Context, l
 	if limit <= 0 {
 		limit = 500
 	}
-	// health_state stays NULL for a mailbox in no pool: leaving the pool is
-	// not evidence of health, so the caller must see "unknown" rather than a
+	// health_state stays NULL for a mailbox with no standing: leaving the pool
+	// is not evidence of health, so the caller must see "unknown" rather than a
 	// clean bill that would auto-resume it.
 	rows, err := r.DB.Pool.Query(ctx, `
 		SELECT ea.id, ea.send_lifecycle, ea.send_lifecycle_since,
-		       wpp.health_state
+		       wh.health_state, `+cloudStandingUnknownSQL("ea.id")+`
 		  FROM email_accounts ea
-		  LEFT JOIN warmup_pool_participants wpp ON wpp.email_account_id = ea.id
+		  LEFT JOIN LATERAL (`+warmupKnownStandingSQL("ea.id")+`
+		  ) wh ON true
 		 WHERE ea.status = 'active'
 		   AND ea.send_lifecycle IN ('active', 'resting')
 		 ORDER BY ea.send_lifecycle_checked_at NULLS FIRST, ea.id
@@ -126,7 +129,7 @@ func (r *sendLifecycleRepository) ListLifecycleCandidates(ctx context.Context, l
 		var c LifecycleCandidate
 		var state string
 		var health *string
-		if err := rows.Scan(&c.EmailAccountID, &state, &c.Since, &health); err != nil {
+		if err := rows.Scan(&c.EmailAccountID, &state, &c.Since, &health, &c.CloudEvidenceUnknown); err != nil {
 			return nil, err
 		}
 		c.Current = models.SendLifecycle(state)
@@ -143,11 +146,13 @@ func (r *sendLifecycleRepository) GetLifecycleCandidate(ctx context.Context, acc
 	var state string
 	var health *string
 	err := r.DB.Pool.QueryRow(ctx, `
-		SELECT ea.id, ea.send_lifecycle, ea.send_lifecycle_since, wpp.health_state
+		SELECT ea.id, ea.send_lifecycle, ea.send_lifecycle_since, wh.health_state,
+		       `+cloudStandingUnknownSQL("ea.id")+`
 		  FROM email_accounts ea
-		  LEFT JOIN warmup_pool_participants wpp ON wpp.email_account_id = ea.id
+		  LEFT JOIN LATERAL (`+warmupKnownStandingSQL("ea.id")+`
+		  ) wh ON true
 		 WHERE ea.id = $1
-	`, accountID).Scan(&c.EmailAccountID, &state, &c.Since, &health)
+	`, accountID).Scan(&c.EmailAccountID, &state, &c.Since, &health, &c.CloudEvidenceUnknown)
 	if err != nil {
 		return nil, err
 	}

@@ -1,4 +1,4 @@
-// Members — invitation flow + roster with inline role change.
+// Members: invitation flow and roster with inline role and access change.
 //
 // Restructured to the flat Section + Row shape so the page reads as
 // a single document, not a stack of cards. The role pill on each row
@@ -7,6 +7,7 @@
 // roles re-renders accordingly.
 
 import React from "react";
+import { AnimatePresence } from "framer-motion";
 import {
     CheckIcon,
     CopyIcon,
@@ -17,7 +18,7 @@ import {
     TrashIcon,
     XIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { Label } from "@/components/ui/field";
 import { useConfirm } from "@/hooks/context/confirm";
 import useFeatureAccess from "@/hooks/useFeatureAccess";
@@ -30,11 +31,17 @@ import useUpdateMemberRole from "@/lib/api/hooks/app/organizations/useUpdateMemb
 import useRoles from "@/lib/api/hooks/app/organizations/useRoles";
 import useAuthConfig from "@/lib/api/hooks/auth/useAuthConfig";
 import type OrganizationRole from "@/lib/api/models/app/organizations/OrganizationRole";
+import type Invitation from "@/lib/api/models/app/organizations/Invitation";
 import { useAppStore } from "@/stores";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 import getInvitationLink from "@/lib/api/client/app/organizations/getInvitationLink";
+import { useSetMemberAccess } from "@/lib/api/hooks/app/organizations/useMemberAccess";
+import type MemberAccess from "@/lib/api/models/app/organizations/MemberAccess";
+import { WORKSPACE_ACCESS } from "@/lib/api/models/app/organizations/MemberAccess";
+import type OrganizationMember from "@/lib/api/models/app/organizations/OrganizationMember";
 import RoleMultiSelect, { RoleChips } from "../_components/RoleMultiSelect";
+import MemberAccessDialog, { AccessBadge } from "./MemberAccessDialog";
 import {
     RolePill,
     Section,
@@ -57,6 +64,8 @@ export default function MembersSettingsPage() {
     const removeMember = useRemoveMember();
     const cancelInvite = useCancelInvitation();
     const updateRole = useUpdateMemberRole();
+    const setAccess = useSetMemberAccess();
+    const [editingAccess, setEditingAccess] = React.useState<OrganizationMember | null>(null);
     const customRoles = useRoles();
     const { config: authConfig, ready: authConfigReady } = useAuthConfig();
     const currentUserId = useAppStore((s) => s.user?.id);
@@ -64,6 +73,7 @@ export default function MembersSettingsPage() {
 
     const memberList = members.data ?? [];
     const inviteList = invites.data ?? [];
+    const expiredCount = inviteList.filter((i) => i.expired).length;
 
     function doRemove(id: string, label: string) {
         confirm?.show(`Remove ${label}?`, async () => {
@@ -91,14 +101,51 @@ export default function MembersSettingsPage() {
             }
         });
     }
-    async function copyInviteLink(invitationId: string) {
+    const [resending, setResending] = React.useState<string | null>(null);
+    // Inviting the same address again replaces the expired row with a fresh link and expiry.
+    async function resendInvite(inv: Invitation) {
+        const roleIds = inv.roles?.length ? inv.roles.map((r) => r.id) : inv.role_id ? [inv.role_id] : undefined;
+        setResending(inv.id);
         try {
-            const { token } = await getInvitationLink(invitationId);
-            const url = `${window.location.origin}/invite?token=${encodeURIComponent(token)}`;
-            await navigator.clipboard.writeText(url);
-            toast.success("Invite link copied");
+            await toast.promise(invite.mutateAsync({ email: inv.email, role_ids: roleIds, access: inv.access }), {
+                loading: "Sending…",
+                success: `Invitation sent again to ${inv.email}`,
+                error: (e: AppError) => buildError(e),
+            });
+        } catch {
+            /* surfaced */
+        } finally {
+            setResending(null);
+        }
+    }
+    async function copyInviteLink(invitationId: string) {
+        // Each copy mints a new link and retires the last, so the write starts inside the click:
+        // ClipboardItem takes the pending URL, which keeps Safari's user gesture.
+        const pending = getInvitationLink(invitationId).then(
+            ({ token }) => `${window.location.origin}/invite?token=${encodeURIComponent(token)}`,
+        );
+        let url = "";
+        try {
+            if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+                await navigator.clipboard.write([
+                    new ClipboardItem({
+                        "text/plain": pending.then((u) => {
+                            url = u;
+                            return new Blob([u], { type: "text/plain" });
+                        }),
+                    }),
+                ]);
+            } else {
+                url = await pending;
+                await navigator.clipboard.writeText(url);
+            }
+            toast.success("Invite link copied. Links you copied before no longer work.");
         } catch (e) {
-            toast.error(buildError(e as AppError));
+            if (url) {
+                toast.error(`Could not copy. The new invite link is ${url}`, { duration: 60000 });
+            } else {
+                toast.error(buildError(e as AppError));
+            }
         }
     }
     async function changeRoles(memberId: string, roleIds: string[]) {
@@ -130,12 +177,12 @@ export default function MembersSettingsPage() {
                         pending={invite.isPending}
                         mailDelivers={!authConfigReady || authConfig.mail_delivers}
                         customRoles={customRoles.data ?? []}
-                        onSubmit={async (emails, roleIds) => {
+                        onSubmit={async (emails, roleIds, inviteAccess) => {
                             let ok = 0;
                             let failed = 0;
                             for (const e of emails) {
                                 try {
-                                    await invite.mutateAsync({ email: e, role_ids: roleIds });
+                                    await invite.mutateAsync({ email: e, role_ids: roleIds, access: inviteAccess });
                                     ok++;
                                 } catch {
                                     failed++;
@@ -148,6 +195,24 @@ export default function MembersSettingsPage() {
                     />
                 </Section>
             )}
+
+            <AnimatePresence>
+                {editingAccess && (
+                    <MemberAccessDialog
+                        title="Member access"
+                        subject={safeEmail(editingAccess.email) || editingAccess.user_id}
+                        initial={editingAccess.access}
+                        onClose={() => setEditingAccess(null)}
+                        onSave={async (next) => {
+                            await toast.promise(setAccess.mutateAsync({ userId: editingAccess.user_id, access: next }), {
+                                loading: "Saving…",
+                                success: "Access updated",
+                                error: (e: AppError) => buildError(e),
+                            });
+                        }}
+                    />
+                )}
+            </AnimatePresence>
 
             <Section
                 eyebrow="Members"
@@ -165,6 +230,7 @@ export default function MembersSettingsPage() {
                                 <tr className="border-b border-slate-200">
                                     <Th>Member</Th>
                                     <Th className="md:w-44">Role</Th>
+                                    <Th className="md:w-48">Access</Th>
                                     <Th className="w-40 hidden md:table-cell">Joined</Th>
                                     <th className="w-12 px-3 py-2"></th>
                                 </tr>
@@ -218,6 +284,12 @@ export default function MembersSettingsPage() {
                                                     <RoleChips roles={m.roles ?? []} />
                                                 )}
                                             </td>
+                                            <td className="px-3 max-w-[12rem]">
+                                                <AccessBadge
+                                                    access={isOwner ? null : m.access}
+                                                    onClick={access.canManage && !isOwner && !isSelf ? () => setEditingAccess(m) : undefined}
+                                                />
+                                            </td>
                                             <td className="px-3 font-mono text-[11px] text-slate-500 tabular-nums hidden md:table-cell">
                                                 {m.joined_at
                                                     ? new Date(m.joined_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
@@ -247,7 +319,11 @@ export default function MembersSettingsPage() {
 
             <Section
                 eyebrow="Pending invitations"
-                description={`${inviteList.length} awaiting acceptance.`}
+                description={
+                    expiredCount > 0
+                        ? `${inviteList.length - expiredCount} awaiting acceptance, ${expiredCount} expired. An invitation works for up to 48 hours.`
+                        : `${inviteList.length} awaiting acceptance. An invitation works for up to 48 hours.`
+                }
             >
                 {invites.isPending ? (
                     <p className="text-[11.5px] text-slate-400 py-2">Loading…</p>
@@ -261,8 +337,9 @@ export default function MembersSettingsPage() {
                                 <tr className="border-b border-slate-200">
                                     <Th>Email</Th>
                                     <Th className="w-32">Role</Th>
+                                    <Th className="md:w-48">Access</Th>
                                     <Th className="w-40 hidden md:table-cell">Expires</Th>
-                                    <th className="w-16 md:w-32 px-3 py-2"></th>
+                                    <th className="w-28 md:w-32 px-3 py-2"></th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -274,35 +351,65 @@ export default function MembersSettingsPage() {
                                         <td className="px-4">
                                             <div className="flex items-center gap-2.5">
                                                 <MailIcon className="w-3.5 h-3.5 text-slate-400" />
-                                                <span className="text-[12.5px] text-slate-900 truncate">
+                                                <span className={`text-[12.5px] truncate ${inv.expired ? "text-slate-500" : "text-slate-900"}`}>
                                                     {inv.email}
                                                 </span>
+                                                {inv.expired && (
+                                                    <span className="md:hidden">
+                                                        <ExpiredBadge />
+                                                    </span>
+                                                )}
                                             </div>
                                         </td>
                                         <td className="px-3">
                                             {(inv.roles?.length ?? 0) > 0 ? <RoleChips roles={inv.roles!} /> : <RolePill role={inv.role} color={(customRoles.data ?? []).find((r) => r.id === inv.role_id)?.color} />}
                                         </td>
+                                        <td className="px-3 max-w-[12rem]">
+                                            <AccessBadge access={inv.access} />
+                                        </td>
                                         <td className="px-3 font-mono text-[11px] text-slate-500 tabular-nums hidden md:table-cell">
-                                            {new Date(inv.expires_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                                            {inv.expired ? (
+                                                <ExpiredBadge />
+                                            ) : (
+                                                new Date(inv.expires_at).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+                                            )}
                                         </td>
                                         <td className="px-3">
                                             {access.canManage && (
-                                                <div className="flex items-center gap-0.5 justify-end opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => copyInviteLink(inv.id)}
-                                                        aria-label="Copy invite link"
-                                                        title="Copy invite link"
-                                                        className="size-6 rounded text-slate-400 hover:text-slate-900 hover:bg-slate-100 inline-flex items-center justify-center transition-colors"
-                                                    >
-                                                        <CopyIcon className="w-3 h-3" />
-                                                    </button>
+                                                <div className="flex items-center gap-0.5 justify-end">
+                                                    {inv.expired ? (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => resendInvite(inv)}
+                                                            disabled={resending === inv.id}
+                                                            aria-label="Send invitation again"
+                                                            title="Send invitation again"
+                                                            className="h-6 px-2 rounded-md border border-slate-200 text-[11.5px] text-slate-700 hover:border-sky-300 hover:text-sky-700 hover:bg-sky-50 inline-flex items-center gap-1 transition-colors disabled:opacity-50"
+                                                        >
+                                                            {resending === inv.id ? (
+                                                                <Loader2Icon className="w-3 h-3 animate-spin" />
+                                                            ) : (
+                                                                <SendIcon className="w-3 h-3" />
+                                                            )}
+                                                            Resend
+                                                        </button>
+                                                    ) : (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => copyInviteLink(inv.id)}
+                                                            aria-label="Copy invite link"
+                                                            title="Copy invite link"
+                                                            className="size-6 rounded text-slate-400 hover:text-slate-900 hover:bg-slate-100 inline-flex items-center justify-center transition-colors opacity-100 md:opacity-0 md:group-hover:opacity-100"
+                                                        >
+                                                            <CopyIcon className="w-3 h-3" />
+                                                        </button>
+                                                    )}
                                                     <button
                                                         type="button"
                                                         onClick={() => doCancelInvite(inv.id)}
                                                         aria-label="Cancel invitation"
                                                         title="Cancel invitation"
-                                                        className="size-6 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 inline-flex items-center justify-center transition-colors"
+                                                        className="size-6 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 inline-flex items-center justify-center transition-colors opacity-100 md:opacity-0 md:group-hover:opacity-100"
                                                     >
                                                         <TrashIcon className="w-3 h-3" />
                                                     </button>
@@ -318,6 +425,14 @@ export default function MembersSettingsPage() {
                 )}
             </Section>
         </SectionShell>
+    );
+}
+
+function ExpiredBadge() {
+    return (
+        <span className="inline-flex items-center h-[18px] px-1.5 rounded bg-amber-50 text-amber-700 text-[10.5px] font-medium font-sans">
+            Expired
+        </span>
     );
 }
 
@@ -343,7 +458,7 @@ function InviteFlow({
     mailDelivers,
     customRoles,
 }: {
-    onSubmit: (emails: string[], roleIds: string[]) => Promise<void>;
+    onSubmit: (emails: string[], roleIds: string[], access: MemberAccess) => Promise<void>;
     pending: boolean;
     mailDelivers: boolean;
     customRoles: OrganizationRole[];
@@ -351,6 +466,8 @@ function InviteFlow({
     const [chips, setChips] = React.useState<{ email: string; valid: boolean }[]>([]);
     const [draft, setDraft] = React.useState("");
     const [roleIds, setRoleIds] = React.useState<string[]>([]);
+    const [inviteAccess, setInviteAccess] = React.useState<MemberAccess>(WORKSPACE_ACCESS);
+    const [editingAccess, setEditingAccess] = React.useState(false);
     // Default to the seeded Viewer (least privilege), else the first role.
     const defaultRole = customRoles.find((r) => r.name === "Viewer") ?? customRoles[0];
     const effectiveRoleIds = roleIds.length > 0 ? roleIds : defaultRole ? [defaultRole.id] : [];
@@ -416,7 +533,7 @@ function InviteFlow({
             toast.error("Create a role first (Settings → Roles & access)");
             return;
         }
-        await onSubmit(valid, effectiveRoleIds);
+        await onSubmit(valid, effectiveRoleIds, inviteAccess);
         setChips([]);
         setDraft("");
     }
@@ -514,6 +631,23 @@ function InviteFlow({
                         onChange={setRoleIds}
                     />
                 </div>
+
+                <div className="flex items-center gap-2">
+                    <Label className="!mb-0 w-16">Access</Label>
+                    <AccessBadge access={inviteAccess} onClick={() => setEditingAccess(true)} />
+                </div>
+                <AnimatePresence>
+                    {editingAccess && (
+                        <MemberAccessDialog
+                            title="Access for this invitation"
+                            subject="Applies to everyone invited with it, from the moment they join."
+                            initial={inviteAccess}
+                            saveLabel="Use this access"
+                            onClose={() => setEditingAccess(false)}
+                            onSave={async (next) => setInviteAccess(next)}
+                        />
+                    )}
+                </AnimatePresence>
 
                 <div className="flex items-center gap-2 pt-1">
                     <span className="text-[11px] text-slate-500">

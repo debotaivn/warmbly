@@ -3,17 +3,20 @@ package orgtransfer
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/warmbly/warmbly/internal/app/cipher"
+	"github.com/warmbly/warmbly/internal/app/mailcred"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/repository"
 )
@@ -128,20 +131,24 @@ func (s *service) ExportTo(
 		buf := bufio.NewWriterSize(entry, 256*1024)
 
 		mt := ManifestTable{
-			Name:    t.Name,
-			Group:   t.Group,
-			Columns: columnNames(cols),
+			Name:  t.Name,
+			Group: t.Group,
+			Columns: slices.DeleteFunc(columnNames(cols), func(column string) bool {
+				return slices.Contains(t.ExcludeOnExport, column)
+			}),
 		}
 		if archiveKey != nil {
 			for _, sc := range t.Secrets {
-				mt.SecretColumns = append(mt.SecretColumns, sc.Column)
+				if !slices.Contains(t.ExcludeOnExport, sc.Column) {
+					mt.SecretColumns = append(mt.SecretColumns, sc.Column)
+				}
 			}
 		}
 
 		// Rows only need decoding when something on them has to change. Most
 		// tables have neither secrets nor blobs, so they stream through
 		// untouched, which is what makes a million-row inbox export cheap.
-		passthrough := len(t.Secrets) == 0 && len(t.Blobs) == 0
+		passthrough := len(t.Secrets) == 0 && len(t.Blobs) == 0 && len(t.ExcludeOnExport) == 0 && len(t.ExcludeJSONOnExport) == 0
 
 		err = s.repo.StreamScoped(ctx, t.Name, t.Scope, orgID, func(row []byte) error {
 			out := row
@@ -186,7 +193,7 @@ func (s *service) ExportTo(
 	return manifest, nil
 }
 
-// exportRow rewrites one row's secret and blob columns.
+// exportRow removes instance-local columns and rewrites portable secrets and blobs.
 func (s *service) exportRow(
 	ctx context.Context,
 	t *Table,
@@ -198,6 +205,22 @@ func (s *service) exportRow(
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(row, &obj); err != nil {
 		return nil, fmt.Errorf("decode %s row: %w", t.Name, err)
+	}
+
+	for _, column := range t.ExcludeOnExport {
+		delete(obj, column)
+	}
+
+	for _, exclusion := range t.ExcludeJSONOnExport {
+		raw, ok := obj[exclusion.Column]
+		if !ok {
+			continue
+		}
+		stripped, err := excludeExportJSONKeys(raw, exclusion.Keys)
+		if err != nil {
+			return nil, fmt.Errorf("exclude %s.%s JSON keys: %w", t.Name, exclusion.Column, err)
+		}
+		obj[exclusion.Column] = stripped
 	}
 
 	for _, sc := range t.Secrets {
@@ -255,9 +278,53 @@ func (s *service) exportRow(
 	return json.Marshal(obj)
 }
 
+func excludeExportJSONKeys(raw json.RawMessage, keys []string) (json.RawMessage, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	switch raw[0] {
+	case '{':
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil {
+			return nil, err
+		}
+		for key, value := range object {
+			if slices.Contains(keys, key) {
+				delete(object, key)
+				continue
+			}
+			stripped, err := excludeExportJSONKeys(value, keys)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = stripped
+		}
+		return json.Marshal(object)
+	case '[':
+		var array []json.RawMessage
+		if err := json.Unmarshal(raw, &array); err != nil {
+			return nil, err
+		}
+		for i, value := range array {
+			stripped, err := excludeExportJSONKeys(value, keys)
+			if err != nil {
+				return nil, err
+			}
+			array[i] = stripped
+		}
+		return json.Marshal(array)
+	default:
+		return raw, nil
+	}
+}
+
 // openSecret returns the plaintext behind one stored value, using whichever
 // key domain sealed it.
 func (s *service) openSecret(ctx context.Context, sc SecretColumn, stored string, orgCipher *cipher.Cipher) (string, error) {
+	if sc.PlaintextPrefix != "" && strings.HasPrefix(stored, sc.PlaintextPrefix) {
+		return stored, nil
+	}
 	switch sc.Domain {
 	case KeyDomainInstance:
 		if s.creds == nil {
@@ -269,6 +336,8 @@ func (s *service) openSecret(ctx context.Context, sc SecretColumn, stored string
 			return "", errors.New("organization key unavailable")
 		}
 		return orgCipher.Decrypt(ctx, stored)
+	case KeyDomainMailbox:
+		return mailcred.OpenWith(ctx, orgCipher, s.creds, stored)
 	}
 	return "", fmt.Errorf("column %s has no key domain", sc.Column)
 }
@@ -357,7 +426,18 @@ func (b *blobCollector) addURL(url, table, column string) {
 }
 
 // publicKeyPrefixes are the object-key prefixes reachable through a public URL.
-var publicKeyPrefixes = []string{"avatars/", "form-assets/"}
+var publicKeyPrefixes = []string{"avatars/", "form-assets/", models.EmailImageKeyPrefix}
+
+// isPublicBlobKey reports whether an object key belongs to one of those
+// prefixes, so import can restore it public-read rather than private.
+func isPublicBlobKey(key string) bool {
+	for _, prefix := range publicKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // ---------- small JSON helpers ----------
 
@@ -430,11 +510,11 @@ func columnNames(cols []repository.ColumnInfo) []string {
 	return out
 }
 
-// needsOrgDEK reports whether any selected table has a DEK-sealed column.
+// needsOrgDEK reports whether any selected table has a column that is or may be DEK-sealed.
 func needsOrgDEK(tables []*Table) bool {
 	for _, t := range tables {
 		for _, sc := range t.Secrets {
-			if sc.Domain == KeyDomainOrgDEK {
+			if sc.Domain == KeyDomainOrgDEK || sc.Domain == KeyDomainMailbox {
 				return true
 			}
 		}

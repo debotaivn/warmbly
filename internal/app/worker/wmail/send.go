@@ -3,6 +3,7 @@ package wmail
 import (
 	"context"
 	"errors"
+	"net/mail"
 	"strings"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/mailhdr"
+	"google.golang.org/api/gmail/v1"
 )
 
 // parentReference resolves what a reply should be threaded onto, from whichever
@@ -63,6 +66,7 @@ type SendRequest struct {
 	BodyPlain   string
 	BodyHTML    string
 	InReplyTo   string
+	References  string
 	Parent      *models.EmailParent
 	IsWarmup    bool
 	WarmupToken string
@@ -72,21 +76,44 @@ type SendRequest struct {
 	// Attachments, when present, are encoded as multipart/mixed parts after the
 	// multipart/alternative text body. Warmup sends never carry attachments.
 	Attachments []Attachment
+	// FromName is the display name the control plane holds for the mailbox at
+	// publish time. Empty falls back to the name cached from ADD_EMAIL.
+	FromName string
+	// FromEmail is the verified provider alias the mailbox was told to send
+	// as. Gmail only, and empty for almost every send, which means the
+	// mailbox's own address. It is never set on a warmup send: warmup pairs
+	// on the mailbox address, so an alias there would break verification.
+	FromEmail string
+	// ReplyTo is the address the Reply-To header names, so a reply lands in
+	// another mailbox. Empty for no header; never set on a warmup send.
+	ReplyTo string
 }
 
 // buildSendHeaders assembles the outbound custom headers: the warmup
-// verification token (warmup sends) and RFC 8058 one-click unsubscribe headers
-// (campaign sends). Returns nil when there are none so callers can branch.
+// verification token (warmup sends), Reply-To, and RFC 8058 one-click
+// unsubscribe headers (campaign sends). Returns nil when there are none so callers can branch.
 func buildSendHeaders(req *SendRequest) map[string]string {
 	h := map[string]string{}
+	if req.References != "" && req.InReplyTo != "" {
+		if value, err := mailhdr.References(strings.Fields(req.References)); err == nil {
+			h["References"] = value
+		}
+	}
 	if req.WarmupToken != "" {
 		h[config.WarmupVerifyHeader] = req.WarmupToken
 	}
+	if rt := replyToHeader(req); rt != "" {
+		h["Reply-To"] = rt
+	}
 	if req.UnsubscribeURL != "" {
-		// RFC 8058: the HTTPS URI in List-Unsubscribe plus the one-click marker
-		// tells Gmail/Yahoo/Microsoft to POST List-Unsubscribe=One-Click here.
 		h["List-Unsubscribe"] = "<" + req.UnsubscribeURL + ">"
-		h["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+		// RFC 8058 one-click requires the URI to be https: a provider that
+		// POSTs an http address either refuses or leaks the token in clear, so
+		// an http link (a LAN or dev install) ships as a plain RFC 2369 header
+		// the recipient clicks instead of a one-click button that will not work.
+		if strings.HasPrefix(strings.ToLower(req.UnsubscribeURL), "https://") {
+			h["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+		}
 	}
 	if len(h) == 0 {
 		return nil
@@ -94,19 +121,74 @@ func buildSendHeaders(req *SendRequest) map[string]string {
 	return h
 }
 
+// replyToHeader is the Reply-To value for a send: one bare address, or empty
+// for a warmup send or anything that does not parse as exactly one address.
+func replyToHeader(req *SendRequest) string {
+	if req.IsWarmup {
+		return ""
+	}
+	raw := strings.TrimSpace(req.ReplyTo)
+	if raw == "" || strings.ContainsAny(raw, "\r\n") {
+		return ""
+	}
+	addr, err := mail.ParseAddress(raw)
+	if err != nil {
+		return ""
+	}
+	return addr.Address
+}
+
 // SendResult contains the result of a send operation
 type SendResult struct {
 	Success       bool
 	MessageID     string
 	ProviderMsgID string
-	SentAt        time.Time
-	Error         *errx.MailError
+	// ThreadID is the provider-side conversation this message landed in.
+	// Gmail is the only provider that has one and the only one that needs it
+	// back: appending a later message to the same thread requires handing the
+	// id to the API, so the control plane records it against the task and
+	// gives it to the next step (issue #472). Empty everywhere else.
+	ThreadID string
+	SentAt   time.Time
+	Error    *errx.MailError
 }
 
 const maxSendRetries = 3
 
+// permanentSendFailure is a refusal no retry can turn into a delivery: the
+// receiving server rejected the sender, the recipient or the message itself
+// with a 5xx. Named codes rather than the resolve method, because several
+// warnings carry a non-retry method while still being worth another attempt.
+func permanentSendFailure(err *errx.MailError) bool {
+	if err == nil {
+		return false
+	}
+	switch err.Code {
+	case errx.MailErrorCodeSendRejected, errx.MailErrorCodeRecipientRejected:
+		return true
+	}
+	return false
+}
+
+// providerThrottle is a temporary limit imposed by the mailbox provider. It
+// must not be raised as Warmbly's anti-abuse RATE_LIMIT_EXCEEDED event, which
+// deactivates the mailbox and removes it from warmup.
+func providerThrottle(err *errx.MailError) bool {
+	if err == nil {
+		return false
+	}
+	return err.Code == errx.MailErrorCodeSendingTooFast || err.Code == errx.MailErrorCodeQuotaExceeded
+}
+
 // Send attempts to send an email with retry for transient failures
 func (w *WMail) Send(ctx context.Context, req *SendRequest) *SendResult {
+	done, ok := w.BeginExecution()
+	if !ok {
+		return &SendResult{Error: errx.ErrMailServerUnreachable}
+	}
+	defer done()
+	ctx, cancel := w.ExecutionContext(ctx)
+	defer cancel()
 	// For warmup emails, ensure HTML is empty
 	bodyHTML := req.BodyHTML
 	if req.IsWarmup {
@@ -137,9 +219,24 @@ func (w *WMail) Send(ctx context.Context, req *SendRequest) *SendResult {
 		if result.Success {
 			return result
 		}
+		if result.Error != nil && result.Error.Failure != nil {
+			return result
+		}
 
-		// Don't retry critical/auth errors - only transient ones
+		// Don't retry critical/auth errors - only transient ones.
 		if result.Error != nil && result.Error.Type == errx.MailErrorCritical {
+			return result
+		}
+		// A permanent refusal is not critical but is just as final: the
+		// server answered with a 5xx, so it will answer the same way next
+		// time and another attempt only spends the mailbox's daily budget.
+		if permanentSendFailure(result.Error) {
+			return result
+		}
+		// Retrying a 429 in one, two and four seconds only extends the provider's
+		// throttle. Return it to the scheduler, which already rolls the send back
+		// for a later attempt.
+		if providerThrottle(result.Error) {
 			return result
 		}
 
@@ -188,22 +285,48 @@ func (w *WMail) sendViaGmail(ctx context.Context, req *SendRequest, bodyHTML str
 	attachments := toGoogAttachments(req.Attachments)
 
 	// Send via Gmail API
-	gmailMsg, err := w.GoogleData.Client.SendMessage(
-		ctx,
-		req.To,
-		req.Cc,
-		req.Bcc,
-		req.MessageID,
-		req.Subject,
-		req.BodyPlain,
-		bodyHTML,
-		parent,
-		attachments,
-		customHeaders,
-	)
+	send := func(p *models.EmailMessageData) (*gmail.Message, error) {
+		return w.GoogleData.Client.SendMessage(
+			ctx,
+			req.FromName,
+			req.FromEmail,
+			req.To,
+			req.Cc,
+			req.Bcc,
+			req.MessageID,
+			req.Subject,
+			req.BodyPlain,
+			bodyHTML,
+			p,
+			attachments,
+			customHeaders,
+		)
+	}
+	gmailMsg, err := send(parent)
+	if err != nil && parent != nil && parent.ThreadID != "" && goog.IsThreadRefusal(err) {
+		// Gmail would not file the message in that thread. It never left, so
+		// send it again as its own conversation rather than failing the step:
+		// a follow-up outside the thread still reaches the recipient, and the
+		// reference headers still thread it in THEIR client.
+		log.Warn().Str("task_id", req.TaskID.String()).Err(err).
+			Msg("Gmail refused the thread; sending as a new conversation")
+		retry := *parent
+		retry.ThreadID = ""
+		gmailMsg, err = send(&retry)
+	}
 	if err != nil {
 		// Convert to MailError using goog.HandleError
 		if mailErr := goog.HandleError(err); mailErr != nil {
+			if mailErr.Failure == nil && mailErr.Type != errx.MailErrorCritical {
+				mailErr = errx.WithSendFailure(mailErr, errx.SendFailure{Provider: "google", Protocol: "http",
+					Stage: "submit", Scope: "mailbox", Disposition: errx.SendAmbiguous, ObservedAt: time.Now().UTC()})
+			}
+			if mailErr.Failure != nil && mailErr.Failure.Status >= 500 {
+				mailErr.Failure.Disposition = errx.SendAmbiguous
+			}
+			if mailErr.Failure != nil {
+				mailErr.Failure.Stage = "submit"
+			}
 			result.Error = mailErr
 		} else {
 			// Generic error
@@ -218,9 +341,33 @@ func (w *WMail) sendViaGmail(ctx context.Context, req *SendRequest, bodyHTML str
 	}
 
 	result.Success = true
-	result.MessageID = req.MessageID
+	result.MessageID = gmailSentMessageID(ctx, w.GoogleData.Client, req.TaskID.String(), gmailMsg.Id, req.MessageID)
 	result.ProviderMsgID = gmailMsg.Id
+	result.ThreadID = gmailMsg.ThreadId
 	return result
+}
+
+// gmailStamp reads the Message-ID a sent Gmail message carries.
+type gmailStamp interface {
+	SentMessageID(ctx context.Context, id string) (string, error)
+}
+
+// gmailSentMessageID reports the Message-ID Gmail stamped, as the Graph path
+// does, falling back to the minted one when the read fails. The send already
+// happened, so a failed read must never turn it into a failure.
+func gmailSentMessageID(ctx context.Context, client gmailStamp, taskID, gmailID, minted string) string {
+	if client == nil || gmailID == "" {
+		return minted
+	}
+	stamped, err := client.SentMessageID(ctx, gmailID)
+	if err != nil {
+		log.Warn().Str("task_id", taskID).Err(err).Msg("Gmail sent the message but its Message-ID could not be read; reporting the minted one")
+		return minted
+	}
+	if stamped == "" {
+		return minted
+	}
+	return stamped
 }
 
 // sendViaGraph sends an email through Microsoft Graph. Graph re-stamps the
@@ -260,6 +407,7 @@ func (w *WMail) sendViaGraph(ctx context.Context, req *SendRequest, bodyHTML str
 
 	sentMessageID, err := w.GraphData.Client.SendMessage(
 		ctx,
+		req.FromName,
 		req.To,
 		req.Cc,
 		req.Bcc,
@@ -324,6 +472,7 @@ func (w *WMail) sendViaSMTP(ctx context.Context, req *SendRequest, bodyHTML stri
 	// empty list still selects the same code path.
 	raw, merr := w.SmtpImapData.SmtpClient.Send(
 		ctx,
+		req.FromName,
 		req.To,
 		req.Cc,
 		req.Bcc,
@@ -429,6 +578,14 @@ func DetermineErrorEventType(err *errx.MailError) models.JobEventType {
 	if err == nil {
 		return models.JobEventTypeEmailFailed
 	}
+	if err.Failure != nil {
+		switch err.Failure.Disposition {
+		case errx.SendRetry, errx.SendAmbiguous:
+			return models.JobEventTypeEmailServerError
+		case errx.SendThrottle:
+			return models.JobEventTypeEmailRateLimited
+		}
+	}
 
 	switch err.Code {
 	case errx.MailErrorCodeGoogleAuth, errx.MailErrorCodeAuthenticationFailed, errx.MailErrorCodeInvalidCredentials:
@@ -437,10 +594,11 @@ func DetermineErrorEventType(err *errx.MailError) models.JobEventType {
 	case errx.MailErrorCodeAccountSuspended, errx.MailErrorCodeAuthorizationFailed:
 		return models.JobEventTypeEmailDisabled
 
-	case errx.MailErrorCodeRateLimitExceeded, errx.MailErrorCodeSendingTooFast, errx.MailErrorCodeQuotaExceeded:
+	case errx.MailErrorCodeRateLimitExceeded:
 		return models.JobEventTypeEmailRateLimited
 
-	case errx.MailErrorCodeServerUnreachable, errx.MailErrorCodeConnectionLost, errx.MailErrorCodeNotFound:
+	case errx.MailErrorCodeServerUnreachable, errx.MailErrorCodeConnectionLost, errx.MailErrorCodeNotFound,
+		errx.MailErrorCodeTLSCertificateChanged, errx.MailErrorCodeTLSCertificateUnconfirmed:
 		return models.JobEventTypeEmailServerError
 
 	default:
@@ -455,8 +613,15 @@ func MailErrorToSendError(err *errx.MailError) *models.EmailSendError {
 	}
 
 	userInfo := err.GetUserErrorInfo()
+	failure := err.Failure
+	if failure == nil && err.RetryAfter > 0 && (err.Code == errx.MailErrorCodeSendingTooFast || err.Code == errx.MailErrorCodeQuotaExceeded) {
+		now := time.Now().UTC()
+		at := now.Add(err.RetryAfter)
+		failure = &errx.SendFailure{Disposition: errx.SendThrottle, Scope: "mailbox", ObservedAt: now, RetryAt: &at}
+	}
 
 	return &models.EmailSendError{
+		Failure:        failure,
 		Code:           string(err.Code),
 		Type:           string(err.Type),
 		Message:        err.Message,
@@ -465,5 +630,6 @@ func MailErrorToSendError(err *errx.MailError) *models.EmailSendError {
 		UserTitle:      userInfo.Title,
 		UserMessage:    userInfo.Message,
 		ActionRequired: userInfo.ActionRequired,
+		Recipient:      err.Recipient,
 	}
 }

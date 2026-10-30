@@ -46,7 +46,7 @@ func NewFormRepository(d *db.DB) FormRepository {
 }
 
 const formColumns = `f.id, f.organization_id, f.created_by, f.public_id, f.name, f.status, f.fields, f.design,
-	f.success_message, f.redirect_url, f.campaign_id, f.allowed_domains, f.captcha_enabled,
+	f.success_message, f.redirect_url, f.campaign_id, f.allowed_domains, f.captcha_enabled, f.triage_enabled,
 	f.logo_url, f.cover_url, f.background_url,
 	f.views_count, f.submissions_count, f.last_submission_at, f.published_at,
 	(SELECT COALESCE(array_agg(fc.category_id), ARRAY[]::uuid[]) FROM form_categories fc WHERE fc.form_id = f.id),
@@ -56,7 +56,7 @@ func scanForm(row pgx.Row) (*models.Form, error) {
 	var f models.Form
 	var fieldsRaw, designRaw []byte
 	if err := row.Scan(&f.ID, &f.OrganizationID, &f.CreatedBy, &f.PublicID, &f.Name, &f.Status, &fieldsRaw, &designRaw,
-		&f.SuccessMessage, &f.RedirectURL, &f.CampaignID, &f.AllowedDomains, &f.CaptchaEnabled,
+		&f.SuccessMessage, &f.RedirectURL, &f.CampaignID, &f.AllowedDomains, &f.CaptchaEnabled, &f.TriageEnabled,
 		&f.LogoURL, &f.CoverURL, &f.BackgroundURL,
 		&f.ViewsCount, &f.SubmissionsCount, &f.LastSubmissionAt, &f.PublishedAt,
 		&f.CategoryIDs, &f.CreatedAt, &f.UpdatedAt); err != nil {
@@ -125,6 +125,24 @@ func (r *formRepository) GetByPublicID(ctx context.Context, publicID string) (*m
 	return f, nil
 }
 
+// formWriteValues renders the columns a Go zero value would corrupt: a form
+// with no domains and no fields yet is exactly what "New form" creates, and
+// its nil slices would bind as NULL against a NOT NULL allowed_domains and a
+// fields column CHECKed to hold a JSON array (issue #343).
+func formWriteValues(f *models.Form) (fields, design []byte, domains []string, err error) {
+	list := f.Fields
+	if list == nil {
+		list = []models.FormField{}
+	}
+	if fields, err = json.Marshal(list); err != nil {
+		return nil, nil, nil, err
+	}
+	if design, err = json.Marshal(f.Design); err != nil {
+		return nil, nil, nil, err
+	}
+	return fields, design, textArray(f.AllowedDomains), nil
+}
+
 func (r *formRepository) Create(ctx context.Context, orgID uuid.UUID, createdBy *uuid.UUID, f *models.Form) (*models.Form, *errx.Error) {
 	var count int
 	if err := r.DB.QueryRow(ctx, `SELECT COUNT(*) FROM forms WHERE organization_id = $1`, orgID).Scan(&count); err != nil {
@@ -135,8 +153,11 @@ func (r *formRepository) Create(ctx context.Context, orgID uuid.UUID, createdBy 
 		return nil, errx.New(errx.BadRequest, fmt.Sprintf("at most %d forms per organization", models.FormsPerOrgMax))
 	}
 
-	fields, _ := json.Marshal(f.Fields)
-	design, _ := json.Marshal(f.Design)
+	fields, design, domains, err := formWriteValues(f)
+	if err != nil {
+		db.CaptureError(err, "forms create", nil, "marshal")
+		return nil, errx.InternalError()
+	}
 
 	tx, err := r.DB.Begin(ctx)
 	if err != nil {
@@ -148,16 +169,16 @@ func (r *formRepository) Create(ctx context.Context, orgID uuid.UUID, createdBy 
 	var id uuid.UUID
 	err = tx.QueryRow(ctx, `
 		INSERT INTO forms (organization_id, created_by, public_id, name, status, fields, design,
-			success_message, redirect_url, campaign_id, allowed_domains, captcha_enabled)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			success_message, redirect_url, campaign_id, allowed_domains, captcha_enabled, triage_enabled)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id
 	`, orgID, createdBy, f.PublicID, f.Name, f.Status, fields, design,
-		f.SuccessMessage, f.RedirectURL, f.CampaignID, f.AllowedDomains, f.CaptchaEnabled).Scan(&id)
+		f.SuccessMessage, f.RedirectURL, f.CampaignID, domains, f.CaptchaEnabled, f.TriageEnabled).Scan(&id)
 	if err != nil {
 		db.CaptureError(err, "forms create", nil, "insert")
 		return nil, errx.InternalError()
 	}
-	if xerr := setFormCategories(ctx, tx, id, f.CategoryIDs); xerr != nil {
+	if xerr := setFormCategories(ctx, tx, orgID, id, f.CategoryIDs); xerr != nil {
 		return nil, xerr
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -168,8 +189,11 @@ func (r *formRepository) Create(ctx context.Context, orgID uuid.UUID, createdBy 
 }
 
 func (r *formRepository) Update(ctx context.Context, orgID uuid.UUID, f *models.Form) (*models.Form, *errx.Error) {
-	fields, _ := json.Marshal(f.Fields)
-	design, _ := json.Marshal(f.Design)
+	fields, design, domains, err := formWriteValues(f)
+	if err != nil {
+		db.CaptureError(err, "forms update", nil, "marshal")
+		return nil, errx.InternalError()
+	}
 
 	tx, err := r.DB.Begin(ctx)
 	if err != nil {
@@ -181,10 +205,10 @@ func (r *formRepository) Update(ctx context.Context, orgID uuid.UUID, f *models.
 	tag, err := tx.Exec(ctx, `
 		UPDATE forms SET name = $3, status = $4, fields = $5, design = $6, success_message = $7,
 			redirect_url = $8, campaign_id = $9, allowed_domains = $10, captcha_enabled = $11,
-			published_at = $12, updated_at = NOW()
+			published_at = $12, triage_enabled = $13, updated_at = NOW()
 		WHERE organization_id = $1 AND id = $2
 	`, orgID, f.ID, f.Name, f.Status, fields, design, f.SuccessMessage,
-		f.RedirectURL, f.CampaignID, f.AllowedDomains, f.CaptchaEnabled, f.PublishedAt)
+		f.RedirectURL, f.CampaignID, domains, f.CaptchaEnabled, f.PublishedAt, f.TriageEnabled)
 	if err != nil {
 		db.CaptureError(err, "forms update", nil, "exec")
 		return nil, errx.InternalError()
@@ -196,7 +220,7 @@ func (r *formRepository) Update(ctx context.Context, orgID uuid.UUID, f *models.
 		db.CaptureError(err, "forms update", nil, "categories clear")
 		return nil, errx.InternalError()
 	}
-	if xerr := setFormCategories(ctx, tx, f.ID, f.CategoryIDs); xerr != nil {
+	if xerr := setFormCategories(ctx, tx, orgID, f.ID, f.CategoryIDs); xerr != nil {
 		return nil, xerr
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -206,20 +230,21 @@ func (r *formRepository) Update(ctx context.Context, orgID uuid.UUID, f *models.
 	return r.Get(ctx, orgID, f.ID)
 }
 
-// setFormCategories links the picked categories, quietly dropping ids that
-// no longer exist (a stale picker must not fail the save).
-func setFormCategories(ctx context.Context, tx pgx.Tx, formID uuid.UUID, categoryIDs []uuid.UUID) *errx.Error {
+// setFormCategories links the picked categories, quietly dropping ids that no
+// longer exist or belong to another workspace (a stale picker must not fail the
+// save, and a borrowed id must not file leads under a foreign category).
+func setFormCategories(ctx context.Context, tx pgx.Tx, orgID, formID uuid.UUID, categoryIDs []uuid.UUID) *errx.Error {
 	if len(categoryIDs) == 0 {
 		return nil
 	}
 	if len(categoryIDs) > models.FormMaxCategories {
-		return errx.New(errx.BadRequest, fmt.Sprintf("at most %d categories per form", models.FormMaxCategories))
+		return errx.New(errx.BadRequest, fmt.Sprintf("at most %d labels per form", models.FormMaxCategories))
 	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO form_categories (form_id, category_id)
-		SELECT $1, c.id FROM categories c WHERE c.id = ANY($2)
+		SELECT $1, c.id FROM categories c WHERE c.id = ANY($2) AND c.organization_id = $3
 		ON CONFLICT (form_id, category_id) DO NOTHING
-	`, formID, categoryIDs)
+	`, formID, categoryIDs, orgID)
 	if err != nil {
 		db.CaptureError(err, "forms categories", nil, "insert")
 		return errx.InternalError()
@@ -280,10 +305,10 @@ func (r *formRepository) CreateSubmission(ctx context.Context, sub *models.FormS
 	defer tx.Rollback(ctx)
 
 	err = tx.QueryRow(ctx, `
-		INSERT INTO form_submissions (form_id, organization_id, contact_id, campaign_id, data, source_url)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO form_submissions (form_id, organization_id, contact_id, campaign_id, data, source_url, triage, triage_confidence)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, created_at
-	`, sub.FormID, sub.OrganizationID, sub.ContactID, sub.CampaignID, data, sub.SourceURL).Scan(&sub.ID, &sub.CreatedAt)
+	`, sub.FormID, sub.OrganizationID, sub.ContactID, sub.CampaignID, data, sub.SourceURL, sub.Triage, float32(sub.TriageConfidence)).Scan(&sub.ID, &sub.CreatedAt)
 	if err != nil {
 		db.CaptureError(err, "form submission", nil, "insert")
 		return nil, errx.InternalError()
@@ -306,7 +331,7 @@ func (r *formRepository) ListSubmissions(ctx context.Context, orgID, formID uuid
 		limit = 50
 	}
 	rows, err := r.DB.Query(ctx, `
-		SELECT s.id, s.form_id, s.organization_id, s.contact_id, s.campaign_id, s.data, s.source_url, s.created_at,
+		SELECT s.id, s.form_id, s.organization_id, s.contact_id, s.campaign_id, s.data, s.source_url, s.triage, s.triage_confidence, s.created_at,
 			COALESCE(c.email, ''), COALESCE(TRIM(c.first_name || ' ' || c.last_name), ''), COALESCE(cp.name, '')
 		FROM form_submissions s
 		LEFT JOIN contacts c ON c.id = s.contact_id
@@ -324,11 +349,13 @@ func (r *formRepository) ListSubmissions(ctx context.Context, orgID, formID uuid
 	for rows.Next() {
 		var s models.FormSubmission
 		var data []byte
-		if err := rows.Scan(&s.ID, &s.FormID, &s.OrganizationID, &s.ContactID, &s.CampaignID, &data, &s.SourceURL, &s.CreatedAt,
+		var confidence float32
+		if err := rows.Scan(&s.ID, &s.FormID, &s.OrganizationID, &s.ContactID, &s.CampaignID, &data, &s.SourceURL, &s.Triage, &confidence, &s.CreatedAt,
 			&s.ContactEmail, &s.ContactName, &s.CampaignName); err != nil {
 			db.CaptureError(err, "form submissions list", nil, "scan")
 			return nil, false, errx.InternalError()
 		}
+		s.TriageConfidence = float64(confidence)
 		s.Data = map[string]any{}
 		if len(data) > 0 {
 			if err := json.Unmarshal(data, &s.Data); err != nil {

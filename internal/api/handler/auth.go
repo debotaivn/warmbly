@@ -10,6 +10,7 @@ import (
 	"github.com/warmbly/warmbly/internal/api/middleware"
 	"github.com/warmbly/warmbly/internal/app/auth"
 	"github.com/warmbly/warmbly/internal/errx"
+	"github.com/warmbly/warmbly/internal/models"
 )
 
 const authRequestTimeout = 15 * time.Second
@@ -18,7 +19,7 @@ func (h *Handler) LoginStart(c *gin.Context) {
 	var data auth.AuthData
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -38,7 +39,7 @@ func (h *Handler) LoginConfirm(c *gin.Context) {
 	var data auth.ConfirmData
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, err)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -58,7 +59,7 @@ func (h *Handler) RegistrationStart(c *gin.Context) {
 	var data auth.AuthData
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -78,7 +79,7 @@ func (h *Handler) RegistrationConfirm(c *gin.Context) {
 	var data auth.ConfirmData
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, err)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -100,7 +101,7 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -131,6 +132,12 @@ func (h *Handler) LogoutAll(c *gin.Context) {
 		errx.Handle(c, err)
 		return
 	}
+	if uid, err := middleware.GetUserUUID(c); err == nil {
+		if ferr := h.AuthService.ForgetTrustedDevices(c.Request.Context(), uid); ferr != nil {
+			errx.Handle(c, ferr)
+			return
+		}
+	}
 
 	c.Status(http.StatusNoContent)
 }
@@ -151,30 +158,69 @@ func (h *Handler) GetUser(c *gin.Context) {
 		return
 	}
 
-	// Populate the per-user label groups so the frontend can render
+	// Populate the workspace's label registries so the frontend can render
 	// folder/tag pickers on initial page load without three extra
-	// round-trips. Without this, anything the user created in a
-	// previous session would disappear after a refresh: the cache
-	// would optimistic-update from a Create response, but on reload
-	// the /auth/me payload had empty folders/tags/categories.
-	if folders, ferr := h.FolderService.List(ctx, uid); ferr == nil {
-		u.Folders = folders
+	// round-trips. Without this, anything created in a previous session
+	// would disappear after a refresh: the cache would optimistic-update
+	// from a Create response, but on reload the /auth/me payload had empty
+	// folders/tags/categories.
+	//
+	// Scoped to the session's current organization, not the caller: labels
+	// are workspace assets, so a teammate must see what the owner created
+	// (issue #436). A session with no workspace selected gets empty lists.
+	// Admin routes require a second factor, so the panel has to be able to say
+	// so before it makes a call that 403s.
+	if sess := middleware.GetSession(c); sess != nil {
+		u.SessionMFAVerified = sess.MFAVerified
 	}
-	if tags, terr := h.TagService.List(ctx, uid); terr == nil {
-		u.Tags = tags
-	}
-	if cats, cerr := h.CategoryService.List(ctx, uid); cerr == nil {
-		u.Categories = cats
+
+	u.Folders, u.Tags, u.Categories = []models.Group{}, []models.Group{}, []models.Group{}
+	if orgID := middleware.GetOrganizationID(c); orgID != nil {
+		if folders, ferr := h.FolderService.List(ctx, *orgID); ferr == nil {
+			u.Folders = folders
+		}
+		if tags, terr := h.TagService.List(ctx, *orgID); terr == nil {
+			u.Tags = tags
+		}
+		// Restricted members see only registries around their grants.
+		if m := middleware.GetAuthMember(c); m.IsRestricted() {
+			scope, xerr := h.OrganizationService.ResolveMemberScope(ctx, *orgID, m.UserID)
+			if xerr != nil {
+				errx.Handle(c, xerr)
+				return
+			}
+			u.Folders = keepGroups(u.Folders, scope.Folders)
+			u.Tags = keepGroups(u.Tags, scope.MailboxTags)
+			if cats, cerr := h.UniboxService.CategoriesForMailboxes(ctx, *orgID, scope.Mailboxes); cerr == nil {
+				u.Categories = cats
+			}
+		} else if cats, cerr := h.CategoryService.List(ctx, *orgID); cerr == nil {
+			u.Categories = cats
+		}
 	}
 
 	c.JSON(http.StatusOK, u)
+}
+
+// keepGroups is the labels whose ids are in keep.
+func keepGroups(groups []models.Group, keep []uuid.UUID) []models.Group {
+	out := make([]models.Group, 0, len(keep))
+	for _, g := range groups {
+		for _, id := range keep {
+			if g.ID == id {
+				out = append(out, g)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (h *Handler) ResetPasswordStart(c *gin.Context) {
 	var data auth.ResetPasswordStart
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -189,11 +235,36 @@ func (h *Handler) ResetPasswordStart(c *gin.Context) {
 	c.Status(http.StatusOK)
 }
 
+// ResetPasswordSession exchanges the emailed link token, sent in the body, for
+// the reset session the confirm step takes.
+func (h *Handler) ResetPasswordSession(c *gin.Context) {
+	var data auth.ResetPasswordExchange
+	if err := c.ShouldBindJSON(&data); err != nil {
+		errx.Handle(c, errx.InvalidBody(err))
+		return
+	}
+	if data.Token == "" {
+		errx.Handle(c, errx.ErrToken)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), authRequestTimeout)
+	defer cancel()
+
+	sess, err := h.AuthService.ResetPasswordSession(ctx, data.Token)
+	if err != nil {
+		errx.Handle(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, sess)
+}
+
 func (h *Handler) ResetPasswordConfirm(c *gin.Context) {
 	var data auth.ResetPasswordConfirm
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -208,7 +279,9 @@ func (h *Handler) ResetPasswordConfirm(c *gin.Context) {
 	c.Status(http.StatusOK)
 }
 
-// ChangePassword updates the signed-in user's password (current + new).
+// ChangePassword updates the signed-in user's password (current + new). Every
+// session ends with it; the response carries the token pair of a new session
+// for this device, and the client must use it from here on.
 func (h *Handler) ChangePassword(c *gin.Context) {
 	uid, err := uuid.Parse(middleware.GetUserID(c))
 	if err != nil {
@@ -218,17 +291,22 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 
 	var data auth.ChangePassword
 	if berr := c.ShouldBindJSON(&data); berr != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(berr))
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), authRequestTimeout)
 	defer cancel()
 
-	if xerr := h.AuthService.ChangePassword(ctx, uid, currentSessionID(c), &data); xerr != nil {
+	tok, xerr := h.AuthService.ChangePassword(ctx, uid, middleware.GetSession(c), c.ClientIP(), c.Request.UserAgent(), &data)
+	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
+	if tok == nil {
+		c.Status(http.StatusOK)
+		return
+	}
 
-	c.Status(http.StatusOK)
+	c.JSON(http.StatusOK, tok)
 }

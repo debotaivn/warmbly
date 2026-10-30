@@ -186,6 +186,38 @@ func TestFormServerServesShellWithRenderToken(t *testing.T) {
 	}
 }
 
+// The bare host and a mistyped path are the two addresses a human reaches
+// without a form link, and gin answers both with a plain-text 404 unless we
+// take them over.
+func TestFormServerRootAndNotFoundPages(t *testing.T) {
+	_, _, r := newFixture(t, 0)
+
+	w := get(r, "/", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("root status %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "<!doctype html>") {
+		t.Fatalf("root is not an HTML page: %q", w.Body.String())
+	}
+
+	w = get(r, "/nope", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown path status %d, want 404", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "<!doctype html>") {
+		t.Fatalf("unknown path is not an HTML page: %q", w.Body.String())
+	}
+
+	// A scripted caller still gets JSON.
+	w = get(r, "/api/nope", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown api status %d, want 404", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"not_found"`) {
+		t.Fatalf("unknown api did not answer JSON: %q", w.Body.String())
+	}
+}
+
 func TestFormServerRequiresRenderToken(t *testing.T) {
 	_, srv, r := newFixture(t, 0)
 
@@ -400,5 +432,72 @@ func TestFormServerSubmitRateLimit(t *testing.T) {
 	w := post(r, "/api/forms/pubtest123/submit", token, payload)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("third submit status %d, want 429", w.Code)
+	}
+}
+
+// The browser credentials are stamped into the shell once at construction, so a
+// page a stranger loads either carries the operator's key and DSN or carries
+// empty tags and loads no reporting SDK at all. There is no third state.
+func TestFormShellStampsBrowserReporting(t *testing.T) {
+	shell := []byte(`<!doctype html><html><head>` +
+		`<meta name="wf-posthog-key" content="" />` +
+		`<meta name="wf-posthog-host" content="" />` +
+		`<meta name="wf-posthog-errors" content="" />` +
+		`<meta name="wf-sentry-dsn" content="" />` +
+		`<meta name="wf-release" content="" />` +
+		`</head><body></body></html>`)
+
+	unset := string(stampMeta(stampMeta(shell, "wf-sentry-dsn", ""), "wf-posthog-key", ""))
+	for _, name := range []string{"wf-posthog-key", "wf-sentry-dsn"} {
+		if !strings.Contains(unset, `<meta name="`+name+`" content="" />`) {
+			t.Fatalf("an unset %s should leave the placeholder untouched, got %s", name, unset)
+		}
+	}
+
+	set := string(stampMeta(stampMeta(stampMeta(stampMeta(stampMeta(shell,
+		"wf-posthog-key", "phc_example"),
+		"wf-posthog-host", "https://eu.i.posthog.com"),
+		"wf-posthog-errors", "false"),
+		"wf-sentry-dsn", `https://k@example.invalid/1`),
+		"wf-release", "v1.2.3"))
+	for _, want := range []string{
+		`<meta name="wf-posthog-key" content="phc_example" />`,
+		`<meta name="wf-posthog-host" content="https://eu.i.posthog.com" />`,
+		`<meta name="wf-posthog-errors" content="false" />`,
+		`<meta name="wf-sentry-dsn" content="https://k@example.invalid/1" />`,
+		`<meta name="wf-release" content="v1.2.3" />`,
+	} {
+		if !strings.Contains(set, want) {
+			t.Fatalf("%s was not stamped, got %s", want, set)
+		}
+	}
+
+	// Both values are operator-supplied, so neither may close the tag and
+	// inject markup into a page served to the public.
+	for _, name := range []string{"wf-posthog-key", "wf-sentry-dsn"} {
+		escaped := string(stampMeta(shell, name, `" /><script>alert(1)</script><meta x="`))
+		if strings.Contains(escaped, "<script>") {
+			t.Fatalf("stamped %s was not escaped: %s", name, escaped)
+		}
+	}
+}
+
+func TestFormServerRefusesRepeatedParametersAndRenderTokens(t *testing.T) {
+	_, srv, r := newFixture(t, 0)
+	token := mintFor(srv, "pubtest123")
+
+	if w := get(r, "/api/forms/pubtest123?ref=a&ref=b", token); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "duplicate_query_parameter") {
+		t.Fatalf("repeated query status %d: %s", w.Code, w.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/forms/pubtest123", nil)
+	req.Header.Add("X-Warmbly-Render", token)
+	req.Header.Add("X-Warmbly-Render", mintFor(srv, "otherform"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "duplicate_header") {
+		t.Fatalf("repeated render token status %d: %s", w.Code, w.Body.String())
+	}
+	if w := get(r, "/api/forms/pubtest123?ref=a", token); w.Code != http.StatusOK {
+		t.Fatalf("single query status %d: %s", w.Code, w.Body.String())
 	}
 }

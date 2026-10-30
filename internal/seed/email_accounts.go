@@ -4,7 +4,10 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/repository"
 )
 
 func seedEmailAccounts(ctx context.Context, pool *pgxpool.Pool, r *Result) error {
@@ -61,7 +64,7 @@ func seedEmailAccounts(ctx context.Context, pool *pgxpool.Pool, r *Result) error
 				tracking_domain, timezone,
 				warmup, warmup_base, warmup_max, warmup_increase, warmup_reply_rate,
 				warmup_tag, warmup_start_time, warmup_end_time, warmup_days,
-				warmup_pool_type,
+				warmup_pool_type, test_mode,
 				created_at, updated_at
 			) VALUES (
 				$1,$2,$3,$4,$5,$6,
@@ -71,13 +74,14 @@ func seedEmailAccounts(ctx context.Context, pool *pgxpool.Pool, r *Result) error
 				CASE WHEN $8 THEN NOW() ELSE NULL END,
 				10, 40, 1, 30,
 				$9, '08:00', '20:00', 62,
-				$10,
+				$10, 'legacy',
 				NOW(), NOW()
 			)
 			ON CONFLICT (id) DO UPDATE SET
 				worker_id = EXCLUDED.worker_id,
 				warmup = EXCLUDED.warmup,
 				warmup_pool_type = EXCLUDED.warmup_pool_type,
+				test_mode = EXCLUDED.test_mode,
 				status = 'active',
 				updated_at = NOW()
 		`,
@@ -136,41 +140,13 @@ func seedEmailAccounts(ctx context.Context, pool *pgxpool.Pool, r *Result) error
 }
 
 func seedWarmupParticipants(ctx context.Context, pool *pgxpool.Pool, _ *Result) error {
-	// Resolve pool IDs (the rows are inserted by migration 000010 but with
-	// generated UUIDs, so look them up by pool_type).
-	rows, err := pool.Query(ctx, `SELECT id, pool_type::text FROM warmup_pools`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	poolIDs := map[string]uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		var t string
-		if err := rows.Scan(&id, &t); err != nil {
+	// Migration 000156 seeds one pool per type under fixed ids; MoveToPool
+	// moves a mailbox that sits in the other pool rather than skipping it.
+	warmups := repository.NewWarmupRepository(pool)
+	for _, id := range []uuid.UUID{EmailAcmeAliceID, EmailAcmeBobID} {
+		if err := warmups.MoveToPool(ctx, models.WarmupPoolPremiumID, id, "sender_receiver"); err != nil {
 			return err
 		}
-		poolIDs[t] = id
-	}
-
-	join := func(poolType string, accountID uuid.UUID) error {
-		pid, ok := poolIDs[poolType]
-		if !ok {
-			return nil
-		}
-		_, err := pool.Exec(ctx, `
-			INSERT INTO warmup_pool_participants (pool_id, email_account_id, joined_at, spam_score)
-			VALUES ($1, $2, NOW(), 0)
-			ON CONFLICT (pool_id, email_account_id) DO NOTHING
-		`, pid, accountID)
-		return err
-	}
-
-	if err := join("premium", EmailAcmeAliceID); err != nil {
-		return err
-	}
-	if err := join("premium", EmailAcmeBobID); err != nil {
-		return err
 	}
 	return nil
 }

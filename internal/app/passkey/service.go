@@ -36,6 +36,13 @@ type Service interface {
 	// handle, and mints a full session — single step, no email OTP.
 	FinishLogin(ctx context.Context, session string, credential []byte, ipaddr, userAgent string) (*models.Token, *errx.Error)
 
+	// BeginReauth asks a signed-in user for one of their own passkeys, keyed
+	// by the session it will re-authenticate. FinishReauth verifies it.
+	BeginReauth(ctx context.Context, userID, sessionID uuid.UUID) (*protocol.CredentialAssertion, *errx.Error)
+	FinishReauth(ctx context.Context, userID, sessionID uuid.UUID, credential []byte) *errx.Error
+	// HasCredentials reports whether the user has enrolled any passkey.
+	HasCredentials(ctx context.Context, userID uuid.UUID) (bool, *errx.Error)
+
 	// ListCredentials returns the user's passkeys for the manager UI.
 	ListCredentials(ctx context.Context, userID uuid.UUID) ([]*CredentialView, *errx.Error)
 	// RenameCredential updates a passkey's friendly name.
@@ -66,8 +73,8 @@ type Deps struct {
 
 // New constructs the passkey service and the underlying WebAuthn engine.
 // Registration defaults to discoverable, synced passkeys (resident key
-// required, user verification preferred) with no attestation — the broadest
-// provider compatibility for consumer passkeys.
+// required, user verification required) with no attestation. Verification is
+// required because a passkey sign-in counts as multi-factor.
 func New(deps Deps) (Service, error) {
 	web, err := webauthn.New(&webauthn.Config{
 		RPID:          deps.RPID,
@@ -75,7 +82,7 @@ func New(deps Deps) (Service, error) {
 		RPOrigins:     deps.RPOrigins,
 		AuthenticatorSelection: protocol.AuthenticatorSelection{
 			ResidentKey:      protocol.ResidentKeyRequirementRequired,
-			UserVerification: protocol.VerificationPreferred,
+			UserVerification: protocol.VerificationRequired,
 		},
 		AttestationPreference: protocol.PreferNoAttestation,
 	})

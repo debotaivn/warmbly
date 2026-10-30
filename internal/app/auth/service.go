@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/warmbly/warmbly/internal/app/appattest"
 	"github.com/warmbly/warmbly/internal/app/organization"
 	"github.com/warmbly/warmbly/internal/app/token"
 	"github.com/warmbly/warmbly/internal/app/trial"
@@ -16,6 +17,7 @@ import (
 	"github.com/warmbly/warmbly/internal/infrastructure/cache"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/notify"
+	"github.com/warmbly/warmbly/internal/observability/analytics"
 	"github.com/warmbly/warmbly/internal/pkg/captcha"
 	"github.com/warmbly/warmbly/internal/repository"
 )
@@ -25,7 +27,7 @@ import (
 // the auth package needs no import of twofa (no cycle).
 type TwoFAChallenger interface {
 	IsEnabled(ctx context.Context, userID uuid.UUID) (bool, error)
-	CreatePendingChallenge(ctx context.Context, userID uuid.UUID) (string, int, *errx.Error)
+	CreatePendingChallenge(ctx context.Context, userID uuid.UUID, authProvider string, link *models.UserIdentity) (string, int, *errx.Error)
 }
 
 // ReferralAttributor links a brand-new org to the referrer behind its signup
@@ -33,6 +35,25 @@ type TwoFAChallenger interface {
 // so the auth package needs no import of referral (no cycle).
 type ReferralAttributor interface {
 	AttributeSignup(ctx context.Context, code string, inviteeOrgID, inviteeUserID uuid.UUID) *errx.Error
+}
+
+// AcquisitionRecorder stores where a signup came from on the new workspace.
+// Satisfied by repository.OrganizationRepository; injected post-construction
+// (WireAcquisition) and nil-safe, so a deployment that never wires it simply
+// records no attribution.
+type AcquisitionRecorder interface {
+	RecordOrganizationAcquisition(ctx context.Context, acq *models.OrgAcquisition) error
+}
+
+// ProductAnalytics counts a finished signup. Satisfied by
+// *analytics.Client; injected post-construction (WireAnalytics) and nil-safe,
+// so a deployment with no POSTHOG_KEY counts nothing and calls nothing.
+//
+// The signup is counted server-side because that is the only place it is
+// exact: an ad blocker, a closed tab or a failed beacon all lose the browser's
+// version of the event that matters most.
+type ProductAnalytics interface {
+	Capture(name string, req analytics.Request, properties map[string]any)
 }
 
 // InstanceSettings is the operator-editable half of the signup policy.
@@ -44,15 +65,34 @@ type InstanceSettings interface {
 
 type AuthService interface {
 	LoginStart(ctx context.Context, data *AuthData, ipaddr, userAgent string) (*models.AuthSession, *errx.Error)
+	// PasswordHashFor returns the stored argon2 hash, or empty for an account
+	// that has no password (passkey or SSO only). Used by the re-auth endpoint
+	// to confirm the account holder without starting a new login.
+	PasswordHashFor(ctx context.Context, userID uuid.UUID) (string, *errx.Error)
+	// The per-account budget for signed-in proofs (re-auth, 2FA disable and
+	// recovery-code regeneration). Reserve charges one attempt atomically and
+	// reports whether it was within budget; Release refunds an attempt that
+	// never checked a credential; Clear forgives the count on success.
+	ReserveReauthAttempt(ctx context.Context, userID uuid.UUID) (bool, *errx.Error)
+	ReleaseReauthAttempt(ctx context.Context, userID uuid.UUID)
+	ClearReauthFailures(ctx context.Context, userID uuid.UUID)
 	LoginConfirm(ctx context.Context, data *ConfirmData, session, ipaddr, userAgent string) (*models.LoginResult, *errx.Error)
 	// WireTwoFA attaches the 2FA challenger (post-construction; nil = 2FA off).
 	WireTwoFA(t TwoFAChallenger)
+	// WireAppAttest accepts native app proofs on the captcha-gated paths (nil = off).
+	WireAppAttest(a *appattest.Service)
 
 	RegistrationStart(ctx context.Context, data *AuthData, origin SignupOrigin) (*models.AuthSession, *errx.Error)
 	RegistrationConfirm(ctx context.Context, data *ConfirmData, session string, origin SignupOrigin) (*models.AuthSession, *errx.Error)
 	// WireReferral attaches the referral attributor (post-construction; nil = no
 	// referral attribution at signup).
 	WireReferral(r ReferralAttributor)
+	WireAcquisition(r AcquisitionRecorder)
+	WireAnalytics(a ProductAnalytics, host string)
+
+	// WireOperatorNotifier attaches the instance-wide operator alert channel
+	// (post-construction; nil = no alerts).
+	WireOperatorNotifier(n OperatorNotifier)
 
 	// WireInstanceSettings attaches the database-backed instance settings
 	// (post-construction; nil keeps the permissive defaults).
@@ -68,11 +108,22 @@ type AuthService interface {
 	WireExternalIDTokens(apple, google IDTokenVerifier)
 
 	ResetPasswordStart(ctx context.Context, data *ResetPasswordStart, ipaddr string) *errx.Error
+	// ResetPasswordSession opens a reset session for an emailed link token,
+	// which the confirm step takes in place of the link token itself.
+	ResetPasswordSession(ctx context.Context, linkToken string) (*ResetPasswordSession, *errx.Error)
 	ResetPasswordConfirm(ctx context.Context, data *ResetPasswordConfirm, session, ipaddr string) *errx.Error
+	// WireCredentialRevokers attaches what ends a user's API credentials when
+	// a password change or reset asks for it.
+	WireCredentialRevokers(r ...UserCredentialRevoker)
 
 	// ChangePassword updates a logged-in user's password after verifying the
-	// current one.
-	ChangePassword(ctx context.Context, userID, currentSessionID uuid.UUID, data *ChangePassword) *errx.Error
+	// current one. Every session ends with it and the caller gets the token
+	// pair of a new one for its device; current is the caller's session, whose
+	// workspace, sign-in method and MFA status the new one keeps.
+	ChangePassword(ctx context.Context, userID uuid.UUID, current *models.Session, ipaddr, userAgent string, data *ChangePassword) (*models.Token, *errx.Error)
+	// ForgetTrustedDevices drops every browser the user asked to remember, so
+	// each asks for an emailed login code again.
+	ForgetTrustedDevices(ctx context.Context, userID uuid.UUID) *errx.Error
 
 	// Policy is the resolved per-deployment auth behavior, exposed so the
 	// public /auth/config endpoint can report it to the login screen.
@@ -100,8 +151,27 @@ type AuthService interface {
 	SSOBegin(ctx context.Context, provider string) (*SSORedirect, *errx.Error)
 	// SSOCallbackComplete returns a single-use handoff code, not a session: the
 	// provider redirects a browser here, so the response must be a redirect.
-	SSOCallbackComplete(ctx context.Context, in SSOCallback) (string, *errx.Error)
+	SSOCallbackComplete(ctx context.Context, in SSOCallback) (*SSOCallbackResult, *errx.Error)
 	SSOExchange(ctx context.Context, code, binding string) (*models.LoginResult, *errx.Error)
+	// SSOLinkConfirm completes a federated sign-in that came back with
+	// link_required: the address already belongs to a password account, and
+	// the identity is attached only once that password is presented.
+	SSOLinkConfirm(ctx context.Context, data *SSOLinkData, ipaddr, userAgent string) (*models.LoginResult, *errx.Error)
+
+	// Re-authentication of a signed-in session through an identity linked to
+	// the account. Each succeeds only for (issuer, subject) already bound to
+	// userID, and only for the session that began it; the caller stamps it.
+	ReauthIdentities(ctx context.Context, userID uuid.UUID) (browser, native []string, err *errx.Error)
+	ReauthSSOBegin(ctx context.Context, provider string, userID, sessionID uuid.UUID) (*SSORedirect, *errx.Error)
+	ReauthSSOFinish(ctx context.Context, code, binding string, userID, sessionID uuid.UUID) *errx.Error
+	ReauthNativeBegin(ctx context.Context, sessionID uuid.UUID) (string, *errx.Error)
+	ReauthNativeVerify(ctx context.Context, provider, rawToken string, userID, sessionID uuid.UUID) *errx.Error
+}
+
+// OperatorNotifier is the instance-wide operator alert surface, injected
+// post-construction so this package needs no import of it. Nil disables it.
+type OperatorNotifier interface {
+	NotifyOperator(key, title, summary string, fields map[string]string)
 }
 
 type authService struct {
@@ -120,12 +190,23 @@ type authService struct {
 	trialService             trial.TrialService
 	organizationService      organization.OrganizationService
 	emailNotificationService notify.EmailNotificationService
-	cache                    *cache.Cache
-	captcha                  *captcha.Turnstile
-	appleIDTokens            IDTokenVerifier
-	googleIDTokens           IDTokenVerifier
-	twofa                    TwoFAChallenger
-	referral                 ReferralAttributor
+	// opsNotify raises instance-wide operator alerts. Nil is the default.
+	opsNotify OperatorNotifier
+	cache     *cache.Cache
+	captcha   *captcha.Turnstile
+	// appAttest takes the native app's proof in place of Turnstile. Nil turns it off.
+	appAttest      *appattest.Service
+	appleIDTokens  IDTokenVerifier
+	googleIDTokens IDTokenVerifier
+	twofa          TwoFAChallenger
+	referral       ReferralAttributor
+	// acquisition records the signup's channel on the new org. Nil-safe.
+	acquisition AcquisitionRecorder
+	// productAnalytics counts finished signups. Nil-safe.
+	productAnalytics ProductAnalytics
+	// analyticsHost is the dashboard's public hostname, forwarded so PostHog's
+	// cookieless hash resolves to the same root domain the browser reported.
+	analyticsHost string
 	// settings is the operator-editable settings document, wired after
 	// construction because it needs the database pool.
 	settings InstanceSettings
@@ -136,6 +217,8 @@ type authService struct {
 	// providers are the configured browser sign-in flows, keyed by identity
 	// provider ("oidc", "google", "apple"). Empty unless one is configured.
 	providers map[string]FederatedProvider
+	// credentialRevokers end a user's app grants and API keys on request.
+	credentialRevokers []UserCredentialRevoker
 
 	// policy and mailDelivers govern whether an emailed code gates a login and
 	// whether public signups are open. Defaults are set in NewService so a
@@ -145,6 +228,27 @@ type authService struct {
 }
 
 func (s *authService) WireTwoFA(t TwoFAChallenger) { s.twofa = t }
+
+// UserCredentialRevoker ends one kind of API credential a user holds or created.
+type UserCredentialRevoker interface {
+	RevokeUserCredentials(ctx context.Context, userID uuid.UUID) error
+}
+
+func (s *authService) WireCredentialRevokers(r ...UserCredentialRevoker) {
+	s.credentialRevokers = append(s.credentialRevokers, r...)
+}
+
+// WireAppAttest accepts native app proofs on the captcha-gated paths.
+func (s *authService) WireAppAttest(a *appattest.Service) { s.appAttest = a }
+
+// verifyHuman is the anti-automation gate on every unauthenticated auth write:
+// Turnstile for a browser, an App Attest assertion for the native app.
+func (s *authService) verifyHuman(ctx context.Context, action, turnstile string, proof *appattest.Proof, ipaddr string) *errx.Error {
+	if proof != nil && s.captcha.Required() && s.appAttest.Enabled() {
+		return s.appAttest.Verify(ctx, action, proof)
+	}
+	return s.captcha.Verify(ctx, turnstile, ipaddr)
+}
 
 func (s *authService) WireDeployment(policy *config.AuthPolicy, mailDelivers bool) {
 	if policy != nil {
@@ -158,6 +262,19 @@ func (s *authService) Policy() *config.AuthPolicy { return s.policy }
 func (s *authService) WireIdentities(r repository.IdentityRepository) { s.identities = r }
 
 func (s *authService) WireReferral(r ReferralAttributor) { s.referral = r }
+
+// WireAcquisition attaches the store for signup attribution.
+func (s *authService) WireAcquisition(r AcquisitionRecorder) { s.acquisition = r }
+
+// WireAnalytics attaches the product-analytics sink. host is the dashboard's
+// public hostname, which is one of the three inputs to the cookieless hash.
+func (s *authService) WireAnalytics(a ProductAnalytics, host string) {
+	s.productAnalytics = a
+	s.analyticsHost = host
+}
+
+// WireOperatorNotifier attaches the operator alert channel.
+func (s *authService) WireOperatorNotifier(n OperatorNotifier) { s.opsNotify = n }
 
 // WireInstanceSettings attaches the instance settings document, so the signup
 // knobs on the admin page reach the registration paths.

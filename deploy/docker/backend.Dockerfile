@@ -11,32 +11,38 @@
 # (adds librdkafka + CGO; slower, and CGO cannot cross-compile — build each arch
 # on a native runner). Runtime selection is still by env
 # (EVENTBUS_PROVIDER / CODEC_PROVIDER).
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 ARG GO_TAGS=""
 ARG TARGETOS TARGETARCH
+# Build identity shown in the admin panel; see internal/version.
+ARG VERSION="" COMMIT="" BUILT_AT=""
 RUN apk add --no-cache git ca-certificates && \
     if echo "$GO_TAGS" | grep -qw kafka; then apk add --no-cache gcc musl-dev librdkafka-dev; fi
 
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod go mod download
 
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
     set -eux; \
     if echo "$GO_TAGS" | grep -qw kafka; then CGO=1; TAGS="musl kafka"; else CGO=0; TAGS=""; fi; \
-    CGO_ENABLED=$CGO GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags "$TAGS" -ldflags="-s -w" -o /out/backend ./cmd/backend; \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /out/seed ./cmd/seed; \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /out/migrate ./cmd/migrate; \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /out/warmblyctl ./cmd/warmblyctl
+    CGO_ENABLED=$CGO GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags "$TAGS" -ldflags="-s -w -X github.com/warmbly/warmbly/internal/version.Version=$VERSION -X github.com/warmbly/warmbly/internal/version.Commit=$COMMIT -X github.com/warmbly/warmbly/internal/version.BuiltAt=$BUILT_AT" -o /out/backend ./cmd/backend; \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w -X github.com/warmbly/warmbly/internal/version.Version=$VERSION -X github.com/warmbly/warmbly/internal/version.Commit=$COMMIT -X github.com/warmbly/warmbly/internal/version.BuiltAt=$BUILT_AT" -o /out/seed ./cmd/seed; \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w -X github.com/warmbly/warmbly/internal/version.Version=$VERSION -X github.com/warmbly/warmbly/internal/version.Commit=$COMMIT -X github.com/warmbly/warmbly/internal/version.BuiltAt=$BUILT_AT" -o /out/migrate ./cmd/migrate; \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w -X github.com/warmbly/warmbly/internal/version.Version=$VERSION -X github.com/warmbly/warmbly/internal/version.Commit=$COMMIT -X github.com/warmbly/warmbly/internal/version.BuiltAt=$BUILT_AT" -o /out/warmblyctl ./cmd/warmblyctl; \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w -X github.com/warmbly/warmbly/internal/version.Version=$VERSION -X github.com/warmbly/warmbly/internal/version.Commit=$COMMIT -X github.com/warmbly/warmbly/internal/version.BuiltAt=$BUILT_AT" -o /out/warmbly ./cmd/cli
 
 # Runtime stage
 FROM alpine:3.23
 
 ARG GO_TAGS=""
-RUN apk add --no-cache ca-certificates tzdata && \
+# postgresql-client is here for `warmblyctl backup` and `warmblyctl restore`:
+# the instance bundle is a pg_dump and the restore replays it with psql, and the
+# backend container is where the CLI already has PRIMARY_DB and the blob root.
+RUN apk add --no-cache ca-certificates tzdata postgresql-client && \
     if echo "$GO_TAGS" | grep -qw kafka; then apk add --no-cache librdkafka; fi && \
     adduser -D -u 1000 warmbly
 
@@ -47,6 +53,23 @@ RUN apk add --no-cache ca-certificates tzdata && \
 # with "mkdir /data/blobs/emails: permission denied".
 RUN mkdir -p /data/blobs && chown -R warmbly:warmbly /data
 
+# GEODB_PATH's default directory, owned by the same user for the same reason:
+# with GEODB_URL set the process writes the database here itself, and /app is
+# root-owned, so without this the download fails on a directory it cannot make.
+# A bind mount over it still wins, which is how an operator supplies their own.
+RUN mkdir -p /app/data && chown -R warmbly:warmbly /app/data
+
+# Amazon RDS presents a chain rooted in an RDS CA that is in no public trust
+# store, so sslmode=verify-full cannot work against it from the system bundle
+# alone. Shipping AWS's truststore makes verification possible for operators who
+# opt in with sslrootcert=/etc/ssl/rds/global-bundle.pem; nothing here changes
+# the default, because pointing every install at an RDS-only store would break
+# a Postgres fronted by a public CA.
+RUN mkdir -p /etc/ssl/rds && \
+    wget -qO /etc/ssl/rds/global-bundle.pem \
+      https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem && \
+    chmod 0644 /etc/ssl/rds/global-bundle.pem
+
 COPY --from=builder /out/backend /app/backend
 COPY --from=builder /out/seed /app/seed
 COPY --from=builder /out/migrate /app/migrate
@@ -55,11 +78,9 @@ COPY --from=builder /out/migrate /app/migrate
 # `docker compose exec backend warmblyctl status` and not a path.
 COPY --from=builder /out/warmblyctl /usr/local/bin/warmblyctl
 
-# Installer script the worker orchestrator uploads + runs over SSH, and serves
-# at GET /worker-install.sh. The mode is explicit because COPY otherwise keeps
-# the checkout's: on a filesystem without POSIX permissions that is 0700, and
-# the backend runs as uid 1000, so serving the installer fails with a 500.
-COPY --chmod=755 scripts/install-worker.sh /app/scripts/install-worker.sh
+# The customer CLI ships alongside it, so an operator who has exec on the box
+# can drive the product as well as recover it without installing anything.
+COPY --from=builder /out/warmbly /usr/local/bin/warmbly
 
 USER warmbly
 EXPOSE 8080

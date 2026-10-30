@@ -4,43 +4,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/warmbly/warmbly/internal/errx"
 	"golang.org/x/oauth2"
 )
 
-// WorkerType represents the type of worker
-type WorkerType string
-
-const (
-	WorkerTypeShared    WorkerType = "shared"
-	WorkerTypeDedicated WorkerType = "dedicated"
-)
-
-// WorkerRiskPool buckets shared workers by acceptable mailbox risk level.
-// Dedicated workers don't use it (one customer per worker — no
-// cross-tenant contamination risk).
-type WorkerRiskPool string
-
-const (
-	WorkerRiskPoolClean      WorkerRiskPool = "clean"
-	WorkerRiskPoolRisky      WorkerRiskPool = "risky"
-	WorkerRiskPoolQuarantine WorkerRiskPool = "quarantine"
-)
-
-// WorkerEgressKind describes how a worker is wired up to actually send mail.
-// Different egress profiles ship with very different safe capacities, which
-// is why the capacity view branches on this column to derive base_capacity.
-type WorkerEgressKind string
-
-const (
-	WorkerEgressColdSMTP   WorkerEgressKind = "cold_smtp"
-	WorkerEgressOAuthAPI   WorkerEgressKind = "oauth_api"
-	WorkerEgressWarmupOnly WorkerEgressKind = "warmup_only"
-)
-
-// WorkerHealthState is the rolled-up health label maintained by the
-// assignment loop. Authoritative for "can this worker accept new
-// mailboxes" placement decisions. Mirrors the warmup health vocabulary
-// but applies to whole workers, not per-mailbox warmup state.
+// WorkerHealthState is the externally managed machine-health label used by placement.
 type WorkerHealthState string
 
 const (
@@ -51,80 +19,47 @@ const (
 	WorkerHealthBlocked     WorkerHealthState = "blocked"
 )
 
+// Worker is a node that carries mailboxes. It is a flat view over
+// workers JOIN fleet_nodes: the placement columns (AccountCount, HealthState,
+// LoadScore) live on `workers`, and the machine columns below are hydrated
+// from the node, because they describe the box rather than the mail on it.
 type Worker struct {
 	ID           uuid.UUID         `json:"id"`
-	Name         string            `json:"name"`
-	Notes        string            `json:"notes"`
-	IPAddr       string            `json:"ip_addr"`
-	Active       bool              `json:"active"`
-	FreeTier     bool              `json:"free_tier"`
-	WorkerType   WorkerType        `json:"worker_type"`
 	AccountCount int               `json:"account_count"`
-	RiskPool     WorkerRiskPool    `json:"risk_pool"`
-	EgressKind   WorkerEgressKind  `json:"egress_kind"`
 	HealthState  WorkerHealthState `json:"health_state"`
 	LoadScore    float64           `json:"load_score"`
 
-	// SSH management (none of these expose secret material — the encrypted
-	// private key is fetched separately via GetWorkerSSHCredentials).
-	SSHHost            string             `json:"ssh_host,omitempty"`
-	SSHPort            int                `json:"ssh_port,omitempty"`
-	SSHUser            string             `json:"ssh_user,omitempty"`
-	SSHPublicKey       string             `json:"ssh_public_key,omitempty"`
-	SSHHostFingerprint string             `json:"ssh_host_fingerprint,omitempty"`
-	InstallState       WorkerInstallState `json:"install_state"`
-	LastSeenAt         *time.Time         `json:"last_seen_at,omitempty"`
-	LastError          string             `json:"last_error,omitempty"`
+	// From the node. Read-only here; a worker never writes them.
+	Name       string     `json:"name"`
+	Notes      string     `json:"notes"`
+	IPAddr     string     `json:"ip_addr"`
+	Active     bool       `json:"active"`
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	LastError  string     `json:"last_error,omitempty"`
+	Version    string     `json:"version,omitempty"`
 
-	// Profile assignment. Nil means "use backend env defaults".
-	ProfileID       *uuid.UUID `json:"profile_id,omitempty"`
-	ConfigAppliedAt *time.Time `json:"config_applied_at,omitempty"`
+	// Region is a sign-in geography hint for placement, not a partition. A
+	// mailbox scores better on a worker whose egress geolocates near where
+	// its provider expects logins from; empty scores neutral.
+	Region string `json:"region"`
 
-	// Image tag the worker is currently running, captured on every successful
-	// Update. Used for the "v1.2.3 → v1.2.4" badge in the dashboard.
-	ImageVersion string `json:"image_version,omitempty"`
-
-	// Admin-applied free-form tags (eu-west, hetzner, warmup-only, ...).
-	// Auto-derived "smart" labels (tier:free, pool:risky, state:error) are
-	// computed client-side from the worker row and never stored here.
+	// Admin-applied free-form tags (eu-west, spare, ...). Auto-derived
+	// "smart" labels (health:watch) are computed client-side and never stored.
 	Tags []string `json:"tags,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// WorkerInstallState mirrors the worker_install_state enum.
-type WorkerInstallState string
-
-const (
-	WorkerInstallStatePending      WorkerInstallState = "pending"
-	WorkerInstallStateProvisioning WorkerInstallState = "provisioning"
-	WorkerInstallStateInstalled    WorkerInstallState = "installed"
-	WorkerInstallStateError        WorkerInstallState = "error"
-	WorkerInstallStateUninstalling WorkerInstallState = "uninstalling"
-	WorkerInstallStateUninstalled  WorkerInstallState = "uninstalled"
-)
-
-// WorkerSSHCredentials carries the encrypted private key alongside the
-// connection info. Only the orchestrator should ever fetch this; the field is
-// never serialised to admin clients.
-type WorkerSSHCredentials struct {
-	WorkerID               uuid.UUID
-	SSHHost                string
-	SSHPort                int
-	SSHUser                string
-	SSHPublicKey           string
-	SSHPrivateKeyEncrypted string
-	SSHHostFingerprint     string
-}
-
 type UpdateWorker struct {
-	IPAddr     *string     `json:"ip_addr"`
-	Active     *bool       `json:"active"`
-	WorkerType *WorkerType `json:"worker_type,omitempty"`
+	Active *bool   `json:"active"`
+	Region *string `json:"region,omitempty"`
 }
 
-// DedicatedWorkerAssignment represents a dedicated worker assignment to a user
+// DedicatedWorkerAssignment binds an organization entitled to isolated egress
+// to a worker. It is a preference the placer converges on, not a hard pin: the
+// worker itself carries no category, and if it dies the org's mailboxes place
+// normally rather than stranding.
 type DedicatedWorkerAssignment struct {
 	ID             uuid.UUID  `json:"id"`
 	WorkerID       uuid.UUID  `json:"worker_id"`
@@ -169,22 +104,32 @@ type TrackingInfo struct {
 
 // EmailSendError contains detailed error information for failed email sends
 type EmailSendError struct {
-	Code           string `json:"code" avro:"code"`
-	Type           string `json:"type" avro:"type"`
-	Message        string `json:"message" avro:"message"`
-	ResolveMethod  string `json:"resolve_method" avro:"resolve_method"`
-	UserVisible    bool   `json:"user_visible" avro:"user_visible"`
-	UserTitle      string `json:"user_title,omitempty" avro:"user_title"`
-	UserMessage    string `json:"user_message,omitempty" avro:"user_message"`
-	ActionRequired string `json:"action_required,omitempty" avro:"action_required"`
+	Failure        *errx.SendFailure `json:"failure,omitempty" avro:"failure"`
+	Code           string            `json:"code" avro:"code"`
+	Type           string            `json:"type" avro:"type"`
+	Message        string            `json:"message" avro:"message"`
+	ResolveMethod  string            `json:"resolve_method" avro:"resolve_method"`
+	UserVisible    bool              `json:"user_visible" avro:"user_visible"`
+	UserTitle      string            `json:"user_title,omitempty" avro:"user_title"`
+	UserMessage    string            `json:"user_message,omitempty" avro:"user_message"`
+	ActionRequired string            `json:"action_required,omitempty" avro:"action_required"`
+	// Recipient is the address a refusal named, when the server refused one
+	// recipient rather than the message.
+	Recipient string `json:"recipient,omitempty" avro:"recipient"`
 }
 
 // SendEmailResult is the result from worker after sending email
 type SendEmailResult struct {
-	TaskID         uuid.UUID       `json:"task_id" avro:"task_id"`
-	Success        bool            `json:"success" avro:"success"`
-	MessageID      string          `json:"message_id,omitempty" avro:"message_id"`
-	ProviderMsgID  string          `json:"provider_msg_id,omitempty" avro:"provider_msg_id"`
+	TransportGeneration uuid.UUID `json:"transport_generation,omitempty" avro:"transport_generation"`
+	TaskID              uuid.UUID `json:"task_id" avro:"task_id"`
+	Success             bool      `json:"success" avro:"success"`
+	MessageID           string    `json:"message_id,omitempty" avro:"message_id"`
+	ProviderMsgID       string    `json:"provider_msg_id,omitempty" avro:"provider_msg_id"`
+	// ThreadID is the provider-side conversation the message landed in, for
+	// the providers that have one (Gmail). The control plane records it
+	// against the task so the next step of the sequence can be appended to
+	// the same thread instead of opening a new one (issue #472).
+	ThreadID       string          `json:"thread_id,omitempty" avro:"thread_id"`
 	SentAt         time.Time       `json:"sent_at,omitempty" avro:"sent_at"`
 	Error          *EmailSendError `json:"error,omitempty" avro:"error"`
 	LegacyErrorMsg string          `json:"legacy_error,omitempty" avro:"legacy_error"` // Deprecated: use Error instead
@@ -208,11 +153,14 @@ type AddWorkerEmailSmtpImapData struct {
 type AddWorkerEmailGraphData struct {
 	Token      *oauth2.Token     `json:"token" avro:"token"`
 	DeltaLinks map[string]string `json:"delta_links" avro:"delta_links"`
+	// User is the Graph user id an application token acts for; "" means the signed-in user (/me).
+	User string `json:"user,omitempty" avro:"user"`
 }
 
 type AddWorkerEmail struct {
-	ID     uuid.UUID `json:"id" avro:"id"`
-	UserID uuid.UUID `json:"user_id" avro:"user_id"`
+	TransportGeneration uuid.UUID `json:"transport_generation,omitempty" avro:"transport_generation"`
+	ID                  uuid.UUID `json:"id" avro:"id"`
+	UserID              uuid.UUID `json:"user_id" avro:"user_id"`
 	// OrganizationID scopes the organization-wide sync budget. Nil for a
 	// legacy personal mailbox, which then only has per-mailbox budgets.
 	OrganizationID *uuid.UUID `json:"organization_id" avro:"organization_id"`
@@ -233,6 +181,9 @@ type AddWorkerEmail struct {
 	Sync *AddWorkerEmailSyncData `json:"sync" avro:"sync"`
 	// Brokered: no credential travels; the worker fetches access tokens from the backend.
 	Brokered bool `json:"brokered" avro:"brokered"`
+	// SealedSecrets carries the token or SMTP/IMAP login sealed under the
+	// organization's data key; when set, no credential travels in the clear.
+	SealedSecrets string `json:"sealed_secrets,omitempty" avro:"sealed_secrets"`
 
 	Cfg oauth2.Config `json:"-" avro:"-"`
 	// TokenSource is set by the worker for brokered mailboxes.
@@ -247,6 +198,9 @@ func (a *AddWorkerEmail) SavesSentCopy() bool {
 }
 
 type RemoveWorkerEmail struct {
-	UserID  string `json:"user_id" avro:"user_id"`
-	EmailID string `json:"email_id" avro:"email_id"`
+	UserID           string   `json:"user_id" avro:"user_id"`
+	EmailID          string   `json:"email_id" avro:"email_id"`
+	WarmupMessageIDs []string `json:"warmup_message_ids,omitempty" avro:"warmup_message_ids"`
+	WarmupPlacement  string   `json:"warmup_placement,omitempty" avro:"warmup_placement"`
+	WarmupFolder     string   `json:"warmup_folder,omitempty" avro:"warmup_folder"`
 }

@@ -33,6 +33,10 @@ export type AuditAction =
 
 export type AuditEntityType =
     | "campaign"
+    // One contact inside one campaign: the entity id is the contact and the
+    // metadata carries the campaign. Written when a lead's flow is held or
+    // resumed.
+    | "campaign_lead"
     | "contact"
     | "email_account"
     | "api_key"
@@ -42,6 +46,7 @@ export type AuditEntityType =
     | "organization_member"
     | "invitation"
     | "template"
+    | "email_image"
     | "webhook"
     | "integration"
     | "warmup_routing_rule"
@@ -77,7 +82,7 @@ export default interface AuditLog {
     org_id: string;
     user_id: string; // actor id (kept for backwards compatibility)
     actor?: AuditActor;
-    action_date: string;
+    action_date: Date;
     action: AuditAction;
     entity_type: AuditEntityType;
     entity_id?: string;
@@ -85,7 +90,7 @@ export default interface AuditLog {
     user_agent: string;
     changes?: Record<string, string>;
     metadata?: Record<string, string>;
-    timestamp: string;
+    timestamp: Date;
 }
 
 export interface AuditLogsResult {

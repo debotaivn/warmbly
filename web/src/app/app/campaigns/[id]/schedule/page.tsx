@@ -1,6 +1,6 @@
 import PermissionButton from "@/components/ui/PermissionButton";
 import React from "react";
-import { ArrowRightIcon, CalendarClockIcon, CalendarRangeIcon, GlobeIcon } from "lucide-react";
+import { ArrowRightIcon, Building2Icon, CalendarClockIcon, CalendarRangeIcon, GlobeIcon } from "lucide-react";
 import { addDays, differenceInCalendarDays, format } from "date-fns";
 import DateSelect from "@/components/app/campaigns/schedule/ScheduleDateSelect";
 import WeekScheduleGrid, { type Interval } from "@/components/app/campaigns/schedule/WeekScheduleGrid";
@@ -9,6 +9,8 @@ import {
     PopoverMenu,
     PopoverMenuContent,
     PopoverMenuItem,
+    PopoverMenuLabel,
+    PopoverMenuSeparator,
     PopoverMenuTrigger,
     SelectButton,
 } from "@/components/ui/popover-menu";
@@ -16,10 +18,12 @@ import { useCampaign } from "@/hooks/context/campaign";
 import type Campaign from "@/lib/api/models/app/campaigns/Campaign";
 import type { ScheduleInterval } from "@/lib/api/models/app/campaigns/Campaign";
 import useUpdateCampaign from "@/lib/api/hooks/app/campaigns/useUpdateCampaign";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 import { useUserProfile } from "@/hooks/context/user";
+import useCurrentOrganization from "@/lib/api/hooks/app/organizations/useCurrentOrganization";
+import { followWorkspaceLabel } from "@/lib/timezone";
 
 // ── Wire ↔ display conversion ────────────────────────────────────────────
 // Wire (schedule_windows) is a 7-array indexed by weekday 0=Sun..6=Sat (the
@@ -128,7 +132,10 @@ export default function CampaignSchedule() {
         }
     }
 
-    const tzLabel = u.timezones.find((tz) => tz.name === newData.timezone)?.display_name ?? newData.timezone;
+    const org = useCurrentOrganization();
+    const followLabel = followWorkspaceLabel(org.data?.timezone);
+    const tzLabel = newData.timezone === "" ? followLabel : (u.timezones.find((tz) => tz.name === newData.timezone)?.display_name ?? newData.timezone);
+    const tzPhrase = newData.timezone === "" ? `the workspace timezone (${org.data?.timezone || "UTC"})` : tzLabel;
 
     const startDate = newData.start_date instanceof Date ? newData.start_date : null;
     const endDate = newData.end_date instanceof Date ? newData.end_date : null;
@@ -179,6 +186,19 @@ export default function CampaignSchedule() {
                                 />
                             </PopoverMenuTrigger>
                             <PopoverMenuContent minWidth={320} className="max-h-72 overflow-y-auto">
+                                <PopoverMenuLabel>Workspace clock</PopoverMenuLabel>
+                                <PopoverMenuItem
+                                    icon={<Building2Icon className="w-3.5 h-3.5" />}
+                                    selected={newData.timezone === ""}
+                                    onSelect={() => setNewData((bef) => ({ ...bef, timezone: "" }))}
+                                >
+                                    {followLabel}
+                                </PopoverMenuItem>
+                                <p className="px-3 pb-1.5 text-[11px] leading-snug text-slate-400">
+                                    Moves with the workspace timezone in Settings &gt; Profile.
+                                </p>
+                                <PopoverMenuSeparator />
+                                <PopoverMenuLabel>Or pin this campaign to</PopoverMenuLabel>
                                 {u.timezones.map((tz) => (
                                     <PopoverMenuItem
                                         key={tz.name}
@@ -221,7 +241,7 @@ export default function CampaignSchedule() {
                     </div>
                     <p className="text-[11px] text-slate-400 mt-3">
                         Each day is independent — set different windows per day, or several windows in one day. Sends
-                        are scheduled in {tzLabel}; worker IPs spread distribution naturally.
+                        are scheduled in {tzPhrase}; worker IPs spread distribution naturally.
                     </p>
                 </div>
             </section>

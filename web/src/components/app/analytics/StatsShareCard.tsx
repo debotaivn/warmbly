@@ -1,6 +1,7 @@
 import React from "react";
 import { Logo } from "@/components/svg";
 import { type ChartPoint } from "@/components/ui/charts";
+import useBrand from "@/hooks/useBrand";
 
 // A branded analytics card rasterized to a shareable PNG (see useExportCard).
 // Design: a flat branded sky background, the Warmbly logo white on the sky, and
@@ -153,6 +154,10 @@ function ShareAreaChart({ points }: { points: ChartPoint[] }) {
 
 const StatsShareCard = React.forwardRef<HTMLDivElement, { data: ShareCardData; aspect?: ShareAspect }>(
     function StatsShareCard({ data, aspect = "1:1" }, ref) {
+        // A shared card is a public image. On a self-host it must not carry
+        // the platform's website and tagline: the numbers on it are the
+        // operator's, and so is whoever sees them.
+        const brand = useBrand();
         const { width, height } = DIMENSIONS[aspect];
         const metrics = data.metrics.slice(0, 4);
         const landscape = aspect !== "1:1";
@@ -166,6 +171,8 @@ const StatsShareCard = React.forwardRef<HTMLDivElement, { data: ShareCardData; a
         return (
             <div
                 ref={ref}
+                // The exported image is the light design whichever theme the exporter uses.
+                className="theme-light"
                 style={{ width, height, background: SKY_BASE, position: "relative", overflow: "hidden", borderRadius: 0 }}
             >
                 <SkyBackdrop />
@@ -179,7 +186,7 @@ const StatsShareCard = React.forwardRef<HTMLDivElement, { data: ShareCardData; a
                                 className="text-white font-extrabold tracking-tight"
                                 style={{ fontFamily: "var(--font-display)", fontSize: wordmarkSize }}
                             >
-                                Warmbly
+                                {brand.name}
                             </span>
                         </div>
                         <span className="font-mono text-[15px] tabular-nums text-white/85">
@@ -228,14 +235,16 @@ const StatsShareCard = React.forwardRef<HTMLDivElement, { data: ShareCardData; a
                     </div>
 
                     {/* footer on the sky */}
-                    <div className="mt-5 flex items-center justify-between text-[16px]">
-                        <span className="text-white font-semibold">
-                            warmbly.com
-                        </span>
-                        <span className="text-white/80">
-                            Cold email, warmed up.
-                        </span>
-                    </div>
+                    {brand.website_label && (
+                        <div className="mt-5 flex items-center justify-between text-[16px]">
+                            <span className="text-white font-semibold">
+                                {brand.website_label}
+                            </span>
+                            <span className="text-white/80">
+                                Cold email, warmed up.
+                            </span>
+                        </div>
+                    )}
                 </div>
             </div>
         );

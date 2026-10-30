@@ -5,9 +5,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/warmbly/warmbly/internal/config"
 )
 
 type Duration string
+
+var TestPlanID = uuid.MustParse("00000000-0000-0000-0000-0000000000e1")
 
 const (
 	DurationMonth Duration = "month"
@@ -33,17 +36,20 @@ func (s SubscriptionStatus) IsActive() bool {
 }
 
 type Plan struct {
-	ID              uuid.UUID `json:"id"`
-	Name            *string   `json:"name,omitempty"`
-	MaxContacts     uint      `json:"max_contacts"`
-	DailyEmails     uint      `json:"daily_emails"`
-	AIGeneration    bool      `json:"ai_generation"`
-	AccountLimit    uint      `json:"account_limit"`
-	Price           float32   `json:"price"`
-	DiscountedPrice float32   `json:"discounted_price"`
-	Duration        Duration  `json:"duration"`
-	Savings         uint8     `json:"savings"`
-	Public          bool      `json:"public"`
+	ID           uuid.UUID `json:"id"`
+	Name         *string   `json:"name,omitempty"`
+	MaxContacts  uint      `json:"max_contacts"`
+	DailyEmails  uint      `json:"daily_emails"`
+	AIGeneration bool      `json:"ai_generation"`
+	AccountLimit uint      `json:"account_limit"`
+	Price        float32   `json:"price"`
+	// PriceYearly is what StripePriceIDYearly charges. Nil means the plan is
+	// monthly only, so nothing may offer it yearly.
+	PriceYearly     *float32 `json:"price_yearly,omitempty"`
+	DiscountedPrice float32  `json:"discounted_price"`
+	Duration        Duration `json:"duration"`
+	Savings         uint8    `json:"savings"`
+	Public          bool     `json:"public"`
 
 	// Stripe integration
 	StripePriceID       *string `json:"stripe_price_id,omitempty"`
@@ -51,6 +57,10 @@ type Plan struct {
 	StripeProductID     *string `json:"stripe_product_id,omitempty"`
 
 	// Worker tier settings
+	// DedicatedWorkers is the isolated-egress entitlement, kept under its
+	// original column name. Read it through IsolatedEgress() rather than
+	// comparing it directly: the number never meant "how many machines you
+	// get", only "does this plan reserve egress for you".
 	DedicatedWorkers   int  `json:"dedicated_workers"`
 	DailyCampaignLimit *int `json:"daily_campaign_limit,omitempty"`
 
@@ -130,6 +140,24 @@ type Subscription struct {
 	CancelAtPeriodEnd  bool       `json:"cancel_at_period_end"`
 	CanceledAt         *time.Time `json:"canceled_at,omitempty"`
 
+	// A plan an operator granted rather than Stripe: internal workspaces,
+	// design partners, support gestures. ManagedUntil nil is open-ended.
+	ManagedAt     *time.Time `json:"managed_at,omitempty"`
+	ManagedBy     *uuid.UUID `json:"managed_by,omitempty"`
+	ManagedReason *string    `json:"managed_reason,omitempty"`
+	ManagedUntil  *time.Time `json:"managed_until,omitempty"`
+	// ManagedPlanID is held beside PlanID, never on top of it, so a workspace
+	// paying Stripe for one plan and granted another goes back to the one it
+	// pays for when the grant ends.
+	ManagedPlanID *uuid.UUID `json:"managed_plan_id,omitempty"`
+	// Managed is IsManaged resolved server-side, carried on the base type so
+	// every endpoint that returns a subscription reports it. A granted plan
+	// never touches Stripe, so Status stays whatever it was ("incomplete" on a
+	// workspace that never subscribed); a client deciding "paid" from Status
+	// alone locks a workspace entitled to everything. Not a column: set by the
+	// service, so a repository scan never has to know about it.
+	Managed bool `json:"managed"`
+
 	// Stripe trial info
 	TrialStart *time.Time `json:"trial_start,omitempty"`
 	TrialEnd   *time.Time `json:"trial_end,omitempty"`
@@ -169,13 +197,76 @@ func (s *Subscription) IsFreeTrialExpired() bool {
 
 // HasPaidSubscription returns true if user has an active paid Stripe subscription
 func (s *Subscription) HasPaidSubscription() bool {
+	// A granted plan is paid without Stripe ever being involved. Checked
+	// first so a workspace that later subscribes for real is not affected
+	// either way.
+	if s.IsManaged() {
+		return true
+	}
 	return s.StripeSubscriptionID != nil && s.Status.IsActive()
+}
+
+// IsManaged reports whether an operator granted this plan and the grant is
+// still in force. An expired ManagedUntil lapses on its own, so a time-boxed
+// grant needs nobody to remember to revoke it.
+func (s *Subscription) IsManaged() bool {
+	if s == nil || s.ManagedAt == nil {
+		return false
+	}
+	if s.ManagedUntil == nil {
+		return true
+	}
+	return time.Now().Before(*s.ManagedUntil)
+}
+
+// EffectivePlanID is the plan that decides entitlements: the granted one while
+// a grant is in force, otherwise the plan the workspace actually pays for.
+// Every lookup of a subscription's plan goes through this; using PlanID
+// directly silently ignores the grant.
+func (s *Subscription) EffectivePlanID() uuid.UUID {
+	if s == nil {
+		return uuid.Nil
+	}
+	if s.IsManaged() && s.ManagedPlanID != nil {
+		return *s.ManagedPlanID
+	}
+	return s.PlanID
+}
+
+// ManagedExpired separates "was granted, has lapsed" from "never granted", so
+// the admin panel can show a grant that ran out instead of silently dropping
+// the workspace back to free with no explanation.
+func (s *Subscription) ManagedExpired() bool {
+	if s == nil || s.ManagedAt == nil || s.ManagedUntil == nil {
+		return false
+	}
+	return !time.Now().Before(*s.ManagedUntil)
+}
+
+// WarmupPlanID is the Warmup plan: the premium pool and no mailbox cap, nothing else.
+var WarmupPlanID = uuid.MustParse(config.PoolLinkPlanID)
+
+// IsWarmupPlan reports a plan that buys warming only: the Warmup plan and the Partnership plan.
+func IsWarmupPlan(planID uuid.UUID) bool {
+	return planID == WarmupPlanID || planID == PartnershipPlanID
+}
+
+// IsWarmupOnly reports a warming-only plan in force; a Stripe subscription to any other plan outranks a warming-only grant.
+func (s *Subscription) IsWarmupOnly() bool {
+	if s == nil || !s.HasPaidSubscription() || !IsWarmupPlan(s.EffectivePlanID()) {
+		return false
+	}
+	return !(s.StripeSubscriptionID != nil && s.Status.IsActive() && !IsWarmupPlan(s.PlanID))
+}
+
+// HasProductPlan reports a paid plan that includes sending, the inbox, AI and integrations: every one but the warming-only plans.
+func (s *Subscription) HasProductPlan() bool {
+	return s != nil && s.HasPaidSubscription() && !s.IsWarmupOnly()
 }
 
 // CanSendEmails returns true if user can send campaign emails
 func (s *Subscription) CanSendEmails() bool {
-	// Active paid subscription
-	if s.HasPaidSubscription() {
+	if s.HasProductPlan() {
 		return true
 	}
 	// In free trial
@@ -195,7 +286,7 @@ func (s *Subscription) CanUseWarmup() bool {
 // Same trial allowance as warmup so a free-trial user can interact with
 // their connected mailbox while evaluating Warmbly.
 func (s *Subscription) CanUseUnibox() bool {
-	return s.HasPaidSubscription() || s.IsInFreeTrial()
+	return s.HasProductPlan() || s.IsInFreeTrial()
 }
 
 // FreeWorkspaceMailboxLimit caps the mailboxes an unsubscribed workspace may
@@ -242,4 +333,34 @@ type StripeWebhookEvent struct {
 	EventType   string                 `json:"event_type"`
 	ProcessedAt time.Time              `json:"processed_at"`
 	Payload     map[string]interface{} `json:"payload,omitempty"`
+}
+
+// IsolatedEgress reports whether the plan reserves a worker for the
+// organization, so its mailboxes always authenticate to their providers from
+// an address no other tenant sends from.
+//
+// This is the deliverability shape of what used to be sold as a "dedicated
+// worker". The customer-visible promise is about the sign-in address being
+// theirs alone, which is the part that actually affects them: providers score
+// login trust and apply per-IP auth throttles on that address, so an
+// organization running many mailboxes benefits from not sharing it. It was
+// never about the machine, and pinning them to one was the wrong shape - a
+// reserved worker that dies used to strand the customer, where a preference
+// simply re-converges.
+func (p *Plan) IsolatedEgress() bool {
+	return p != nil && p.DedicatedWorkers > 0
+}
+
+// ManagedPlan is the admin-facing view of an operator-granted plan. Managed
+// and Expired are deliberately separate: a lapsed grant is not the same as a
+// workspace that was never granted one, and the reason stays readable after
+// it lapses.
+type ManagedPlan struct {
+	Managed   bool       `json:"managed"`
+	Expired   bool       `json:"expired"`
+	PlanID    uuid.UUID  `json:"plan_id"`
+	GrantedAt *time.Time `json:"granted_at,omitempty"`
+	GrantedBy *uuid.UUID `json:"granted_by,omitempty"`
+	Reason    *string    `json:"reason,omitempty"`
+	Until     *time.Time `json:"until,omitempty"`
 }

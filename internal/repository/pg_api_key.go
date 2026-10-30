@@ -22,6 +22,9 @@ type APIKeyRepository interface {
 	List(ctx context.Context, orgID uuid.UUID, limit int, cursor *uuid.UUID) (*models.APIKeysResult, *errx.Error)
 	Update(ctx context.Context, orgID, keyID uuid.UUID, data *models.UpdateAPIKey) (*models.APIKey, *errx.Error)
 	Revoke(ctx context.Context, orgID, keyID uuid.UUID, reason string) *errx.Error
+	// RevokeCreatedBy revokes every active key userID created, in any workspace.
+	RevokeCreatedBy(ctx context.Context, userID uuid.UUID, reason string) (int64, *errx.Error)
+	Delete(ctx context.Context, orgID, keyID uuid.UUID) *errx.Error
 	UpdateLastUsed(ctx context.Context, keyID uuid.UUID, ip string) error
 	LogUsage(ctx context.Context, log *models.APIKeyUsageLog) error
 
@@ -103,11 +106,14 @@ func (r *apiKeyRepository) Create(ctx context.Context, orgID, userID uuid.UUID, 
 	return &key, nil
 }
 
+// keyHolderNotBanned stops a key the moment its creator is banned from signing in.
+const keyHolderNotBanned = `
+		AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = api_keys.user_id AND (u.ban_scope & 1) <> 0)`
+
 func (r *apiKeyRepository) GetByHash(ctx context.Context, keyHash string) (*models.APIKey, *errx.Error) {
 	query := fmt.Sprintf(`
 		SELECT %s FROM api_keys
-		WHERE key_hash = $1 AND status = 'active'
-	`, API_KEY_SELECT)
+		WHERE key_hash = $1 AND status = 'active'`+keyHolderNotBanned, API_KEY_SELECT)
 
 	var key models.APIKey
 	row := r.DB.QueryRow(ctx, query, keyHash)
@@ -182,7 +188,8 @@ func (r *apiKeyRepository) List(ctx context.Context, orgID uuid.UUID, limit int,
 	hasMore := false
 	if len(keys) > limit {
 		hasMore = true
-		nextCursor = paging.EncodeUUID(keys[limit].ID)
+		// The last row returned: the next page starts strictly below it.
+		nextCursor = paging.EncodeUUID(keys[limit-1].ID)
 		keys = keys[:limit]
 	}
 
@@ -282,6 +289,50 @@ func (r *apiKeyRepository) Revoke(ctx context.Context, orgID, keyID uuid.UUID, r
 	return nil
 }
 
+func (r *apiKeyRepository) RevokeCreatedBy(ctx context.Context, userID uuid.UUID, reason string) (int64, *errx.Error) {
+	query := `
+		UPDATE api_keys
+		SET status = 'revoked', revoked_at = now(), revoked_reason = $2, updated_at = now()
+		WHERE user_id = $1 AND status = 'active'
+	`
+
+	params := []any{userID, reason}
+
+	cmd, err := r.DB.Exec(ctx, query, params...)
+	if err != nil {
+		db.CaptureError(err, query, params, "exec")
+		return 0, errx.InternalError()
+	}
+	return cmd.RowsAffected(), nil
+}
+
+// Delete removes a key row for good. It refuses a key that can still
+// authenticate: ending a live credential is Revoke's job, which leaves the row
+// and the reason behind. A key past its expires_at is already dead even though
+// the status column still reads 'active', so that one is deletable. The usage
+// logs go with the row through the FK's ON DELETE CASCADE.
+func (r *apiKeyRepository) Delete(ctx context.Context, orgID, keyID uuid.UUID) *errx.Error {
+	query := `
+		DELETE FROM api_keys
+		WHERE organization_id = $1 AND id = $2
+		  AND (status <> 'active' OR (expires_at IS NOT NULL AND expires_at <= now()))
+	`
+
+	params := []any{orgID, keyID}
+
+	cmd, err := r.DB.Exec(ctx, query, params...)
+	if err != nil {
+		db.CaptureError(err, query, params, "exec")
+		return errx.InternalError()
+	}
+
+	if cmd.RowsAffected() == 0 {
+		return errx.ErrNotFound
+	}
+
+	return nil
+}
+
 func (r *apiKeyRepository) UpdateLastUsed(ctx context.Context, keyID uuid.UUID, ip string) error {
 	// Casting via NULLIF lets the same query handle "no IP available" (worker
 	// background calls, tests) without erroring on an empty INET.
@@ -322,10 +373,14 @@ func (r *apiKeyRepository) LogUsage(ctx context.Context, log *models.APIKeyUsage
 func (r *apiKeyRepository) GetUsageSummary(ctx context.Context, orgID uuid.UUID) (*models.APIKeyUsageSummary, *errx.Error) {
 	query := `
 		WITH key_counts AS (
+			-- The status column only ever holds 'active' or 'revoked'; expiry
+			-- is applied when a key is read, so a key past expires_at counts
+			-- as expired here rather than inflating the active total.
 			SELECT
-				COUNT(*) FILTER (WHERE status = 'active')  AS active_keys,
+				COUNT(*) FILTER (WHERE status = 'active' AND (expires_at IS NULL OR expires_at > now())) AS active_keys,
 				COUNT(*) FILTER (WHERE status = 'revoked') AS revoked_keys,
-				COUNT(*) FILTER (WHERE status = 'expired') AS expired_keys
+				COUNT(*) FILTER (WHERE status = 'expired'
+					OR (status = 'active' AND expires_at IS NOT NULL AND expires_at <= now())) AS expired_keys
 			FROM api_keys
 			WHERE organization_id = $1
 		),
@@ -506,7 +561,8 @@ func (r *apiKeyRepository) ListUsageLogs(ctx context.Context, orgID, keyID uuid.
 	hasMore := false
 	if len(logs) > limit {
 		hasMore = true
-		nextCursor = paging.EncodeUUID(logs[limit].ID)
+		// The last row returned: the next page starts strictly below it.
+		nextCursor = paging.EncodeUUID(logs[limit-1].ID)
 		logs = logs[:limit]
 	}
 

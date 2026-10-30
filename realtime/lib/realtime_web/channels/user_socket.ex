@@ -2,7 +2,8 @@ defmodule RealtimeWeb.UserSocket do
   @moduledoc """
   WebSocket handler with authentication and connection management.
 
-  Supports both JWT tokens and API keys (prefixed with `wmbly_`).
+  Accepts the dashboard's ws ticket in the `token` query parameter, and API
+  keys (`wmbly_`) or OAuth tokens (`wmat_`) in the `x-warmbly-token` header.
   Implements Discord-style error codes for rejection reasons.
   Rate limits are based on user's subscription tier.
   """
@@ -24,11 +25,61 @@ defmodule RealtimeWeb.UserSocket do
   channel("org:*", RealtimeWeb.OrgChannel)
   channel("admin:*", RealtimeWeb.AdminChannel)
 
-  @impl true
-  def connect(%{"token" => token}, socket, connect_info) do
-    ip = get_ip(connect_info)
+  # API keys and OAuth tokens belong in this header. The query string, which
+  # proxies record, carries them only where REALTIME_ALLOW_QUERY_CREDENTIALS is set.
+  @credential_header "x-warmbly-token"
 
-    with {:ok, user_id, auth_type} <- Auth.verify_token(token, ip: ip),
+  @impl true
+  def connect(params, socket, connect_info) do
+    case credential(params, connect_info) do
+      {:ok, token} -> authenticate(token, socket, connect_info)
+      {:error, reason} -> reject(reason)
+    end
+  end
+
+  @doc false
+  def credential(params, connect_info) do
+    header = header_credential(connect_info)
+    query = Map.get(params, "token")
+
+    cond do
+      present?(header) ->
+        {:ok, header}
+
+      present?(query) and Auth.long_lived?(query) ->
+        if Application.get_env(:realtime, :allow_query_credentials, false) do
+          Logger.info(
+            "Socket credential in the query string; send it in the x-warmbly-token header"
+          )
+
+          {:ok, query}
+        else
+          {:error, :credential_in_query}
+        end
+
+      present?(query) ->
+        {:ok, query}
+
+      true ->
+        {:error, :missing_token}
+    end
+  end
+
+  defp header_credential(%{x_headers: headers}) when is_list(headers) do
+    Enum.find_value(headers, fn
+      {@credential_header, value} -> String.trim(value)
+      _ -> nil
+    end)
+  end
+
+  defp header_credential(_), do: nil
+
+  defp present?(value), do: is_binary(value) and value != ""
+
+  defp authenticate(token, socket, connect_info) do
+    ip = client_ip(token, connect_info)
+
+    with {:ok, user_id, auth_type, context} <- Auth.verify_token(token, ip: ip),
          limits <- Subscription.get_limits(user_id),
          :ok <- check_connection_limit(user_id, ip, limits),
          :ok <- check_rate_limit(user_id, limits) do
@@ -40,6 +91,10 @@ defmodule RealtimeWeb.UserSocket do
         |> assign(:ip_address, ip)
         |> assign(:auth_type, auth_type)
         |> assign(:rate_limits, limits)
+        # nil for a ticket; an API key or OAuth token's workspace and scope grant otherwise.
+        |> assign(:credential, Map.get(context, :credential))
+        |> assign(:session_id, Map.get(context, :session_id))
+        |> assign(:mfa_verified, Map.get(context, :mfa_verified) == true)
 
       {:ok, socket}
     else
@@ -51,10 +106,6 @@ defmodule RealtimeWeb.UserSocket do
       {:error, reason} ->
         reject(reason)
     end
-  end
-
-  def connect(_params, _socket, _connect_info) do
-    reject(:missing_token)
   end
 
   # Build the structured rejection returned from connect/2.
@@ -96,6 +147,18 @@ defmodule RealtimeWeb.UserSocket do
     Logger.warning("Socket connection rejected (#{code}): #{message}")
   end
 
+  @doc false
+  # The transport's error handler: a refused handshake answers 403 with the
+  # `{code, reason}` it was refused for, so a server-side client can read why.
+  def handle_error(conn, %{code: code, reason: reason} = payload)
+      when is_integer(code) and is_binary(reason) do
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.send_resp(403, Jason.encode!(payload))
+  end
+
+  def handle_error(conn, _reason), do: Plug.Conn.send_resp(conn, 403, "")
+
   @impl true
   def id(socket), do: "user_socket:#{socket.assigns.user_id}"
 
@@ -120,6 +183,22 @@ defmodule RealtimeWeb.UserSocket do
     case RateLimiter.check(user_id, :ws_connect, limit) do
       {:ok, _remaining} -> :ok
       {:error, :rate_limited, retry_after_ms} -> {:error, :rate_limited, retry_after_ms}
+    end
+  end
+
+  def client_ip(ticket, connect_info) do
+    proof =
+      connect_info
+      |> Map.get(:x_headers, [])
+      |> Enum.find_value(fn
+        {"x-warmbly-proxy-proof", value} -> value
+        _ -> nil
+      end)
+
+    with {:ok, ip} <- Auth.proxy_ip(proof, ticket) do
+      ip
+    else
+      _ -> get_ip(connect_info)
     end
   end
 

@@ -16,7 +16,7 @@ type AdminUserSearch struct {
 	CreatedWithin int    `form:"created_within"`  // signup window, in days
 
 	// Plan / subscription
-	PlanID                *uuid.UUID `form:"plan_id"`             // subscribed to THIS plan
+	PlanID                *ParamUUID `form:"plan_id"`             // subscribed to THIS plan
 	SubscriptionStatus    string     `form:"subscription_status"` // trialing, active, past_due, ...
 	IsEnterprise          bool       `form:"is_enterprise"`
 	HasSubscription       bool       `form:"has_subscription"`
@@ -50,10 +50,10 @@ type AdminUserSearch struct {
 	UpdatedAfter       *time.Time `form:"updated_after" time_format:"2006-01-02" time_utc:"true"`
 	UpdatedBefore      *time.Time `form:"updated_before" time_format:"2006-01-02" time_utc:"true"`
 
-	Cursor   *uuid.UUID `form:"cursor"`
-	Limit    int        `form:"limit"`
-	SortBy   string     `form:"sort_by"` // created_at, email, name
-	SortDesc bool       `form:"sort_desc"`
+	Offset   int    `form:"-"` // decoded from ?cursor by the handler
+	Limit    int    `form:"limit"`
+	SortBy   string `form:"sort_by"` // created_at, email, name
+	SortDesc bool   `form:"sort_desc"`
 }
 
 // AdminUserDetail represents a user with admin-relevant statistics
@@ -70,6 +70,12 @@ type AdminUserDetail struct {
 	BannedAt         *time.Time      `json:"banned_at,omitempty"`
 	CreatedAt        time.Time       `json:"created_at"`
 	UpdatedAt        time.Time       `json:"updated_at"`
+
+	LoginCodeExempt       bool       `json:"login_code_exempt"`
+	LoginCodeExemptReason *string    `json:"login_code_exempt_reason,omitempty"`
+	LoginCodeExemptAt     *time.Time `json:"login_code_exempt_at,omitempty"`
+	// PasswordExpiresAt is set only on a tester whose password was handed out.
+	PasswordExpiresAt *time.Time `json:"password_expires_at,omitempty"`
 
 	// Statistics
 	OrganizationCount int `json:"organization_count"`
@@ -142,16 +148,15 @@ type UnbanUserRequest struct {
 
 // AdminWorkerDetail represents a worker with admin-relevant details
 type AdminWorkerDetail struct {
-	ID           uuid.UUID  `json:"id"`
-	Name         string     `json:"name"`
-	Notes        string     `json:"notes"`
-	IPAddr       string     `json:"ip_addr"`
-	Active       bool       `json:"active"`
-	FreeTier     bool       `json:"free_tier"`
-	WorkerType   WorkerType `json:"worker_type"`
-	AccountCount int        `json:"account_count"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID           uuid.UUID `json:"id"`
+	Name         string    `json:"name"`
+	Notes        string    `json:"notes"`
+	IPAddr       string    `json:"ip_addr"`
+	Active       bool      `json:"active"`
+	Region       string    `json:"region"`
+	AccountCount int       `json:"account_count"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 
 	// Statistics
 	EmailsSentToday int `json:"emails_sent_today"`
@@ -169,10 +174,12 @@ type AdminWorkersResult struct {
 
 // AdminUpdateWorker represents the request to update a worker
 type AdminUpdateWorker struct {
-	Name       *string     `json:"name,omitempty"`
-	Notes      *string     `json:"notes,omitempty"`
-	Active     *bool       `json:"active,omitempty"`
-	WorkerType *WorkerType `json:"worker_type,omitempty"`
+	Name   *string `json:"name,omitempty"`
+	Notes  *string `json:"notes,omitempty"`
+	Active *bool   `json:"active,omitempty"`
+	// Region is a sign-in geography hint the placer scores on. It is the only
+	// worker attribute an operator sets, and leaving it empty is fine.
+	Region *string `json:"region,omitempty"`
 }
 
 // AdminWorkerEmail represents an email account connected to a worker, including
@@ -191,8 +198,8 @@ type AdminWorkerEmail struct {
 	RiskBand        string     `json:"risk_band"` // clean | risky | quarantine
 	RiskEvaluatedAt *time.Time `json:"risk_evaluated_at,omitempty"`
 	WarmupHealth    string     `json:"warmup_health,omitempty"` // worst warmup health_state, "" if not in a pool
-	SpamScore       *int       `json:"spam_score,omitempty"`
 	BlockedUntil    *time.Time `json:"blocked_until,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
 // ReassignEmailsRequest represents the request to reassign emails
@@ -307,8 +314,8 @@ type AdminCampaignsResult struct {
 // *time.Time with time_format/time_utc, mirroring AdminOrgSearch.
 type AdminCampaignSearch struct {
 	Query  string     `form:"q"`
-	UserID *uuid.UUID `form:"user_id"`
-	OrgID  *uuid.UUID `form:"org_id"`
+	UserID *ParamUUID `form:"user_id"`
+	OrgID  *ParamUUID `form:"org_id"`
 	Status string     `form:"status"` // draft, active, paused, completed, paused_trial_expired, paused_no_accounts, paused_guardrail, paused_undeliverable
 
 	// Boolean flags
@@ -339,10 +346,10 @@ type AdminCampaignSearch struct {
 	UpdatedAfter    *time.Time `form:"updated_after" time_format:"2006-01-02" time_utc:"true"`
 	UpdatedBefore   *time.Time `form:"updated_before" time_format:"2006-01-02" time_utc:"true"`
 
-	Cursor   *uuid.UUID `form:"cursor"`
-	Limit    int        `form:"limit"`
-	SortBy   string     `form:"sort_by"`
-	SortDesc bool       `form:"sort_desc"`
+	Offset   int    `form:"-"` // decoded from ?cursor by the handler
+	Limit    int    `form:"limit"`
+	SortBy   string `form:"sort_by"`
+	SortDesc bool   `form:"sort_desc"`
 }
 
 // AdminAuditLog represents an audit log entry for admin actions
@@ -369,13 +376,13 @@ type AdminAuditLogsResult struct {
 
 // AdminAuditLogSearch represents search parameters for audit logs
 type AdminAuditLogSearch struct {
-	AdminUserID *uuid.UUID `form:"admin_user_id"`
+	AdminUserID *ParamUUID `form:"admin_user_id"`
 	Action      string     `form:"action"`
 	TargetType  string     `form:"target_type"`
-	TargetID    *uuid.UUID `form:"target_id"`
-	StartDate   *time.Time `form:"start_date"`
-	EndDate     *time.Time `form:"end_date"`
-	Cursor      *uuid.UUID `form:"cursor"`
+	TargetID    *ParamUUID `form:"target_id"`
+	StartDate   *time.Time `form:"start_date" time_format:"2006-01-02" time_utc:"true"`
+	EndDate     *time.Time `form:"end_date" time_format:"2006-01-02" time_utc:"true"`
+	Cursor      string     `form:"cursor"`
 	Limit       int        `form:"limit"`
 }
 
@@ -434,16 +441,17 @@ type AdminMailboxesResult struct {
 // All fields optional; empty status = active, "all" returns every
 // status. provider lets ops filter to "all gmail mailboxes" quickly.
 type AdminMailboxSearch struct {
+	MailboxID     *ParamUUID `form:"mailbox_id"`
 	Query         string     `form:"q"`
 	Status        string     `form:"status"`
 	Provider      string     `form:"provider"`
 	Warmup        string     `form:"warmup"`         // "on", "off", or "" for any
 	CreatedWithin int        `form:"created_within"` // connected window, in days
-	OrgID         *uuid.UUID `form:"org_id"`         // browse a single org's mailboxes
+	OrgID         *ParamUUID `form:"org_id"`         // browse a single org's mailboxes
 
 	// Ownership / placement
-	UserID   *uuid.UUID `form:"user_id"`   // mailboxes owned by THIS user
-	WorkerID *uuid.UUID `form:"worker_id"` // mailboxes on THIS worker
+	UserID   *ParamUUID `form:"user_id"`   // mailboxes owned by THIS user
+	WorkerID *ParamUUID `form:"worker_id"` // mailboxes on THIS worker
 
 	// Classification
 	RiskBand       string `form:"risk_band"`        // clean, risky, quarantine
@@ -471,10 +479,10 @@ type AdminMailboxSearch struct {
 	LastSyncedAfter  *time.Time `form:"last_synced_after" time_format:"2006-01-02" time_utc:"true"`
 	LastSyncedBefore *time.Time `form:"last_synced_before" time_format:"2006-01-02" time_utc:"true"`
 
-	Cursor   *uuid.UUID `form:"cursor"`
-	Limit    int        `form:"limit"`
-	SortBy   string     `form:"sort_by"` // email, created_at, last_synced_at, campaign_limit
-	SortDesc bool       `form:"sort_desc"`
+	Offset   int    `form:"-"` // decoded from ?cursor by the handler
+	Limit    int    `form:"limit"`
+	SortBy   string `form:"sort_by"` // email, created_at, last_synced_at, campaign_limit
+	SortDesc bool   `form:"sort_desc"`
 }
 
 // DailyEmailStats represents daily email statistics for graphs
@@ -494,17 +502,6 @@ type HourlyEmailStats struct {
 	TotalSent int64 `json:"total_sent"`
 }
 
-// WorkerLoadStats represents worker load statistics
-type WorkerLoadStats struct {
-	WorkerID        uuid.UUID `json:"worker_id"`
-	WorkerName      string    `json:"worker_name"`
-	EmailsSentToday int64     `json:"emails_sent_today"`
-	QueuedEmails    int64     `json:"queued_emails"`
-	ConnectedEmails int64     `json:"connected_emails"`
-	CPUUsage        float64   `json:"cpu_usage,omitempty"`
-	MemoryUsage     float64   `json:"memory_usage,omitempty"`
-}
-
 // UserGrowthStats represents user growth statistics
 type UserGrowthStats struct {
 	Date       time.Time `json:"date"`
@@ -518,111 +515,6 @@ type AnalyticsTrends struct {
 	EmailsGrowthPercent    float64 `json:"emails_growth_percent"`
 	CampaignsGrowthPercent float64 `json:"campaigns_growth_percent"`
 	RevenueGrowthPercent   float64 `json:"revenue_growth_percent"`
-}
-
-// CreatePlanRequest represents the request to create a custom plan
-type CreatePlanRequest struct {
-	Name               string   `json:"name" binding:"required"`
-	MaxContacts        uint     `json:"max_contacts"`
-	DailyEmails        uint     `json:"daily_emails"`
-	AIGeneration       bool     `json:"ai_generation"`
-	AccountLimit       uint     `json:"account_limit"`
-	Price              float32  `json:"price"`
-	DiscountedPrice    float32  `json:"discounted_price"`
-	Duration           Duration `json:"duration"` // month/year
-	DedicatedWorkers   int      `json:"dedicated_workers"`
-	DailyCampaignLimit *int     `json:"daily_campaign_limit,omitempty"`
-	MaxCampaigns       *int     `json:"max_campaigns,omitempty"`
-	MaxActiveCampaigns *int     `json:"max_active_campaigns,omitempty"`
-	MaxTeamMembers     *int     `json:"max_team_members,omitempty"`
-	MaxEmailAccounts   *int     `json:"max_email_accounts,omitempty"`
-	Public             bool     `json:"public"` // false for enterprise-only
-}
-
-// UpdatePlanRequest represents the request to update a plan
-type UpdatePlanRequest struct {
-	Name               *string   `json:"name,omitempty"`
-	MaxContacts        *uint     `json:"max_contacts,omitempty"`
-	DailyEmails        *uint     `json:"daily_emails,omitempty"`
-	AIGeneration       *bool     `json:"ai_generation,omitempty"`
-	AccountLimit       *uint     `json:"account_limit,omitempty"`
-	Price              *float32  `json:"price,omitempty"`
-	DiscountedPrice    *float32  `json:"discounted_price,omitempty"`
-	Duration           *Duration `json:"duration,omitempty"`
-	DedicatedWorkers   *int      `json:"dedicated_workers,omitempty"`
-	DailyCampaignLimit *int      `json:"daily_campaign_limit,omitempty"`
-	MaxCampaigns       *int      `json:"max_campaigns,omitempty"`
-	MaxActiveCampaigns *int      `json:"max_active_campaigns,omitempty"`
-	MaxTeamMembers     *int      `json:"max_team_members,omitempty"`
-	MaxEmailAccounts   *int      `json:"max_email_accounts,omitempty"`
-	Public             *bool     `json:"public,omitempty"`
-}
-
-// AdminEnterpriseInquiry represents an enterprise inquiry with admin details
-type AdminEnterpriseInquiry struct {
-	ID                 uuid.UUID  `json:"id"`
-	UserID             *uuid.UUID `json:"user_id,omitempty"`
-	CompanyName        string     `json:"company_name"`
-	ContactName        string     `json:"contact_name"`
-	ContactEmail       string     `json:"contact_email"`
-	Phone              *string    `json:"phone,omitempty"`
-	TeamSize           *string    `json:"team_size,omitempty"`
-	EstimatedVolume    *int       `json:"estimated_volume,omitempty"`
-	MonthlyEmailVolume *string    `json:"monthly_email_volume,omitempty"`
-	Message            *string    `json:"message,omitempty"`
-	Status             string     `json:"status"`
-	AssignedTo         *uuid.UUID `json:"assigned_to,omitempty"`
-	Notes              *string    `json:"notes,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
-
-	// Joined data
-	User          *AdminUserSummary `json:"user,omitempty"`
-	AssignedAdmin *AdminUserSummary `json:"assigned_admin,omitempty"`
-}
-
-// AdminEnterpriseInquiriesResult represents paginated inquiries
-type AdminEnterpriseInquiriesResult struct {
-	Data       []AdminEnterpriseInquiry `json:"data"`
-	Pagination Pagination               `json:"pagination"`
-}
-
-// AdminEnterpriseInquirySearch are the query params for the enterprise inquiry
-// queue. Mirrors AdminOrgSearch tag conventions.
-type AdminEnterpriseInquirySearch struct {
-	Query      string `form:"q"`
-	Status     string `form:"status"`     // pending, contacted, converted, declined, all
-	Assignment string `form:"assignment"` // assigned, unassigned
-	Linkage    string `form:"linkage"`    // linked, anonymous
-
-	HasNotes  bool `form:"has_notes"`
-	HasPhone  bool `form:"has_phone"`
-	Processed bool `form:"processed"`
-
-	// Count ranges
-	TeamSizeMin        *int `form:"team_size_min"`
-	TeamSizeMax        *int `form:"team_size_max"`
-	EstimatedVolumeMin *int `form:"estimated_volume_min"`
-	EstimatedVolumeMax *int `form:"estimated_volume_max"`
-
-	// Date ranges (YYYY-MM-DD, UTC)
-	CreatedWithin int        `form:"created_within"`
-	CreatedAfter  *time.Time `form:"created_after" time_format:"2006-01-02" time_utc:"true"`
-	CreatedBefore *time.Time `form:"created_before" time_format:"2006-01-02" time_utc:"true"`
-	UpdatedAfter  *time.Time `form:"updated_after" time_format:"2006-01-02" time_utc:"true"`
-	UpdatedBefore *time.Time `form:"updated_before" time_format:"2006-01-02" time_utc:"true"`
-
-	Cursor   *uuid.UUID `form:"cursor"`
-	Limit    int        `form:"limit"`
-	SortBy   string     `form:"sort_by"` // created_at, updated_at, company_name, contact_email, status, team_size, estimated_volume
-	SortDesc bool       `form:"sort_desc"`
-}
-
-// UpdateEnterpriseInquiryRequest represents the request to update an inquiry
-type UpdateEnterpriseInquiryRequest struct {
-	Status     *string    `json:"status,omitempty"`
-	AssignedTo *uuid.UUID `json:"assigned_to,omitempty"`
-	Notes      *string    `json:"notes,omitempty"`
 }
 
 // AdminInfo represents an admin user for listing
@@ -735,15 +627,14 @@ type WarmupPoolInfo struct {
 
 // WarmupPoolParticipant represents a participant in a warmup pool
 type WarmupPoolParticipant struct {
-	ID              uuid.UUID  `json:"id"`
-	Email           string     `json:"email"`
-	UserID          uuid.UUID  `json:"user_id"`
-	JoinedAt        time.Time  `json:"joined_at"`
-	EmailsSent      int64      `json:"emails_sent"`
-	EmailsReceived  int64      `json:"emails_received"`
-	ReputationScore float64    `json:"reputation_score"`
-	IsBlocked       bool       `json:"is_blocked"`
-	BlockedAt       *time.Time `json:"blocked_at,omitempty"`
+	ID             uuid.UUID  `json:"id"`
+	Email          string     `json:"email"`
+	UserID         uuid.UUID  `json:"user_id"`
+	JoinedAt       time.Time  `json:"joined_at"`
+	EmailsSent     int64      `json:"emails_sent"`
+	EmailsReceived int64      `json:"emails_received"`
+	IsBlocked      bool       `json:"is_blocked"`
+	BlockedAt      *time.Time `json:"blocked_at,omitempty"`
 
 	// Joined data
 	User *AdminUserSummary `json:"user,omitempty"`
@@ -766,25 +657,18 @@ type WorkerStats struct {
 	QueueDepth          int64     `json:"queue_depth"`
 }
 
-// EmailDistribution represents email distribution across workers
-type EmailDistribution struct {
-	WorkerID   uuid.UUID `json:"worker_id"`
-	WorkerName string    `json:"worker_name"`
-	EmailCount int64     `json:"email_count"`
-	Percentage float64   `json:"percentage"`
-}
-
 // AdminOrgSearch are the query params for the admin organization listing.
 type AdminOrgSearch struct {
 	Query          string     `form:"q"`
 	Status         string     `form:"status"` // active, pending_deletion, all
-	PlanID         *uuid.UUID `form:"plan_id"`
+	PlanID         *ParamUUID `form:"plan_id"`
 	PlanVisibility string     `form:"plan_visibility"` // public, private, none
 	CreatedWithin  int        `form:"created_within"`  // days; 0 = any
 	HasOverrides   bool       `form:"has_overrides"`   // has organization_limit_overrides
 	RiskState      string     `form:"risk_state"`      // exact posture: trusted|watch|restricted|suspended
 	RiskFlagged    bool       `form:"risk_flagged"`    // any posture other than trusted
 	Enterprise     bool       `form:"enterprise"`      // has an enterprise subscription
+	ManagedPlan    bool       `form:"managed_plan"`    // plan granted by an operator, not Stripe
 
 	// Subscription state
 	SubscriptionStatus    string `form:"subscription_status"`
@@ -815,26 +699,36 @@ type AdminOrgSearch struct {
 	UpdatedAfter           *time.Time `form:"updated_after" time_format:"2006-01-02" time_utc:"true"`
 	UpdatedBefore          *time.Time `form:"updated_before" time_format:"2006-01-02" time_utc:"true"`
 
-	Cursor   *uuid.UUID `form:"cursor"`
-	Limit    int        `form:"limit"`
-	SortBy   string     `form:"sort_by"` // created_at, name, owner_email, member_count, campaign_count, email_account_count
-	SortDesc bool       `form:"sort_desc"`
+	// Exact acquisition filters. Presence toggles test the row, not a known source.
+	// Setting both presence toggles applies only HasAcquisition.
+	UTMSource      string `form:"utm_source"`
+	UTMMedium      string `form:"utm_medium"`
+	UTMCampaign    string `form:"utm_campaign"`
+	ReferrerHost   string `form:"referrer_host"`
+	HasAcquisition bool   `form:"has_acquisition"`
+	NoAcquisition  bool   `form:"no_acquisition"`
+
+	Offset   int    `form:"-"` // decoded from ?cursor by the handler
+	Limit    int    `form:"limit"`
+	SortBy   string `form:"sort_by"` // created_at, name, owner_email, member_count, campaign_count, email_account_count
+	SortDesc bool   `form:"sort_desc"`
 }
 
 // AdminOrgListItem is one row in the admin org list. It carries enough
 // summary state for the table (owner, counts, deletion status) without
 // joining to plans or subscriptions — those land on the detail endpoint.
 type AdminOrgListItem struct {
-	ID                   uuid.UUID  `json:"id"`
-	Name                 string     `json:"name"`
-	Slug                 *string    `json:"slug,omitempty"`
-	OwnerUserID          uuid.UUID  `json:"owner_user_id"`
-	OwnerEmail           string     `json:"owner_email"`
-	OwnerFirstName       string     `json:"owner_first_name"`
-	OwnerLastName        string     `json:"owner_last_name"`
-	OwnerBannedAt        *time.Time `json:"owner_banned_at,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
-	DeletionScheduledFor *time.Time `json:"deletion_scheduled_for,omitempty"`
+	Category             OrganizationCategory `json:"category"`
+	ID                   uuid.UUID            `json:"id"`
+	Name                 string               `json:"name"`
+	Slug                 *string              `json:"slug,omitempty"`
+	OwnerUserID          uuid.UUID            `json:"owner_user_id"`
+	OwnerEmail           string               `json:"owner_email"`
+	OwnerFirstName       string               `json:"owner_first_name"`
+	OwnerLastName        string               `json:"owner_last_name"`
+	OwnerBannedAt        *time.Time           `json:"owner_banned_at,omitempty"`
+	CreatedAt            time.Time            `json:"created_at"`
+	DeletionScheduledFor *time.Time           `json:"deletion_scheduled_for,omitempty"`
 
 	// Resource counts. Cheap enough to inline on the list query so the
 	// table can show usage at a glance without an extra round-trip.
@@ -847,10 +741,27 @@ type AdminOrgListItem struct {
 	// which workspaces a detector has acted on without a call per row.
 	RiskState OrgRiskState `json:"risk_state,omitempty"`
 
+	// Acquisition recorded at signup; absent values are unknown, not necessarily direct.
+	UTMSource    *string `json:"utm_source,omitempty"`
+	UTMMedium    *string `json:"utm_medium,omitempty"`
+	UTMCampaign  *string `json:"utm_campaign,omitempty"`
+	LandingPath  *string `json:"landing_path,omitempty"`
+	ReferrerHost *string `json:"referrer_host,omitempty"`
+
 	// Plan summary (LEFT JOINed via the org's single active subscription).
 	PlanName     *string `json:"plan_name,omitempty"`
 	PlanPublic   *bool   `json:"plan_public,omitempty"`
 	IsEnterprise bool    `json:"is_enterprise"`
+
+	// ManagedPlan marks a plan an operator granted rather than Stripe, so the
+	// table can answer "which workspaces are paid because we said so" without
+	// a call per row. ManagedPlanExpired is a grant that lapsed, which is
+	// deliberately distinct: the workspace is back on free and the reason is
+	// still on file.
+	ManagedPlan        bool       `json:"managed_plan"`
+	ManagedPlanExpired bool       `json:"managed_plan_expired"`
+	ManagedPlanReason  *string    `json:"managed_plan_reason,omitempty"`
+	ManagedPlanUntil   *time.Time `json:"managed_plan_until,omitempty"`
 }
 
 // AdminOrgsResult is the paginated response for the admin org listing.
@@ -868,8 +779,8 @@ type AdminLimitRequestSearch struct {
 	Status string `form:"status"` // pending, approved, rejected, cancelled, all
 	Field  string `form:"field"`  // app-validated: max_email_accounts ... daily_campaign_limit
 
-	OrgID       *uuid.UUID `form:"org_id"`
-	SubmittedBy *uuid.UUID `form:"submitted_by"`
+	OrgID       *ParamUUID `form:"org_id"`
+	SubmittedBy *ParamUUID `form:"submitted_by"`
 
 	// Flags
 	Reviewed   bool `form:"reviewed"`   // reviewed_at IS NOT NULL
@@ -888,53 +799,16 @@ type AdminLimitRequestSearch struct {
 	ReviewedAfter   *time.Time `form:"reviewed_after" time_format:"2006-01-02" time_utc:"true"`
 	ReviewedBefore  *time.Time `form:"reviewed_before" time_format:"2006-01-02" time_utc:"true"`
 
-	Cursor   *uuid.UUID `form:"cursor"`
-	Limit    int        `form:"limit"`
-	SortBy   string     `form:"sort_by"` // submitted_at, requested, current_effective, reviewed_at, status, field, org_name
-	SortDesc bool       `form:"sort_desc"`
+	Offset   int    `form:"-"` // decoded from ?cursor by the handler
+	Limit    int    `form:"limit"`
+	SortBy   string `form:"sort_by"` // submitted_at, requested, current_effective, reviewed_at, status, field, org_name
+	SortDesc bool   `form:"sort_desc"`
 }
 
 // AdminLimitRequestsResult is the paginated admin limit-request response.
 type AdminLimitRequestsResult struct {
 	Data       []LimitIncreaseRequest `json:"data"`
 	Pagination Pagination             `json:"pagination"`
-}
-
-// AdminPlanSearch are the query params for the admin plan catalog listing.
-// Mirrors AdminOrgSearch tag conventions. price_* bind to *int (whole-dollar
-// filtering against the numeric price column).
-type AdminPlanSearch struct {
-	Query      string `form:"q"`
-	Visibility string `form:"visibility"` // public, private, "" = any
-	Duration   string `form:"duration"`   // month, year, "" = any (durations.title)
-
-	AIGeneration   bool `form:"ai_generation"`
-	HasStripe      bool `form:"has_stripe"`
-	HasSubscribers bool `form:"has_subscribers"`
-
-	// Numeric ranges
-	PriceMin        *int `form:"price_min"`
-	PriceMax        *int `form:"price_max"`
-	DailyEmailsMin  *int `form:"daily_emails_min"`
-	DailyEmailsMax  *int `form:"daily_emails_max"`
-	AccountLimitMin *int `form:"account_limit_min"`
-	AccountLimitMax *int `form:"account_limit_max"`
-
-	// Date range
-	CreatedWithin int        `form:"created_within"` // days; 0 = any
-	CreatedAfter  *time.Time `form:"created_after" time_format:"2006-01-02" time_utc:"true"`
-	CreatedBefore *time.Time `form:"created_before" time_format:"2006-01-02" time_utc:"true"`
-
-	Cursor   *uuid.UUID `form:"cursor"`
-	Limit    int        `form:"limit"`
-	SortBy   string     `form:"sort_by"` // price, name, daily_emails, account_limit, created_at
-	SortDesc bool       `form:"sort_desc"`
-}
-
-// AdminPlansResult is the paginated response for the admin plan listing.
-type AdminPlansResult struct {
-	Data       []Plan     `json:"data"`
-	Pagination Pagination `json:"pagination"`
 }
 
 // AdminOrgDetail is the full payload for the org detail page. Carries

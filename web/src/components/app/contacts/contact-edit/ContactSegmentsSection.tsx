@@ -3,8 +3,8 @@
 
 import React from "react";
 import { CheckIcon, Loader2Icon, MinusIcon, RotateCcwIcon } from "lucide-react";
-import { Link } from "react-router-dom";
-import toast from "react-hot-toast";
+import { Link } from "@tanstack/react-router";
+import toast from "react-hot-toast/headless";
 
 import { useWriteGuard } from "@/hooks/usePermission";
 import { useContactSegments, useSetSegmentMembers } from "@/lib/api/hooks/app/segments";
@@ -12,6 +12,7 @@ import type { ContactSegment, SegmentMemberMode } from "@/lib/api/models/app/seg
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 import { cn } from "@/lib/utils";
+import { selectionOf } from "@/lib/api/models/app/contacts/ContactSelection";
 
 export function ContactSegmentsSection({ contactId }: { contactId: string }) {
     const segments = useContactSegments(contactId);
@@ -23,7 +24,7 @@ export function ContactSegmentsSection({ contactId }: { contactId: string }) {
         if (set.isPending) return;
         setBusyId(seg.id);
         try {
-            await set.mutateAsync({ id: seg.id, contacts: [contactId], mode });
+            await set.mutateAsync({ id: seg.id, selection: selectionOf(contactId), mode });
             toast.success(
                 mode === "include" ? `Pinned into ${seg.name}` : mode === "exclude" ? `Pinned out of ${seg.name}` : `${seg.name} is automatic again`,
             );
@@ -63,7 +64,8 @@ export function ContactSegmentsSection({ contactId }: { contactId: string }) {
                                 <li key={s.id} className="px-3 h-9 flex items-center gap-2">
                                     <span className="size-2 rounded-full shrink-0" style={{ backgroundColor: s.color }} />
                                     <Link
-                                        to={`/app/contacts/segments/${s.id}`}
+                                        to="/app/contacts/segments/$id"
+                                        params={{ id: s.id }}
                                         className={cn("text-[12px] truncate hover:underline", s.member ? "text-slate-900" : "text-slate-400")}
                                     >
                                         {s.name}

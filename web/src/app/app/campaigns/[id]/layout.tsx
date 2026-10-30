@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import PermissionButton from "@/components/ui/PermissionButton";
-import { Link, Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, Outlet, useLocation, useNavigate, useParams } from "@tanstack/react-router";
+import { useSearchParams } from "@/hooks/useSearchParams";
 import { motion } from "framer-motion";
 import {
     ArrowLeftIcon,
@@ -13,6 +14,7 @@ import {
     Settings2Icon,
     UsersIcon,
 } from "lucide-react";
+import { campaignDisplayLabel, isIdleCampaign } from "@/components/app/campaigns/status";
 import useCampaign from "@/lib/api/hooks/app/campaigns/useCampaign";
 import useStartCampaign from "@/lib/api/hooks/app/campaigns/useStartCampaign";
 import useStopCampaign from "@/lib/api/hooks/app/campaigns/useStopCampaign";
@@ -22,17 +24,19 @@ import LaunchCampaignDialog from "@/components/app/campaigns/LaunchCampaignDialo
 import CampaignActionsMenu from "@/components/app/campaigns/CampaignActionsMenu";
 import UndeliverableBanner from "@/components/app/campaigns/UndeliverableBanner";
 import { canStartCampaign } from "@/components/app/campaigns/useCampaignActions";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { CAMPAIGN_DELETED_EVENT, type CampaignDeletedDetail } from "@/lib/realtime/campaignDeleted";
 import ResourceViewers from "@/components/app/presence/ResourceViewers";
 import { usePresenceResource } from "@/hooks/PresenceProvider";
+import { useAccessRestricted, usePermission } from "@/hooks/usePermission";
 
+// `scoped` tabs read only the campaign's own data, so a restricted member sees them.
 const TABS = [
-    { label: "Overview", path: "", Icon: BarChart3Icon },
-    { label: "Leads", path: "/leads", Icon: UsersIcon },
-    { label: "Steps", path: "/steps", Icon: ListChecksIcon },
-    { label: "Schedule", path: "/schedule", Icon: CalendarIcon },
-    { label: "Settings", path: "/preferences", Icon: Settings2Icon },
+    { label: "Overview", to: "/app/campaigns/$id", Icon: BarChart3Icon, scoped: true },
+    { label: "Leads", to: "/app/campaigns/$id/leads", Icon: UsersIcon, scoped: false },
+    { label: "Steps", to: "/app/campaigns/$id/steps", Icon: ListChecksIcon, scoped: true },
+    { label: "Schedule", to: "/app/campaigns/$id/schedule", Icon: CalendarIcon, scoped: true },
+    { label: "Settings", to: "/app/campaigns/$id/preferences", Icon: Settings2Icon, scoped: false },
 ] as const;
 
 const STATUS_PILL: Record<string, string> = {
@@ -41,17 +45,38 @@ const STATUS_PILL: Record<string, string> = {
     paused_undeliverable: "bg-amber-50 text-amber-700 border-amber-200",
     draft: "bg-slate-100 text-slate-600 border-slate-200",
     completed: "bg-slate-100 text-slate-600 border-slate-200",
+    idle: "bg-sky-50 text-sky-700 border-sky-200",
 };
 
 export default function CampaignLayout() {
-    const { pathname } = useLocation();
-    const { id } = useParams();
+    const pathname = useLocation({ select: (l) => l.pathname });
+    const { id } = useParams({ from: "/app/campaigns/$id" });
     const navigate = useNavigate();
-    const campaignData = useCampaign(id ?? "");
+    const campaignData = useCampaign(id);
     const confirm = useConfirm();
     const startCampaign = useStartCampaign();
     const stopCampaign = useStopCampaign();
     const [launchOpen, setLaunchOpen] = useState(false);
+    const [searchParams, setSearchParams] = useSearchParams();
+    const canSend = usePermission("SEND_CAMPAIGNS");
+    const restricted = useAccessRestricted();
+    const launchRequested = searchParams.get("launch") === "1";
+    const loadedStatus = campaignData.data?.status;
+
+    // ?launch=1 (the new-campaign flow's hand-off, the draft checklist) opens
+    // the launch dialog once the campaign has loaded, then leaves the URL clean.
+    useEffect(() => {
+        if (!launchRequested || !loadedStatus) return;
+        if (canSend && canStartCampaign(loadedStatus)) setLaunchOpen(true);
+        setSearchParams(
+            (prev) => {
+                const next = new URLSearchParams(prev);
+                next.delete("launch");
+                return next;
+            },
+            { replace: true },
+        );
+    }, [launchRequested, loadedStatus, canSend, setSearchParams]);
 
     // Collaboration: claim this campaign while it's open so teammates see
     // who's already in here (header pill + the org-wide presence stack).
@@ -65,7 +90,7 @@ export default function CampaignLayout() {
             const detail = (e as CustomEvent<CampaignDeletedDetail>).detail;
             if (detail?.id !== id) return;
             toast(`"${detail.name || "This campaign"}" was deleted by a teammate`);
-            navigate("/app/campaigns", { replace: true });
+            navigate({ to: "/app/campaigns", replace: true });
         };
         window.addEventListener(CAMPAIGN_DELETED_EVENT, onDeleted);
         return () => window.removeEventListener(CAMPAIGN_DELETED_EVENT, onDeleted);
@@ -73,7 +98,7 @@ export default function CampaignLayout() {
 
     if (campaignData.isLoading) {
         return (
-            <div className="px-5 pt-5 space-y-4">
+            <div className="px-3 sm:px-5 pt-4 sm:pt-5 space-y-4">
                 <div className="space-y-2">
                     <div className="h-6 w-56 bg-slate-100 rounded-md animate-pulse" />
                     <div className="h-3 w-40 bg-slate-100 rounded animate-pulse" />
@@ -106,7 +131,7 @@ export default function CampaignLayout() {
 
     const campaign = campaignData.data;
     const status = campaign.status;
-    const pill = STATUS_PILL[status] ?? STATUS_PILL.draft;
+    const pill = isIdleCampaign(campaign) ? STATUS_PILL.idle : (STATUS_PILL[status] ?? STATUS_PILL.draft);
 
     const isActive = status === "active";
     const canStart = canStartCampaign(status);
@@ -116,7 +141,9 @@ export default function CampaignLayout() {
     const onToggle = () => {
         if (isActive) {
             confirm?.show(`Pause ${campaign.name}?`, () => {
-                stopCampaign.mutate(campaign.id);
+                stopCampaign.mutate(campaign.id, {
+                    onError: (err) => toast.error((err as { message?: string })?.message || "Could not pause the campaign"),
+                });
             });
         } else {
             setLaunchOpen(true);
@@ -126,7 +153,7 @@ export default function CampaignLayout() {
     return (
         <CampaignContext.Provider value={campaign}>
             <div className="flex flex-col min-h-full bg-white">
-                <div className="px-5 pt-4 pb-3 flex items-start gap-3">
+                <div className="px-3 sm:px-5 pt-3 sm:pt-4 pb-3 flex items-start gap-3">
                     <div className="min-w-0">
                         <Link
                             to="/app/campaigns"
@@ -135,12 +162,14 @@ export default function CampaignLayout() {
                             <ArrowLeftIcon className="w-3 h-3" />
                             Campaigns
                         </Link>
-                        <div className="flex items-center gap-2">
-                            <h1 className="text-[18px] font-semibold text-slate-900 truncate">{campaign.name}</h1>
+                        {/* min-w-0 lets the name truncate instead of pushing the
+                            pills off a narrow screen; the pills wrap under it. */}
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                            <h1 className="min-w-0 max-w-full text-[18px] font-semibold text-slate-900 truncate">{campaign.name}</h1>
                             <span
                                 className={`shrink-0 inline-flex items-center h-5 px-2 rounded-md border text-[10px] uppercase tracking-[0.12em] font-medium ${pill}`}
                             >
-                                {status === "paused_undeliverable" ? "needs verification" : status}
+                                {campaignDisplayLabel(campaign)}
                             </span>
                             <ResourceViewers resource={`campaign:${campaign.id}`} className="shrink-0" />
                         </div>
@@ -170,7 +199,7 @@ export default function CampaignLayout() {
                             campaign={campaign}
                             variant="header"
                             onToggle={canToggle ? onToggle : undefined}
-                            afterDelete={() => navigate("/app/campaigns", { replace: true })}
+                            afterDelete={() => navigate({ to: "/app/campaigns", replace: true })}
                         />
                     </div>
                 </div>
@@ -178,34 +207,37 @@ export default function CampaignLayout() {
                 <UndeliverableBanner campaignId={campaign.id} status={status} />
 
                 <div className="shrink-0 px-3 flex items-center gap-1 border-b border-slate-200 overflow-x-auto no-scrollbar">
-                    {TABS.map(({ label, path, Icon }) => {
-                        const fullPath = `/app/campaigns/${id}${path}`;
-                        const isTabActive = pathname.replace(/\/$/, "") === fullPath.replace(/\/$/, "");
-                        return (
-                            <Link
-                                key={path || "overview"}
-                                to={fullPath}
-                                className={`relative h-10 px-2.5 inline-flex items-center gap-1.5 text-[12.5px] transition-colors ${
-                                    isTabActive
-                                        ? "text-slate-900 font-medium"
-                                        : "text-slate-500 hover:text-slate-800"
-                                }`}
-                            >
-                                <Icon className="w-3.5 h-3.5" />
-                                {label}
-                                {isTabActive && (
-                                    <motion.span
-                                        layoutId="campaign-tab-underline"
-                                        className="absolute left-1.5 right-1.5 -bottom-px h-0.5 rounded-full bg-sky-600"
-                                        transition={{ type: "spring", duration: 0.3, bounce: 0.15 }}
-                                    />
-                                )}
-                            </Link>
-                        );
-                    })}
+                    {TABS.filter((t) => t.scoped || !restricted).map(({ label, to, Icon }) => (
+                        <Link
+                            key={to}
+                            to={to}
+                            params={{ id }}
+                            activeOptions={{ exact: true, includeSearch: false }}
+                            className="relative h-10 px-2.5 inline-flex items-center gap-1.5 text-[12.5px] transition-colors"
+                            activeProps={{ className: "text-slate-900 font-medium" }}
+                            inactiveProps={{ className: "text-slate-500 hover:text-slate-800" }}
+                        >
+                            {({ isActive }) => (
+                                <>
+                                    <Icon className="w-3.5 h-3.5" />
+                                    {label}
+                                    {isActive && (
+                                        <motion.span
+                                            layoutId="campaign-tab-underline"
+                                            className="absolute left-1.5 right-1.5 -bottom-px h-0.5 rounded-full bg-sky-600"
+                                            transition={{ type: "spring", duration: 0.3, bounce: 0.15 }}
+                                        />
+                                    )}
+                                </>
+                            )}
+                        </Link>
+                    ))}
                 </div>
 
-                <div className="p-5">
+                {/* Leads renders a full-bleed Page (its own topbar, stat strip
+                    and table gutters), so padding it again wastes a fifth of a
+                    phone screen and stops its hairlines short of the edge. */}
+                <div className={pathname.replace(/\/$/, "").endsWith("/leads") ? "" : "p-3 sm:p-5"}>
                     <Outlet />
                 </div>
             </div>

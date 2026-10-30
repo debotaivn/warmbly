@@ -9,10 +9,11 @@ import (
 	"net/mail"
 	"time"
 
-	"github.com/getsentry/sentry-go"
+	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/app/token"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 	"github.com/warmbly/warmbly/internal/pkg/idtoken"
 )
 
@@ -68,6 +69,18 @@ type ssoFlow struct {
 	Verifier string `json:"verifier"`
 	Nonce    string `json:"nonce"`
 	Binding  string `json:"binding"`
+	// Purpose is empty for a sign-in and ssoPurposeReauth for a signed-in
+	// session re-proving its holder, which also pins the user and session.
+	Purpose   string    `json:"purpose,omitempty"`
+	UserID    uuid.UUID `json:"user_id"`
+	SessionID uuid.UUID `json:"session_id"`
+}
+
+// SSOCallbackResult is where the callback sends the browser: Reauth is set
+// whenever the state belonged to a re-authentication, error or not.
+type SSOCallbackResult struct {
+	Code   string
+	Reauth bool
 }
 
 // ssoHandoff is a completed login waiting to be collected, carrying the same
@@ -140,16 +153,16 @@ func (s *authService) FederatedProviderLabels() map[string]string {
 func (s *authService) mintHandoff(ctx context.Context, result *models.LoginResult, binding string) (string, *errx.Error) {
 	code, err := randomHex(32)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return "", errx.InternalError()
 	}
 	payload, err := json.Marshal(ssoHandoff{Binding: binding, Result: *result})
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return "", errx.InternalError()
 	}
 	if err := s.cache.SetEx(ctx, ssoHandoffKey(code), payload, ssoHandoffTTL).Err(); err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return "", errx.InternalError()
 	}
 	return code, nil
@@ -173,7 +186,7 @@ func (s *authService) SSOExchange(ctx context.Context, code, binding string) (*m
 	}
 	var handoff ssoHandoff
 	if err := json.Unmarshal(raw, &handoff); err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	if subtle.ConstantTimeCompare([]byte(handoff.Binding), []byte(binding)) != 1 {
@@ -189,34 +202,43 @@ func (s *authService) SSOBegin(ctx context.Context, provider string) (*SSORedire
 		return nil, errx.ErrExternalProvider
 	}
 
+	return s.beginFlow(ctx, p, ssoFlow{Provider: provider}, "")
+}
+
+// beginFlow mints the state, nonce, verifier and binding for one authorization
+// and stores them under the state. statePrefix only routes the callback; the
+// stored Purpose is what is trusted.
+func (s *authService) beginFlow(ctx context.Context, p FederatedProvider, flow ssoFlow, statePrefix string) (*SSORedirect, *errx.Error) {
 	state, err := randomHex(32)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
+	state = statePrefix + state
 	nonce, err := randomHex(32)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	verifier, err := randomHex(32)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	binding, err := randomHex(32)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 
-	payload, err := json.Marshal(ssoFlow{Provider: provider, Verifier: verifier, Nonce: nonce, Binding: binding})
+	flow.Verifier, flow.Nonce, flow.Binding = verifier, nonce, binding
+	payload, err := json.Marshal(flow)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 	if err := s.cache.SetEx(ctx, ssoStateKey(state), payload, ssoStateTTL).Err(); err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 
@@ -225,7 +247,14 @@ func (s *authService) SSOBegin(ctx context.Context, provider string) (*SSORedire
 
 // SSOCallbackComplete finishes an authorization and returns a single-use
 // handoff code the dashboard exchanges for the session.
-func (s *authService) SSOCallbackComplete(ctx context.Context, in SSOCallback) (string, *errx.Error) {
+func (s *authService) SSOCallbackComplete(ctx context.Context, in SSOCallback) (*SSOCallbackResult, *errx.Error) {
+	out := &SSOCallbackResult{Reauth: IsReauthState(in.State)}
+	code, err := s.ssoCallbackComplete(ctx, in, out.Reauth)
+	out.Code = code
+	return out, err
+}
+
+func (s *authService) ssoCallbackComplete(ctx context.Context, in SSOCallback, reauthState bool) (string, *errx.Error) {
 	p, ok := s.providers[in.Provider]
 	if !ok || p == nil {
 		return "", errx.ErrExternalProvider
@@ -242,7 +271,7 @@ func (s *authService) SSOCallbackComplete(ctx context.Context, in SSOCallback) (
 
 	var flow ssoFlow
 	if err := json.Unmarshal(raw, &flow); err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return "", errx.InternalError()
 	}
 	// A state minted for one provider presented at another's callback is a
@@ -250,13 +279,22 @@ func (s *authService) SSOCallbackComplete(ctx context.Context, in SSOCallback) (
 	if flow.Provider != "" && flow.Provider != in.Provider {
 		return "", errx.ErrExternalCode
 	}
+	// The stored purpose decides, and it must agree with the state's routing prefix.
+	isReauth := flow.Purpose == ssoPurposeReauth
+	if isReauth != reauthState {
+		return "", errx.ErrExternalCode
+	}
 
 	claims, err := p.Exchange(ctx, in.Code, flow.Verifier, flow.Nonce)
 	if err != nil {
 		// Reported, not buried: these are configuration problems more often
 		// than attacks.
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return "", errx.ErrExternalCode
+	}
+
+	if isReauth {
+		return s.completeReauthFlow(ctx, flow, claims)
 	}
 
 	email, perr := mail.ParseAddress(claims.Email)
@@ -272,7 +310,7 @@ func (s *authService) SSOCallbackComplete(ctx context.Context, in SSOCallback) (
 		lastName = in.LastName
 	}
 
-	userID, rerr := s.resolveFederatedUser(
+	res, rerr := s.resolveFederatedUser(
 		ctx,
 		in.Provider,
 		claims.Issuer,
@@ -285,7 +323,9 @@ func (s *authService) SSOCallbackComplete(ctx context.Context, in SSOCallback) (
 		return "", rerr
 	}
 
-	result, lerr := s.finishLoginAs(ctx, userID, in.IPAddress, in.UserAgent, sessionProvider(in.Provider))
+	// Carried through the handoff like a 2FA challenge is: the dashboard
+	// collects it at the exchange and asks for the password there.
+	result, lerr := s.finishFederatedLogin(ctx, res, in.IPAddress, in.UserAgent, sessionProvider(in.Provider))
 	if lerr != nil {
 		return "", lerr
 	}

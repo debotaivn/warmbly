@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -16,7 +17,9 @@ import (
 )
 
 // templatePreviewRequest is the composer's preview/validate payload: the raw
-// templates plus an optional sample contact to render against.
+// templates plus, optionally, the context of the real send: a contact of the
+// organization to render for (or ad-hoc sample overrides), the campaign whose
+// opt-out footer and attachments apply, and the mailbox whose signature does.
 type templatePreviewRequest struct {
 	Subject   string `json:"subject"`
 	BodyHTML  string `json:"body_html"`
@@ -29,6 +32,28 @@ type templatePreviewRequest struct {
 		Phone        string            `json:"phone"`
 		CustomFields map[string]string `json:"custom_fields"`
 	} `json:"contact"`
+	ContactID  *uuid.UUID `json:"contact_id"`
+	CampaignID *uuid.UUID `json:"campaign_id"`
+	AccountID  *uuid.UUID `json:"account_id"`
+	// The step being previewed, so the attachment list is the one that step
+	// sends. Omitted lists the campaign-wide files only.
+	StepID *uuid.UUID `json:"step_id"`
+}
+
+// orgContact resolves a contact that must belong to orgID; any other id, or an
+// unknown one, is not found.
+func (h *Handler) orgContact(ctx context.Context, orgID, contactID uuid.UUID) (*models.Contact, *errx.Error) {
+	if h.ContactRepo == nil {
+		return nil, errx.ErrNotFound
+	}
+	found, xerr := h.ContactRepo.GetByIDsAndOrganization(ctx, orgID, []uuid.UUID{contactID})
+	if xerr != nil {
+		return nil, xerr
+	}
+	if len(found) == 0 {
+		return nil, errx.New(errx.NotFound, "contact not found")
+	}
+	return &found[0], nil
 }
 
 func sampleContact() models.Contact {
@@ -42,17 +67,67 @@ func sampleContact() models.Contact {
 	}
 }
 
-// PreviewCampaignTemplate renders subject/body against a sample (or supplied)
-// contact EXACTLY as the send path would, returning the output plus any parse
-// errors and unresolved tokens. No side effects — powers the composer's live
+// PreviewCampaignTemplate renders subject/body for a contact EXACTLY as the
+// send path would, returning the output plus any parse errors and unresolved
+// tokens. With campaign_id and account_id it also applies the mailbox
+// signature, the opt-out footer and the plain-text rule, and lists the
+// attachments the send carries (the campaign-wide files, plus step_id's own). No side effects — powers the composer's live
 // preview + inline validation.
 func (h *Handler) PreviewCampaignTemplate(c *gin.Context) {
-	var req templatePreviewRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.ErrNoOrganization)
 		return
 	}
+	var req templatePreviewRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+
+	in := tasks.EmailPreviewInput{Subject: req.Subject, BodyHTML: req.BodyHTML, BodyPlain: req.BodyPlain}
+	if req.CampaignID != nil {
+		campaign, xerr := h.CampaignService.Get(c.Request.Context(), orgID.String(), req.CampaignID.String())
+		if xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		in.Campaign = campaign
+		if req.StepID != nil {
+			in.SequenceID = *req.StepID
+		}
+	}
+	if req.AccountID != nil {
+		if xerr := mailboxAllowed(c, *req.AccountID); xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		account, xerr := h.EmailService.Get(c.Request.Context(), orgID.String(), req.AccountID.String())
+		if xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		in.Account = account
+	}
+
 	contact := sampleContact()
+	if req.ContactID != nil {
+		// Rendering a real contact reads its fields back, so it takes the
+		// contacts read permission on top of the route's campaigns one.
+		if xerr := h.hasAccess(c, models.PermViewContacts, models.APIPermReadContacts); xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		found, xerr := h.orgContact(c.Request.Context(), *orgID, *req.ContactID)
+		if xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		contact = *found
+		if contact.CustomFields == nil {
+			contact.CustomFields = map[string]string{}
+		}
+	}
 	if rc := req.Contact; rc != nil {
 		if rc.FirstName != "" {
 			contact.FirstName = rc.FirstName
@@ -73,7 +148,8 @@ func (h *Handler) PreviewCampaignTemplate(c *gin.Context) {
 			contact.CustomFields[k] = v
 		}
 	}
-	c.JSON(http.StatusOK, tasks.PreviewTemplates(req.Subject, req.BodyHTML, req.BodyPlain, contact))
+	in.Contact = contact
+	c.JSON(http.StatusOK, h.TasksService.PreviewEmail(c.Request.Context(), *orgID, in))
 }
 
 func (h *Handler) CreateCampaign(c *gin.Context) {
@@ -89,7 +165,15 @@ func (h *Handler) CreateCampaign(c *gin.Context) {
 	var data models.CreateCampaign
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	if xerr := sendersAllowed(c, data.Senders); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	if xerr := poolStrategyAllowed(c, explicitOrDefault(data.SenderStrategy), len(data.EmailTagIDs) > 0); xerr != nil {
+		errx.JSON(c, xerr)
 		return
 	}
 
@@ -136,7 +220,33 @@ func (h *Handler) SearchCampaigns(c *gin.Context) {
 	status := c.Query("status")
 	limit := c.Query("limit")
 
-	resp, err := h.CampaignService.Search(c.Request.Context(), orgID.String(), query, cursor, folder, status, limit)
+	resp, err := h.CampaignService.Search(c.Request.Context(), orgID.String(), query, cursor, folder, status, limit, middleware.AllowedCampaigns(c))
+	if err != nil {
+		errx.JSON(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// EstimateCampaign projects an audience against a sender pool before a
+// campaign exists: recipients, daily capacity and the day the last send
+// lands. Read-only.
+// POST /campaigns-estimate
+func (h *Handler) EstimateCampaign(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.ErrNoOrganization)
+		return
+	}
+
+	var data models.CampaignEstimate
+	if err := c.ShouldBindJSON(&data); err != nil {
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+
+	resp, err := h.CampaignService.Estimate(c.Request.Context(), *orgID, &data)
 	if err != nil {
 		errx.JSON(c, err)
 		return
@@ -154,7 +264,7 @@ func (h *Handler) GetCampaignsOverview(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.CampaignService.Overview(c.Request.Context(), orgID.String())
+	resp, err := h.CampaignService.Overview(c.Request.Context(), orgID.String(), middleware.AllowedCampaigns(c))
 	if err != nil {
 		errx.JSON(c, err)
 		return
@@ -164,18 +274,26 @@ func (h *Handler) GetCampaignsOverview(c *gin.Context) {
 }
 
 func (h *Handler) UpdateCampaign(c *gin.Context) {
-	userIDStr := middleware.GetUserID(c)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
 
 	id := c.Param("id")
 
 	var data models.UpdateCampaign
 
 	if err := c.ShouldBindJSON(&data); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	if xerr := poolStrategyAllowed(c, data.SenderStrategy, data.EmailTags != nil); xerr != nil {
+		errx.JSON(c, xerr)
 		return
 	}
 
-	resp, err := h.CampaignService.Update(c.Request.Context(), userIDStr, id, &data)
+	resp, err := h.CampaignService.Update(c.Request.Context(), orgID.String(), id, &data)
 	if err != nil {
 		errx.JSON(c, err)
 		return
@@ -244,7 +362,7 @@ func (h *Handler) DuplicateCampaign(c *gin.Context) {
 	// The body is optional; an empty one reads as io.EOF.
 	var req duplicateCampaignRequest
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -279,6 +397,10 @@ func (h *Handler) StartCampaign(c *gin.Context) {
 		_ = c.ShouldBindJSON(&opts)
 	}
 
+	if xerr := h.campaignPoolAllowed(c, *orgID, id); xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
 	if xerr := h.CampaignService.StartCampaign(c.Request.Context(), *orgID, id, opts); xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -288,7 +410,13 @@ func (h *Handler) StartCampaign(c *gin.Context) {
 		h.auditOrg(c, models.AuditActionStart, models.AuditEntityCampaign, &campaignID, nil, nil)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "started"})
+	// waiting_for_leads tells the caller the campaign started with nothing to
+	// send and is active, waiting, so the dashboard can say so at once.
+	resp := gin.H{"status": "started", "waiting_for_leads": false}
+	if campaign, gerr := h.CampaignService.Get(c.Request.Context(), orgID.String(), id); gerr == nil && campaign != nil && campaign.IdleSince != nil {
+		resp["waiting_for_leads"] = true
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // StopCampaign stops a campaign
@@ -317,7 +445,11 @@ func (h *Handler) StopCampaign(c *gin.Context) {
 // GetCampaignLogs returns campaign activity logs
 // GET /campaigns/:id/logs
 func (h *Handler) GetCampaignLogs(c *gin.Context) {
-	userID := middleware.GetUserID(c)
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.Handle(c, errx.New(errx.BadRequest, "no organization selected"))
+		return
+	}
 	id := c.Param("id")
 
 	cursorStr := c.Query("cursor")
@@ -333,13 +465,41 @@ func (h *Handler) GetCampaignLogs(c *gin.Context) {
 		}
 	}
 
-	result, xerr := h.CampaignService.GetLogs(c.Request.Context(), userID, id, limit, cursor)
+	result, xerr := h.CampaignService.GetLogs(c.Request.Context(), orgID.String(), id, limit, cursor)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
 	}
 
+	if allowed := middleware.AllowedEmailAccounts(c); allowed != nil {
+		addresses := h.campaignLogAddresses(c, *orgID, result.Data, allowed)
+		for i := range result.Data {
+			result.Data[i] = scopedCampaignLog(result.Data[i], allowed, addresses)
+		}
+	}
+
 	c.JSON(http.StatusOK, result)
+}
+
+// GetCampaignSendPlan returns today's sending plan for a campaign: what will go
+// out today and every limit that decided it, read through the scheduler's own
+// gates. GET /campaigns/:id/send-plan
+func (h *Handler) GetCampaignSendPlan(c *gin.Context) {
+	orgID := middleware.GetOrganizationID(c)
+	if orgID == nil {
+		errx.JSON(c, errx.ErrNoOrganization)
+		return
+	}
+	if _, err := uuid.Parse(c.Param("id")); err != nil {
+		errx.JSON(c, errx.ErrNotFound)
+		return
+	}
+	plan, xerr := h.CampaignService.SendPlan(c.Request.Context(), *orgID, c.Param("id"))
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	c.JSON(http.StatusOK, plan)
 }
 
 // ListCampaignSenders returns a campaign's explicit sender pool.
@@ -360,6 +520,64 @@ func (h *Handler) ListCampaignSenders(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": senders})
 }
 
+// errPoolNeedsExplicitSenders holds a mailbox-limited key to explicit sender pools, which it can check.
+var errPoolNeedsExplicitSenders = errx.NewWithIdentifier(errx.Forbidden, apiKeyMailboxLimited,
+	"This API key is limited to some mailboxes, so its campaigns must use an explicit sender list (sender_strategy \"explicit\") of those mailboxes.")
+
+// poolStrategyAllowed refuses a tag-resolved pool to a mailbox-limited key.
+func poolStrategyAllowed(c *gin.Context, strategy *string, tagsChanged bool) *errx.Error {
+	if !keyMailboxLimited(c) {
+		return nil
+	}
+	if tagsChanged || (strategy != nil && *strategy != "explicit") {
+		return errPoolNeedsExplicitSenders
+	}
+	return nil
+}
+
+// campaignPoolAllowed checks a stored campaign's pool against a mailbox-limited key before it sends.
+func (h *Handler) campaignPoolAllowed(c *gin.Context, orgID uuid.UUID, id string) *errx.Error {
+	if !keyMailboxLimited(c) {
+		return nil
+	}
+	camp, xerr := h.CampaignService.Get(c.Request.Context(), orgID.String(), id)
+	if xerr != nil {
+		return xerr
+	}
+	if camp.SenderStrategy != "explicit" {
+		return errPoolNeedsExplicitSenders
+	}
+	senders, xerr := h.CampaignService.ListCampaignSenders(c.Request.Context(), orgID, id)
+	if xerr != nil {
+		return xerr
+	}
+	for _, s := range senders {
+		if xerr := mailboxAllowed(c, s.EmailAccountID); xerr != nil {
+			return xerr
+		}
+	}
+	return nil
+}
+
+// explicitOrDefault reads a create request's strategy, which defaults to tags when absent.
+func explicitOrDefault(strategy *string) *string {
+	if strategy == nil {
+		tags := "tags"
+		return &tags
+	}
+	return strategy
+}
+
+// sendersAllowed refuses a sender pool naming a mailbox outside the caller's allowlist.
+func sendersAllowed(c *gin.Context, senders []models.CampaignSenderInput) *errx.Error {
+	for _, s := range senders {
+		if xerr := mailboxAllowed(c, s.EmailAccountID); xerr != nil {
+			return xerr
+		}
+	}
+	return nil
+}
+
 // ReplaceCampaignSenders atomically replaces a campaign's explicit sender pool.
 // PUT /campaigns/:id/senders
 func (h *Handler) ReplaceCampaignSenders(c *gin.Context) {
@@ -373,7 +591,11 @@ func (h *Handler) ReplaceCampaignSenders(c *gin.Context) {
 		Senders []models.CampaignSenderInput `json:"senders"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		errx.JSON(c, errx.ErrInvalid)
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	if xerr := sendersAllowed(c, body.Senders); xerr != nil {
+		errx.JSON(c, xerr)
 		return
 	}
 

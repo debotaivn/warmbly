@@ -65,6 +65,18 @@ var apiSpecs = []apiSpec{
 	{name: "campaign start", summary: "Start the campaign. This sends real mail", method: "POST", path: "/campaigns/{id}/start", sends: true},
 	{name: "campaign stop", summary: "Stop the campaign", method: "POST", path: "/campaigns/{id}/stop"},
 	{name: "campaign logs", summary: "The campaign's send log", method: "GET", path: "/campaigns/{id}/logs", query: []string{"limit", "cursor"}},
+	{name: "campaign plan", summary: "Today's sending plan and every limit that decided it", method: "GET", path: "/campaigns/{id}/send-plan"},
+	// Per-lead hold: park ONE contact's flow in THIS campaign without
+	// unsubscribing them or removing them from it. --data carries
+	// {"until": "<RFC 3339>", "reason": "..."}; no until holds with no end.
+	{name: "campaign lead-hold", summary: "Whether one lead's flow is held", method: "GET", path: "/campaigns/{id}/leads/{child}/hold", child: "contact"},
+	{name: "campaign pause-lead", summary: "Hold one lead's flow until a date, or until resumed", method: "POST", path: "/campaigns/{id}/leads/{child}/pause", body: bodyOptional, child: "contact"},
+	{name: "campaign resume-lead", summary: "Lift one lead's hold now", method: "POST", path: "/campaigns/{id}/leads/{child}/resume", child: "contact"},
+	// Contacts copied on every email to one lead. --data carries
+	// {"contact_ids": ["<contact>", ...]}, at most two; [] copies nobody.
+	{name: "campaign lead-cc", summary: "Contacts copied on one lead's emails", method: "GET", path: "/campaigns/{id}/leads/{child}/cc", child: "contact"},
+	{name: "campaign set-lead-cc", summary: "Replace the contacts copied on one lead's emails", method: "PUT", path: "/campaigns/{id}/leads/{child}/cc", body: bodyRequired, child: "contact"},
+	{name: "campaign lead-cc-suggestions", summary: "The lead's likely colleagues to copy", method: "GET", path: "/campaigns/{id}/leads/{child}/cc/suggestions", child: "contact"},
 
 	// Contacts.
 	{name: "contact list", summary: "List or search contacts; --data carries the filter body", method: "POST", path: "/contacts/search", body: bodyOptional, query: []string{"limit", "cursor"}},
@@ -80,7 +92,17 @@ var apiSpecs = []apiSpec{
 	{name: "contact custom-fields", summary: "The distinct custom field keys in use", method: "GET", path: "/contacts/custom-fields"},
 	{name: "contact import-preview", summary: "Preview a bulk import without writing", method: "POST", path: "/contacts/import/preview", body: bodyRequired},
 	{name: "contact import-commit", summary: "Commit a previewed bulk import", method: "POST", path: "/contacts/import/commit", body: bodyRequired},
+	{name: "contact imports", summary: "Background imports, newest first", method: "GET", path: "/contacts/imports"},
+	{name: "contact import-status", summary: "A background import's progress and result", method: "GET", path: "/contacts/imports/{id}"},
+	{name: "contact import-analyze", summary: "What a draft import would do under a mapping", method: "POST", path: "/contacts/imports/{id}/analyze", body: bodyRequired},
+	{name: "contact import-start", summary: "Start a draft import", method: "POST", path: "/contacts/imports/{id}/start", body: bodyRequired},
+	{name: "contact import-cancel", summary: "Stop a background import", method: "POST", path: "/contacts/imports/{id}/cancel"},
 	{name: "contact export", summary: "Export contacts", method: "POST", path: "/contacts/export", body: bodyOptional},
+
+	// Suppression list.
+	{name: "suppression list", summary: "The workspace suppression list: addresses and domains that get no campaign mail", method: "GET", path: "/suppressions", query: []string{"limit", "cursor", "q"}},
+	{name: "suppression add", summary: "Add addresses or domains to the suppression list", method: "POST", path: "/suppressions", body: bodyRequired},
+	{name: "suppression remove", summary: "Lift a suppression entry so the address can be emailed again", method: "DELETE", path: "/suppressions/{id}"},
 
 	// Mailboxes (email accounts).
 	{name: "mailbox list", summary: "List connected mailboxes", method: "GET", path: "/emails", query: []string{"limit", "cursor", "q"}},
@@ -88,7 +110,10 @@ var apiSpecs = []apiSpec{
 	{name: "mailbox update", summary: "Update mailbox settings (limits, tags, timezone, signature)", method: "PATCH", path: "/emails/{id}", body: bodyRequired},
 	{name: "mailbox delete", summary: "Disconnect a mailbox", method: "DELETE", path: "/emails/{id}"},
 	{name: "mailbox auth-check", summary: "Check the mailbox's SPF, DKIM and DMARC", method: "GET", path: "/emails/{id}/auth-check"},
-	{name: "mailbox sync", summary: "The mailbox's sync state and backfill progress", method: "GET", path: "/emails/{id}/sync"},
+	{name: "mailbox sync", summary: "The mailbox's sync state, backfill progress and skipped folders", method: "GET", path: "/emails/{id}/sync"},
+	{name: "mailbox skip-folders", summary: "Replace the folders an IMAP mailbox's sync leaves alone (body: {\"skip_folders\": [...]})", method: "PUT", path: "/emails/{id}/sync", body: bodyRequired},
+	{name: "mailbox identity", summary: "The addresses this mailbox may send as (Gmail only)", method: "GET", path: "/emails/{id}/identity"},
+	{name: "mailbox refresh-identity", summary: "Re-read the send-as addresses from the provider, optionally importing its signature", method: "POST", path: "/emails/{id}/identity/refresh", body: bodyOptional},
 	{name: "mailbox behavior", summary: "The mailbox's human-sending ranges", method: "GET", path: "/emails/{id}/behavior"},
 	{name: "mailbox set-behavior", summary: "Update the mailbox's sending behaviour", method: "PUT", path: "/emails/{id}/behavior", body: bodyRequired},
 	{name: "mailbox verify", summary: "Verify an email address without sending", method: "POST", path: "/emails/verify", body: bodyRequired},
@@ -116,13 +141,13 @@ var apiSpecs = []apiSpec{
 	{name: "inbox cancel-scheduled", summary: "Cancel a scheduled send", method: "DELETE", path: "/unibox/scheduled/{id}"},
 
 	// Analytics and audit.
-	{name: "analytics dashboard", summary: "The dashboard numbers", method: "GET", path: "/analytics/dashboard"},
+	{name: "analytics dashboard", summary: "The dashboard numbers, optionally for chosen campaigns and folders", method: "GET", path: "/analytics/dashboard", query: []string{"period", "campaign_ids", "folder_ids"}},
 	{name: "analytics deliverability", summary: "Bounces, complaints and placement", method: "GET", path: "/analytics/deliverability"},
 	{name: "analytics warmup", summary: "Warmup analytics", method: "GET", path: "/analytics/warmup"},
 	{name: "analytics accounts", summary: "Per-mailbox analytics", method: "GET", path: "/analytics/accounts"},
 	{name: "analytics account", summary: "One mailbox's analytics", method: "GET", path: "/analytics/accounts/{id}"},
-	{name: "analytics campaign", summary: "One campaign's analytics", method: "GET", path: "/analytics/campaigns/{id}"},
-	{name: "analytics campaign-daily", summary: "One campaign's daily series", method: "GET", path: "/analytics/campaigns/{id}/daily"},
+	{name: "analytics campaign", summary: "One campaign's analytics, all time or for the emails sent from..to", method: "GET", path: "/analytics/campaigns/{id}", query: []string{"from", "to"}},
+	{name: "analytics campaign-daily", summary: "One campaign's daily series", method: "GET", path: "/analytics/campaigns/{id}/daily", query: []string{"from", "to"}},
 	{name: "analytics campaign-hourly", summary: "One campaign's hourly series", method: "GET", path: "/analytics/campaigns/{id}/hourly"},
 	{name: "analytics usage", summary: "API and plan usage", method: "GET", path: "/analytics/usage"},
 	{name: "analytics audit-logs", summary: "The organization's audit trail", method: "GET", path: "/audit-logs", query: []string{"limit", "cursor"}},
@@ -141,12 +166,14 @@ var apiSpecs = []apiSpec{
 	{name: "webhook deliveries", summary: "Recent deliveries across endpoints", method: "GET", path: "/webhooks/deliveries", query: []string{"limit", "cursor"}},
 	{name: "webhook event-types", summary: "Every event type a webhook can subscribe to", method: "GET", path: "/webhooks/event-types"},
 
-	// API keys (self-service).
+	// API keys (self-service). `purge` rather than `delete` to match
+	// `warmbly key purge`, where `delete` is already an alias of `revoke`.
 	{name: "apikey list", summary: "List the organization's API keys", method: "GET", path: "/api-keys"},
 	{name: "apikey get", summary: "Get one API key", method: "GET", path: "/api-keys/{id}"},
 	{name: "apikey create", summary: "Create an API key; the secret is only ever in this response", method: "POST", path: "/api-keys", body: bodyRequired},
 	{name: "apikey update", summary: "Update an API key's name, scopes or restrictions", method: "PATCH", path: "/api-keys/{id}", body: bodyRequired},
 	{name: "apikey revoke", summary: "Revoke an API key", method: "DELETE", path: "/api-keys/{id}"},
+	{name: "apikey purge", summary: "Delete a revoked API key for good, with its usage logs; a key that can still authenticate is refused", method: "DELETE", path: "/api-keys/{id}/permanent"},
 	{name: "apikey permissions", summary: "Every grantable scope with its bit value", method: "GET", path: "/api-keys/permissions"},
 
 	// Templates.
@@ -169,24 +196,25 @@ var apiSpecs = []apiSpec{
 
 // apiFamilyOrder keeps the top-level help stable; maps iterate randomly.
 var apiFamilyOrder = []string{
-	"me", "campaign", "contact", "mailbox", "inbox", "analytics",
+	"me", "campaign", "contact", "suppression", "mailbox", "inbox", "analytics",
 	"settings", "webhook", "apikey", "template", "crm", "tool",
 }
 
 // apiFamilies drives top-level dispatch and help for the typed commands.
 var apiFamilies = map[string]string{
-	"me":        "Who the API key is",
-	"campaign":  "Campaigns and their sequences",
-	"contact":   "Contacts, notes, and imports",
-	"mailbox":   "Connected mailboxes and warmup",
-	"inbox":     "The unified inbox",
-	"analytics": "Analytics and the audit trail",
-	"settings":  "Organization outreach settings",
-	"webhook":   "Webhook endpoints",
-	"apikey":    "API keys",
-	"template":  "Reply templates",
-	"crm":       "Pipelines, deals, and CRM tasks",
-	"tool":      "AI agent tools (list and call the registry)",
+	"me":          "Who the API key is",
+	"campaign":    "Campaigns and their sequences",
+	"contact":     "Contacts, notes, and imports",
+	"suppression": "The suppression list: addresses and domains that get no campaign mail",
+	"mailbox":     "Connected mailboxes and warmup",
+	"inbox":       "The unified inbox",
+	"analytics":   "Analytics and the audit trail",
+	"settings":    "Organization outreach settings",
+	"webhook":     "Webhook endpoints",
+	"apikey":      "API keys",
+	"template":    "Reply templates",
+	"crm":         "Pipelines, deals, and CRM tasks",
+	"tool":        "AI agent tools (list and call the registry)",
 }
 
 // runAPIResource runs one typed command: `warmblyctl campaign start --id ...`.

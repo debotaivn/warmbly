@@ -3,17 +3,16 @@ package unibox
 import (
 	"context"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 )
 
 // Search searches emails with filters
 func (s *uniboxService) Search(
 	ctx context.Context,
 	orgID uuid.UUID,
-	userID uuid.UUID,
 	params *models.MailSearchParams,
 ) (*models.MailSearchResult, *errx.Error) {
 	// Validate page size
@@ -29,9 +28,9 @@ func (s *uniboxService) Search(
 	// sender-only fast path (GetBySender) returned un-collapsed,
 	// label-less rows, so it can't serve the stacked list anymore — the
 	// sender filter is handled inside Search via params.Sender.
-	resp, err := s.uniboxRepository.Search(ctx, orgID, userID, params)
+	resp, err := s.uniboxRepository.Search(ctx, orgID, params)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
 
@@ -46,7 +45,7 @@ func (s *uniboxService) GetUnseenCount(
 ) (int64, *errx.Error) {
 	count, err := s.uniboxRepository.GetUnseenCount(ctx, orgID, emailAccountID)
 	if err != nil {
-		sentry.CaptureException(err)
+		errs.CaptureException(err)
 		return 0, errx.InternalError()
 	}
 

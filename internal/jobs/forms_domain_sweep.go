@@ -2,11 +2,14 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/warmbly/warmbly/internal/app/customhost"
 	"github.com/warmbly/warmbly/internal/config"
+	"github.com/warmbly/warmbly/internal/jobrun"
 	"github.com/warmbly/warmbly/internal/pkg/trackdns"
 	"github.com/warmbly/warmbly/internal/repository"
 )
@@ -18,11 +21,12 @@ import (
 // that later stops pointing here stops being used instead of quietly serving
 // form links on a host that no longer answers.
 type FormsDomainSweep struct {
-	orgs repository.OrganizationRepository
+	orgs  repository.OrganizationRepository
+	hosts *customhost.Checker
 }
 
-func NewFormsDomainSweep(orgs repository.OrganizationRepository) *FormsDomainSweep {
-	return &FormsDomainSweep{orgs: orgs}
+func NewFormsDomainSweep(orgs repository.OrganizationRepository, hosts *customhost.Checker) *FormsDomainSweep {
+	return &FormsDomainSweep{orgs: orgs, hosts: hosts}
 }
 
 func (j *FormsDomainSweep) Run(ctx context.Context) error {
@@ -40,7 +44,8 @@ func (j *FormsDomainSweep) Run(ctx context.Context) error {
 		return err
 	}
 	for _, row := range rows {
-		res := trackdns.Verify(ctx, row.Domain, target)
+		// An unverified domain needs the workspace's TXT proof as well as the CNAME.
+		res := j.hosts.Gate(ctx, trackdns.Verify(ctx, row.Domain, target), row.OrganizationID, row.Verified)
 		// A resolver failure is transient: never let it un-verify a domain
 		// that was working, or one DNS blip drops every customer back to the
 		// shared host.
@@ -56,6 +61,10 @@ func (j *FormsDomainSweep) Run(ctx context.Context) error {
 			at = &now
 		}
 		if err := j.orgs.SetFormsDomainVerified(ctx, row.OrganizationID, res.Verified, at); err != nil {
+			if errors.Is(err, repository.ErrFormsDomainTaken) {
+				// Another workspace holds this domain; it stays unverified here.
+				continue
+			}
 			log.Warn().Err(err).Str("organization_id", row.OrganizationID.String()).Msg("forms domain sweep: persist failed")
 			continue
 		}
@@ -71,15 +80,5 @@ func (j *FormsDomainSweep) Run(ctx context.Context) error {
 
 // Start runs the sweep once on boot and then on the interval until ctx ends.
 func (j *FormsDomainSweep) Start(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	_ = j.Run(ctx)
-	for {
-		select {
-		case <-ticker.C:
-			_ = j.Run(ctx)
-		case <-ctx.Done():
-			return
-		}
-	}
+	jobrun.Loop(ctx, "forms_domain_sweep", interval, true, j.Run)
 }

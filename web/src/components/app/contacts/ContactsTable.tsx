@@ -11,26 +11,26 @@
 //     section header so it nests cleanly under the campaign view.
 
 import React from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate } from "@tanstack/react-router";
+import { useSearchParams } from "@/hooks/useSearchParams";
 import {
     AlertTriangleIcon,
-    BanIcon,
-    Building2Icon,
+    ArrowDownIcon,
+    ArrowUpIcon,
     CableIcon,
+    DatabaseZapIcon,
     CheckIcon,
-    ClockIcon,
     CornerUpLeftIcon,
     DownloadIcon,
     LayersIcon,
     Loader2Icon,
-    MailIcon,
     MailOpenIcon,
     MoreHorizontalIcon,
     MousePointerClickIcon,
-    PhoneIcon,
+    PauseIcon,
+    PlayIcon,
     PlusIcon,
     RefreshCcwIcon,
-    Settings2Icon,
     ShieldCheckIcon,
     SheetIcon,
     SparklesIcon,
@@ -48,40 +48,60 @@ import useSearchContacts from "@/lib/api/hooks/app/contacts/useSearchContacts";
 import type SearchContacts from "@/lib/api/models/app/contacts/SearchContacts";
 import useDeleteContacts from "@/lib/api/hooks/app/contacts/useDeleteContacts";
 import { useRequestContactVerification } from "@/lib/api/hooks/app/contacts/useContactVerification";
-import VerificationBadge from "./VerificationBadge";
+import { reverifyNotice } from "@/lib/api/client/app/contacts/verification";
 import { useBatchResearch } from "@/lib/api/hooks/app/contacts/useContactResearch";
 import useIntegrationConnections from "@/lib/api/hooks/app/integrations/useIntegrationConnections";
 import { usePushContacts } from "@/lib/api/hooks/app/integrations/usePushContacts";
+import { useStartApolloEnrichment } from "@/lib/api/hooks/app/integrations/useApollo";
 import {
     PROVIDER_LABELS,
     PUSHABLE_PROVIDERS,
     type IntegrationConnection,
 } from "@/lib/api/models/app/integrations/Integration";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 import FilterBar from "./filters/FilterBar";
-import { isCompleteCustomFilter } from "./filters/helpers";
+import useContactBrowseState, { contactBrowseName } from "./filters/useContactBrowseState";
+import { hasNarrowingFilters, isCompleteCustomFilter, scopeSearch } from "./filters/helpers";
 import ContactEdit from "./ContactEdit";
 import type { ContactSlideTab } from "./contact-edit/tabs";
 import type MiniCampaign from "@/lib/api/models/app/campaigns/MiniCampaign";
-import type { ContactCampaignProgress, LeadEngagement, LeadStatus, VerificationSource, VerificationStatus } from "@/lib/api/models/app/contacts/Contact";
+import { holdSummary } from "@/lib/api/models/app/contacts/Contact";
+import type { ContactCampaignProgress, LeadEngagement, LeadStatus } from "@/lib/api/models/app/contacts/Contact";
 import type { CampaignLeadCounts } from "@/lib/api/models/app/contacts/SearchContactsResult";
 import ContactsEditBulk from "./ContactsEditBulk";
+import PauseLeadDialog from "./PauseLeadDialog";
+import { useResumeLead } from "@/lib/api/hooks/app/campaigns/useLeadHold";
+import { CC_RESUME_CONFIRM } from "@/lib/leadHold";
+import { selectionOf } from "@/lib/api/models/app/contacts/ContactSelection";
+import type ContactSelection from "@/lib/api/models/app/contacts/ContactSelection";
+import * as rowSelection from "./selection";
+import type { RowSelection } from "./selection";
 import { NewContactDialog } from "./NewContactDialog";
 import ExportDialog from "./ExportDialog";
-import ImportWizard from "./ImportWizard";
+import ImportWizard, { type ImportStep } from "./ImportWizard";
+import RunningImportChip from "./import/RunningImportChip";
 import AddFromContactsDialog from "./AddFromContactsDialog";
 import AddToSegmentMenu from "@/components/app/segments/AddToSegmentMenu";
 import SegmentEditor from "@/components/app/segments/SegmentEditor";
 import { filtersToSegment } from "@/components/app/segments/filtersToSegment";
 import type { SegmentCondition } from "@/lib/api/models/app/segments/Segment";
 import CampaignSegmentsDialog from "@/components/app/segments/CampaignSegmentsDialog";
-import { useCampaignSegments, useSetSegmentMembers } from "@/lib/api/hooks/app/segments";
+import LinkedSegmentsStrip from "@/components/app/segments/LinkedSegmentsStrip";
+import { linksEmptyReason } from "@/components/app/segments/linkedSegments";
+import type { CampaignSegmentLink } from "@/lib/api/models/app/segments/Segment";
+import { useAddSegmentToCampaign, useCampaignSegments, useSetSegmentMembers } from "@/lib/api/hooks/app/segments";
+import type { ExportScopeContext } from "./ExportDialog";
 import useUpdateContactsBulk from "@/lib/api/hooks/app/contacts/useUpdateContactsBulk";
 import useAiMetered from "@/hooks/useAiMetered";
 import SyncSourcesPanel from "./SyncSourcesPanel";
-import { CategoryChip } from "./CategoryPicker";
+import { columnClass, emptyColumnIds, sortOptions, type ContactColumn, type ContactRow } from "./columns";
+import { ColumnChooser, SortMenu, type ViewSortState } from "./ViewControls";
+import { useContactView } from "./useContactView";
+import { readCachedView } from "@/lib/api/hooks/app/views/useViewPreferences";
+import type { SearchContactsSortBy } from "@/lib/api/models/app/contacts/search-contacts.types";
+import type { ColumnViewName } from "@/lib/api/models/app/views/ViewPreferences";
 
 import {
     EmptyBlock,
@@ -99,12 +119,23 @@ import {
     PopoverMenuContent,
     PopoverMenuItem,
     PopoverMenuLabel,
-    PopoverMenuSeparator,
     PopoverMenuTrigger,
     SelectButton,
 } from "@/components/ui/popover-menu";
+import { Checkbox } from "@/components/ui/checkbox";
+import useCrmProvider from "@/hooks/useCrmProvider";
+import { CrmMark } from "@/components/app/crm/crmProviders";
+import CrmImportDialog from "./import/CrmImportDialog";
 
 type SubFilter = "all" | "subscribed" | "unsubscribed";
+
+// Mirrors maxIntegrationPushSize on the backend: one synchronous push is a
+// live call per contact against the CRM's API.
+const MAX_CRM_PUSH = 500;
+// The most contacts one Apollo enrichment run takes; the server refuses more.
+const MAX_APOLLO_ENRICH = 5000;
+// Mirrors research.MaxBatch: every contact is a metered AI run.
+const MAX_RESEARCH_BATCH = 500;
 
 export default function ContactsTable({
     current_campaign,
@@ -112,13 +143,15 @@ export default function ContactsTable({
 }: {
     current_campaign?: MiniCampaign;
     // Scope the list to one segment's members (the segment detail page).
-    segment?: { id: string; name: string };
+    segment?: { id: string; name: string; color?: string };
 }) {
     const confirm = useConfirm();
     const segmentMembers = useSetSegmentMembers();
     // Enrolling a segment writes campaign leads, so it takes the campaign permission.
     const campaignWrite = useWriteGuard("MANAGE_CAMPAIGNS");
-    const [selected, setSelected] = React.useState<string[]>([]);
+    // Ticked rows, or "everything the search matches" minus what was unticked
+    // after; see ./selection for the two shapes and what each one means.
+    const [rowSel, setRowSel] = React.useState<RowSelection>(rowSelection.emptySelection);
     const [del, setDelete] = React.useState<boolean>(false);
     const [edit, setEdit] = React.useState<string>("");
     // Which tab the drawer opens on. Row click → default (overview); the
@@ -129,10 +162,8 @@ export default function ContactsTable({
         setEdit(id);
     }, []);
     const [bulkEdit, setBulkEdit] = React.useState<boolean>(false);
-    const [subFilter, setSubFilter] = React.useState<SubFilter>("all");
     const [newOpen, setNewOpen] = React.useState<boolean>(false);
     const [exportOpen, setExportOpen] = React.useState<boolean>(false);
-    const [importOpen, setImportOpen] = React.useState<boolean>(false);
     const [syncOpen, setSyncOpen] = React.useState<boolean>(false);
     const [fromContactsOpen, setFromContactsOpen] = React.useState<boolean>(false);
     const [fromSegmentOpen, setFromSegmentOpen] = React.useState<boolean>(false);
@@ -140,20 +171,132 @@ export default function ContactsTable({
     const [segmentPreset, setSegmentPreset] = React.useState<{ conditions: SegmentCondition[] } | null>(null);
     const navigate = useNavigate();
     // ?category=<id> pre-filters the list (the Categories tab links here).
-    const [params] = useSearchParams();
+    const [params, setParams] = useSearchParams();
 
-    const [searchProps, setSearchProps] = React.useState<SearchContacts>(() => {
-        const category = params.get("category");
-        return {
-            query: "",
-            filters: [],
-            campaign_ids: current_campaign ? [current_campaign.id] : [],
-            segment_ids: segment ? [segment.id] : undefined,
-            category_ids: category && !segment && !current_campaign ? [category] : undefined,
-            sort_by: "created_at",
-            reverse: false,
-        };
+    // An open import lives in the URL (?import=<id>&importStep=<step>), so a
+    // reload reopens it where it was. "new" is the upload step before a draft exists.
+    const [importOpen, setImportOpen] = React.useState<boolean>(() => params.has("import"));
+    const [importId, setImportId] = React.useState<string | null>(() => {
+        const id = params.get("import");
+        return id && id !== "new" ? id : null;
     });
+    const [importStep, setImportStep] = React.useState<ImportStep | undefined>(
+        () => (params.get("importStep") as ImportStep) ?? undefined,
+    );
+    // Provider mode adds a list import; its draft continues in the same wizard.
+    const { isExternal, crm } = useCrmProvider();
+    const [crmImportOpen, setCrmImportOpen] = React.useState(false);
+    const continueImport = React.useCallback((id: string, step: ImportStep) => {
+        setCrmImportOpen(false);
+        setImportId(id);
+        setImportStep(step);
+        setImportOpen(true);
+    }, []);
+    const routeImport = React.useCallback(
+        (id: string | null, step: ImportStep) => {
+            setParams(
+                (prev) => {
+                    const next = new URLSearchParams(prev);
+                    next.set("import", id ?? "new");
+                    next.set("importStep", step);
+                    return next;
+                },
+                { replace: true },
+            );
+        },
+        [setParams],
+    );
+    const closeImport = React.useCallback(() => {
+        setImportOpen(false);
+        setImportId(null);
+        setImportStep(undefined);
+        setParams(
+            (prev) => {
+                const next = new URLSearchParams(prev);
+                next.delete("import");
+                next.delete("importStep");
+                return next;
+            },
+            { replace: true },
+        );
+    }, [setParams]);
+
+    // ?contact=<id> opens that contact's drawer (the CRM's "Open in Warmbly" links here).
+    const deepContact = params.get("contact");
+    React.useEffect(() => {
+        if (deepContact) openContact(deepContact);
+    }, [deepContact, openContact]);
+    // Closing the drawer drops the param, so a reload does not reopen it.
+    const prevEdit = React.useRef(edit);
+    React.useEffect(() => {
+        const was = prevEdit.current;
+        prevEdit.current = edit;
+        if (!was || edit) return;
+        setParams(
+            (prev) => {
+                if (!prev.has("contact")) return prev;
+                const next = new URLSearchParams(prev);
+                next.delete("contact");
+                return next;
+            },
+            { replace: true },
+        );
+    }, [edit, setParams]);
+
+    // The member's saved layout for this list: its columns and its sort. The
+    // Leads tab and the contacts page are two views with two layouts.
+    const viewName: ColumnViewName = current_campaign ? "campaign_leads" : "contacts";
+    const view = useContactView(viewName);
+
+    const browseName = contactBrowseName(current_campaign?.id, segment?.id);
+    const category = !segment && !current_campaign ? params.get("category") ?? undefined : undefined;
+    const [searchProps, setSearchProps] = useContactBrowseState({
+        campaignId: current_campaign?.id, segmentId: segment?.id, category,
+        initialSort: () => {
+            const cached = readCachedView(view.scope, viewName)?.sort;
+            return { sort_by: (cached?.by ?? "created_at") as SearchContactsSortBy, reverse: cached?.reverse ?? false };
+        },
+        clearCategoryIntent: () => setParams((prev) => {
+            const next = new URLSearchParams(prev);
+            next.delete("category");
+            return next;
+        }, { replace: true }),
+    });
+
+    // The saved sort applies once the server's copy is in hand, and only when
+    // it differs from what is already applied, so a change made here (which
+    // writes the same sort back) does not re-apply itself.
+    const appliedSortRef = React.useRef<string | null>(null);
+    React.useEffect(() => {
+        if (!view.loaded) return;
+        const saved = view.savedSort;
+        const sig = `${view.scope.userId}:${view.scope.orgId}:${viewName}:${saved ? `${saved.by}:${saved.reverse}` : "default"}`;
+        if (appliedSortRef.current === sig) return;
+        appliedSortRef.current = sig;
+        setSearchProps((prev) => ({
+            ...prev,
+            sort_by: (saved?.by ?? "created_at") as SearchContactsSortBy,
+            reverse: saved?.reverse ?? false,
+        }));
+    }, [view.loaded, view.savedSort, view.scope.userId, view.scope.orgId, viewName, setSearchProps]);
+    const sortState: ViewSortState = { by: searchProps.sort_by, reverse: searchProps.reverse };
+    function changeSort(next: ViewSortState) {
+        appliedSortRef.current = `${view.scope.userId}:${view.scope.orgId}:${viewName}:${next.by}:${next.reverse}`;
+        setSearchProps((s) => ({ ...s, sort_by: next.by, reverse: next.reverse }));
+        view.setSort({ by: next.by, reverse: next.reverse });
+    }
+    // A header click: the same column flips direction, a new one starts the
+    // way its kind reads best (A to Z for text, newest or most first otherwise).
+    function sortByColumn(col: ContactColumn) {
+        if (!col.sortKey) return;
+        if (searchProps.sort_by === col.sortKey) changeSort({ by: col.sortKey, reverse: !searchProps.reverse });
+        else changeSort({ by: col.sortKey, reverse: !!col.sortAsc });
+    }
+    function resetView() {
+        view.reset();
+        appliedSortRef.current = "default";
+        setSearchProps((s) => ({ ...s, sort_by: "created_at", reverse: false }));
+    }
 
     function saveAsSegment(draft: SearchContacts) {
         const { conditions, dropped } = filtersToSegment(draft, current_campaign?.id);
@@ -162,40 +305,110 @@ export default function ContactsTable({
     }
     // Half-filled custom-field pills stay in the bar but never reach the server.
     const searchOptions = React.useMemo(
-        () => ({ ...searchProps, filters: searchProps.filters.filter(isCompleteCustomFilter) }),
+        () => ({ ...searchProps, custom_field_filters: searchProps.custom_field_filters.filter(isCompleteCustomFilter) }),
         [searchProps],
     );
     const contactsData = useSearchContacts({ options: searchOptions });
 
+    // The stat strip's subscription facet is the same filter the bar exposes,
+    // so it goes to the server: the total, the pages and "select all matching"
+    // then all agree with what the strip says.
+    const subFilter: SubFilter =
+        searchProps.subscribed === undefined ? "all" : searchProps.subscribed ? "subscribed" : "unsubscribed";
+    const setSubFilter = (v: SubFilter) =>
+        setSearchProps((s) => ({ ...s, subscribed: v === "all" ? undefined : v === "subscribed" }));
+
+    const clearSelection = React.useCallback(() => setRowSel(rowSelection.emptySelection), []);
+    const isRowSelected = React.useCallback((id: string) => rowSelection.isRowSelected(rowSel, id), [rowSel]);
+    // A different result set makes a select-all stale and a tick list
+    // meaningless, so the selection resets with the filters. Sort is excluded:
+    // it reorders the same rows.
+    const selectionScope = React.useMemo(() => {
+        const { sort_by: _sortBy, reverse: _reverse, ...rest } = searchOptions;
+        return JSON.stringify(rest);
+    }, [searchOptions]);
+    React.useEffect(() => {
+        clearSelection();
+    }, [selectionScope, clearSelection]);
+
     // Inside a segment, "remove" pins the contact out as a manual exclude so
     // it stays out even while the conditions still match it.
     async function excludeFromSegment() {
-        if (!segment || selected.length === 0 || segmentMembers.isPending) return;
+        if (!segment || selectionCount === 0 || segmentMembers.isPending) return;
         try {
-            await segmentMembers.mutateAsync({ id: segment.id, contacts: selected, mode: "exclude" });
-            toast.success(`Removed ${selected.length} contact${selected.length === 1 ? "" : "s"} from ${segment.name}`);
-            setSelected([]);
+            const removed = await segmentMembers.mutateAsync({ id: segment.id, selection, mode: "exclude" });
+            toast.success(`Removed ${removed.toLocaleString()} contact${removed === 1 ? "" : "s"} from ${segment.name}`);
+            clearSelection();
         } catch (err) {
             toast.error(buildError(err as AppError));
         }
     }
     const contactsBulkDelete = useDeleteContacts();
     const bulkUpdate = useUpdateContactsBulk();
-    // Linked segments (live audience) for the toolbar badge on a Leads tab.
+    // Linked segments (live audience) for the strip and badge on a Leads tab.
     const campaignSegments = useCampaignSegments(current_campaign?.id, !!current_campaign);
+    const linkedSegments = React.useMemo(() => campaignSegments.data ?? [], [campaignSegments.data]);
+    // Members removed from the campaign by hand are held out of automatic
+    // enrolment; the one-shot enrol clears those records and adds them back.
+    const reenrol = useAddSegmentToCampaign();
+    const reenrolling = reenrol.isPending ? (reenrol.variables?.id ?? null) : null;
+    // One link from the strip, or every link with held-out members from the
+    // empty state; the one-shot enrol clears the removals segment by segment.
+    function reenrolSegments(links: CampaignSegmentLink[]) {
+        if (!current_campaign || reenrol.isPending || links.length === 0) return;
+        const held = links.reduce((n, l) => n + l.held_out_count, 0);
+        const names = links.map((l) => l.name).join(", ");
+        confirm?.show(
+            `Add the ${held.toLocaleString()} held-out member${held === 1 ? "" : "s"} of ${names} back to this campaign? Every current member of ${links.length === 1 ? "the segment" : "these segments"} becomes a lead again, including the ones removed by hand.`,
+            async () => {
+                let added = 0;
+                try {
+                    for (const l of links) {
+                        const res = await reenrol.mutateAsync({ id: l.segment_id, campaignId: current_campaign.id });
+                        added += res.added;
+                    }
+                    toast.success(`Added ${added.toLocaleString()} lead${added === 1 ? "" : "s"} back`);
+                } catch (err) {
+                    toast.error(buildError(err as AppError));
+                }
+            },
+        );
+    }
+    // A linked-segment chip scopes the list to that segment's leads; clicking
+    // the active one shows every lead again.
+    const activeSegmentId = searchProps.segment_ids?.length === 1 ? searchProps.segment_ids[0] : undefined;
+    const toggleSegmentScope = (id: string) =>
+        setSearchProps((s) => ({ ...s, segment_ids: activeSegmentId === id ? undefined : [id] }));
+    // The list's own scope with nothing narrowing it: what "clear filters"
+    // returns to, and what "everyone" means in the export dialog here.
+    const baseFilters = React.useMemo<SearchContacts>(
+        () => ({
+            ...scopeSearch({ campaignId: current_campaign?.id, segmentId: segment?.id }),
+            sort_by: searchProps.sort_by,
+            reverse: searchProps.reverse,
+        }),
+        [current_campaign, segment, searchProps.sort_by, searchProps.reverse],
+    );
+    const exportScope = React.useMemo<ExportScopeContext | undefined>(() => {
+        if (current_campaign) return { kind: "campaign", name: current_campaign.name, baseFilters };
+        if (segment) return { kind: "segment", name: segment.name, baseFilters };
+        return undefined;
+    }, [current_campaign, segment, baseFilters]);
+    const [filterResetToken, setFilterResetToken] = React.useState(0);
 
     // In a campaign, "remove" detaches the leads; the contacts themselves stay.
-    async function removeFromCampaign(ids: string[]) {
-        if (!current_campaign || ids.length === 0 || bulkUpdate.isPending) return;
+    async function removeFromCampaign(target: ContactSelection, count: number) {
+        if (!current_campaign || count === 0 || bulkUpdate.isPending) return;
         try {
-            await bulkUpdate.mutateAsync({
-                contacts: ids,
+            const updated = await bulkUpdate.mutateAsync({
+                ...target,
                 add_campaigns: [],
                 remove_campaigns: [current_campaign.id],
                 fields: [],
             });
-            toast.success(`Removed ${ids.length} lead${ids.length === 1 ? "" : "s"} from ${current_campaign.name}`);
-            setSelected((bef) => bef.filter((x) => !ids.includes(x)));
+            const n = updated.length || count;
+            toast.success(`Removed ${n.toLocaleString()} lead${n === 1 ? "" : "s"} from ${current_campaign.name}`);
+            clearSelection();
         } catch (err) {
             toast.error(buildError(err as AppError));
         }
@@ -210,17 +423,58 @@ export default function ContactsTable({
             (connectionsQuery.data?.connections ?? []).filter(
                 (c) =>
                     PUSHABLE_PROVIDERS.includes(c.provider) &&
-                    (c.status === "connected" || c.status === "degraded"),
+                    (c.status === "connected" || c.status === "degraded") &&
+                    // In provider mode contacts sync to that CRM on their own.
+                    !(isExternal && c.provider === crm.id),
+            ),
+        [connectionsQuery.data, isExternal, crm.id],
+    );
+
+    // Connected Apollo accounts the "Enrich" bulk action can use.
+    const startEnrich = useStartApolloEnrichment();
+    const apolloTargets = React.useMemo<IntegrationConnection[]>(
+        () =>
+            (connectionsQuery.data?.connections ?? []).filter(
+                (c) => c.provider === "apollo" && (c.status === "connected" || c.status === "degraded"),
             ),
         [connectionsQuery.data],
     );
 
+    function enrichWithApollo(connectionId: string, overwrite: boolean) {
+        if (selectionCount === 0 || startEnrich.isPending) return;
+        if (selectionCount > MAX_APOLLO_ENRICH) {
+            toast.error(`Apollo enrichment takes up to ${MAX_APOLLO_ENRICH.toLocaleString()} contacts at a time. Narrow the selection and try again.`);
+            return;
+        }
+        const n = selectionCount.toLocaleString();
+        confirm.show(
+            `Enrich ${n} contact${selectionCount === 1 ? "" : "s"} with Apollo? Apollo charges one credit for each person it finds. ${
+                overwrite ? "Fields that already have a value are replaced." : "Only empty fields are filled in."
+            }`,
+            async () => {
+                try {
+                    await startEnrich.mutateAsync({ connectionId, selection, overwrite });
+                    toast.success("Enrichment started. Progress is on the Apollo page.");
+                    clearSelection();
+                } catch (err) {
+                    toast.error(buildError(err as AppError));
+                    throw err;
+                }
+            },
+        );
+    }
+
     async function pushToCRM(connectionId: string, providerLabel: string) {
-        if (selected.length === 0 || pushContacts.isPending) return;
-        const ids = selected;
-        const t = toast.loading(`Pushing ${ids.length} to ${providerLabel}…`);
+        if (selectionCount === 0 || pushContacts.isPending) return;
+        // The push is a live call per contact against the CRM, so the server
+        // caps it; say so here instead of letting the request fail.
+        if (selectionCount > MAX_CRM_PUSH) {
+            toast.error(`Push to CRM takes up to ${MAX_CRM_PUSH.toLocaleString()} contacts at a time. Narrow the selection and try again.`);
+            return;
+        }
+        const t = toast.loading(`Pushing ${selectionCount.toLocaleString()} to ${providerLabel}…`);
         try {
-            const res = await pushContacts.mutateAsync({ connectionId, contact_ids: ids });
+            const res = await pushContacts.mutateAsync({ connectionId, ...selection });
             if (res.pushed === 0) {
                 toast.error(
                     `Couldn't push to ${providerLabel}${res.failed ? ` (${res.failed} failed)` : ""}`,
@@ -238,13 +492,43 @@ export default function ContactsTable({
 
     const contacts = contactsData.contacts;
     const total = contactsData.data?.pages[0]?.pagination.total ?? 0;
-    const filtered = React.useMemo(() => {
-        if (!contacts) return [];
-        if (subFilter === "all") return contacts;
-        return contacts.filter((c) =>
-            subFilter === "subscribed" ? c.subscribed : !c.subscribed,
-        );
-    }, [contacts, subFilter]);
+    const rows = React.useMemo(() => contacts ?? [], [contacts]);
+
+    // Optional-data columns (phone, company, custom fields) that no contact in
+    // this list has a value for step aside instead of showing a column of dashes.
+    const emptyColumns = React.useMemo(() => emptyColumnIds(view.columns, rows), [rows, view.columns]);
+    const tableColumns = React.useMemo(
+        () => view.columns.filter((col) => !emptyColumns.has(col.id)),
+        [view.columns, emptyColumns],
+    );
+
+    const viewControls = (
+        <>
+            <SortMenu sort={sortState} options={sortOptions(viewName)} customKeys={view.customKeys} onChange={changeSort} />
+            <ColumnChooser
+                visible={view.columns}
+                empty={emptyColumns}
+                available={view.available}
+                customized={view.customized}
+                onChange={view.setColumns}
+                onReset={resetView}
+            />
+        </>
+    );
+
+    // What every bulk action applies to, and how many contacts that is. In
+    // select-all mode the server resolves the filter, so the count here is the
+    // search total minus whatever was unticked after.
+    const loadedIDs = React.useMemo(() => rows.map((c) => c.id), [rows]);
+    const selection = React.useMemo<ContactSelection>(
+        () => rowSelection.toRequest(rowSel, searchOptions),
+        [rowSel, searchOptions],
+    );
+    const selectionCount = rowSelection.selectionCount(rowSel, total);
+    // Ticking every loaded row still leaves the rest of the match set behind;
+    // that gap is what the banner offers to close.
+    const loadedAllSelected = rowSelection.allLoadedSelected(rowSel, loadedIDs);
+    const canSelectAllMatching = rowSelection.canSelectAllMatching(rowSel, loadedIDs, total);
 
     // Prefer the server's org-wide facet counts (first page's `counts` block) so
     // the stat strip is accurate at scale. Before that lands, fall back to a
@@ -269,32 +553,21 @@ export default function ContactsTable({
         return stats;
     }, [serverCounts, contacts]);
 
-    const isSelectedAll = React.useMemo(() => {
-        if (!filtered.length) return false;
-        return filtered.every((v) => selected.includes(v.id));
-    }, [filtered, selected]);
+    const toggleAll = () => setRowSel((s) => rowSelection.toggleLoaded(s, loadedIDs));
+    const selectAllMatching = () => setRowSel(rowSelection.selectAllMatching());
 
-    function toggleAll() {
-        if (isSelectedAll) {
-            setSelected((bef) => bef.filter((id) => !filtered.some((c) => c.id === id)));
-        } else {
-            setSelected((bef) => Array.from(new Set([...bef, ...filtered.map((c) => c.id)])));
-        }
-    }
-
-    async function bulkDelete() {
-        if (selected.length === 0) return;
+    async function bulkDelete(target: ContactSelection, count: number) {
+        if (count === 0) return;
         try {
             confirm?.setLoading(true);
-            const ids = selected;
             try {
                 setDelete(true);
-                await toast.promise(contactsBulkDelete.mutateAsync(ids), {
-                    loading: `Deleting ${ids.length} contacts…`,
-                    success: "Contacts deleted",
+                await toast.promise(contactsBulkDelete.mutateAsync(target), {
+                    loading: `Deleting ${count.toLocaleString()} ${count === 1 ? "contact" : "contacts"}…`,
+                    success: count === 1 ? "Contact deleted" : "Contacts deleted",
                     error: (err: AppError) => buildError(err),
                 });
-                setSelected([]);
+                clearSelection();
             } finally {
                 setDelete(false);
             }
@@ -309,16 +582,21 @@ export default function ContactsTable({
     const batchResearch = useBatchResearch();
     const metered = useAiMetered();
     function bulkResearch() {
-        if (selected.length === 0) return;
-        const ids = selected;
+        if (selectionCount === 0) return;
+        if (selectionCount > MAX_RESEARCH_BATCH) {
+            toast.error(`Research takes up to ${MAX_RESEARCH_BATCH.toLocaleString()} contacts at a time. Narrow the selection and try again.`);
+            return;
+        }
         confirm?.show(
-            `Research ${ids.length} ${ids.length === 1 ? "contact" : "contacts"}? ${
-                metered ? `This uses up to ${ids.length * 2} AI credits and runs` : "This runs"
+            `Research ${selectionCount.toLocaleString()} ${selectionCount === 1 ? "contact" : "contacts"}? ${
+                metered
+                    ? `This uses up to ${(selectionCount * 2).toLocaleString()} AI credits and runs`
+                    : "This runs"
             } in the background.`,
             async () => {
-                const res = await batchResearch.mutateAsync({ contactIds: ids, objective: "" });
-                toast.success(`Queued research for ${res.queued} contacts`);
-                setSelected([]);
+                const res = await batchResearch.mutateAsync({ selection, objective: "" });
+                toast.success(`Queued research for ${res.queued.toLocaleString()} contacts`);
+                clearSelection();
             },
         );
     }
@@ -327,42 +605,84 @@ export default function ContactsTable({
     // updates live as its verdict lands; marking deliverable is immediate.
     const verification = useRequestContactVerification();
     function bulkVerify() {
-        if (selected.length === 0) return;
-        const ids = selected;
+        if (selectionCount === 0) return;
         confirm?.show(
-            `Re-verify ${ids.length} ${ids.length === 1 ? "address" : "addresses"}? Verdicts land in the background${
-                ids.length > 50 ? " over the next few minutes" : ""
+            `Re-verify ${selectionCount.toLocaleString()} ${selectionCount === 1 ? "address" : "addresses"}? Current verdicts stand until the new ones land in the background${
+                selectionCount > 50 ? " over the next few minutes" : ""
             }.`,
             async () => {
-                const res = await verification.mutateAsync({ contacts: ids, action: "verify" });
-                toast.success(`Re-checking ${res.affected} ${res.affected === 1 ? "address" : "addresses"}`);
-                setSelected([]);
+                const res = await verification.mutateAsync({ ...selection, action: "verify" });
+                const notice = reverifyNotice(res, "address", "addresses");
+                if (notice.warn) toast(notice.text, { icon: "⚠️" });
+                else toast.success(notice.text);
+                clearSelection();
             },
         );
     }
     function bulkMarkDeliverable() {
-        if (selected.length === 0) return;
-        const ids = selected;
+        if (selectionCount === 0) return;
         confirm?.show(
-            `Mark ${ids.length} ${ids.length === 1 ? "address" : "addresses"} deliverable? Campaigns will send to them even if verification refused them. Use this for a list you verified elsewhere.`,
+            `Mark ${selectionCount.toLocaleString()} ${selectionCount === 1 ? "address" : "addresses"} deliverable? Campaigns will send to them even if verification refused them. Use this for a list you verified elsewhere.`,
             async () => {
-                const res = await verification.mutateAsync({ contacts: ids, action: "mark_deliverable" });
-                toast.success(`${res.affected} marked deliverable`);
-                setSelected([]);
+                const res = await verification.mutateAsync({ ...selection, action: "mark_deliverable" });
+                toast.success(`${res.affected.toLocaleString()} marked deliverable`);
+                clearSelection();
             },
         );
     }
 
     const embedded = !!current_campaign;
+
+    // Per-lead hold. Pausing opens a dialog (a date, or no end at all);
+    // resuming is one call, so the row acts straight away.
+    const [pauseTarget, setPauseTarget] = React.useState<{ id: string; name: string } | null>(null);
+    const resumeLead = useResumeLead();
+    const resumeOne = React.useCallback(
+        (contactId: string, copied?: boolean) => {
+            if (!current_campaign) return;
+            const run = async () => {
+                try {
+                    await toast.promise(
+                        resumeLead.mutateAsync({ campaignId: current_campaign.id, contactId }),
+                        {
+                            loading: "Resuming lead…",
+                            success: "Lead resumed",
+                            error: (err: AppError) => buildError(err),
+                        },
+                    );
+                } catch {
+                    /* toast.promise already surfaced it */
+                }
+            };
+            if (copied) confirm.show(CC_RESUME_CONFIRM, run);
+            else void run();
+        },
+        [current_campaign, resumeLead, confirm],
+    );
+
     // Leads-view scope chips write straight into the search request, so the
     // rows, the total and pagination all come from the server for that scope.
-    const leadFilterActive = !!searchProps.lead_status || !!searchProps.engagement;
+    // Anything that narrows the list beyond its scope (the campaign or the
+    // segment): an empty result then means "nothing matches", not "no leads".
+    const narrowed = hasNarrowingFilters(searchProps, baseFilters);
     const setLeadStatus = (v: LeadStatus | undefined) =>
         setSearchProps((s) => ({ ...s, lead_status: s.lead_status === v ? undefined : v }));
     const setEngagement = (v: LeadEngagement | undefined) =>
         setSearchProps((s) => ({ ...s, engagement: s.engagement === v ? undefined : v }));
-    const clearLeadFilters = () =>
-        setSearchProps((s) => ({ ...s, lead_status: undefined, engagement: undefined }));
+    const clearLeadFilters = () => {
+        setSearchProps(baseFilters);
+        setFilterResetToken((n) => n + 1);
+    };
+    // Why a campaign with linked segments still has no leads, in one line;
+    // unknown while the links are still loading or failed to load.
+    const linkedEmptyReason =
+        current_campaign && campaignSegments.isSuccess && linkedSegments.length > 0
+            ? linksEmptyReason(linkedSegments)
+            : null;
+    const linksPending = !!current_campaign && campaignSegments.isPending;
+    const heldOutLinks = linkedSegments.filter((l) => l.held_out_count > 0);
+    const heldOut = heldOutLinks.reduce((n, l) => n + l.held_out_count, 0);
+    const canReenrol = heldOut > 0 && campaignWrite.allowed;
     const tableNode = (
         <ContactsTableBody
             embedded={embedded}
@@ -371,18 +691,30 @@ export default function ContactsTable({
             errorMessage={(contactsData.error as Error | undefined)?.message ?? "Request failed."}
             onRetry={() => contactsData.refetch()}
             isRefetching={contactsData.isFetching && !contactsData.isPending}
-            contacts={filtered}
-            selected={selected}
-            onToggle={(id, on) =>
-                setSelected((bef) => (on ? [...bef, id] : bef.filter((x) => x !== id)))
-            }
-            isSelectedAll={isSelectedAll}
+            contacts={rows}
+            columns={tableColumns}
+            sort={sortState}
+            onSort={sortByColumn}
+            isRowSelected={isRowSelected}
+            onToggle={(id, on) => setRowSel((s) => rowSelection.toggleRow(s, id, on))}
+            isSelectedAll={loadedAllSelected}
             onToggleAll={toggleAll}
+            banner={
+                <SelectAllBanner
+                    noun={current_campaign ? "lead" : segment ? "member" : "contact"}
+                    selectAll={rowSel.all}
+                    count={selectionCount}
+                    loadedCount={rows.length}
+                    total={total}
+                    canSelectAllMatching={canSelectAllMatching}
+                    onSelectAllMatching={selectAllMatching}
+                    onClear={clearSelection}
+                />
+            }
             onRowClick={openContact}
             onDelete={(id) =>
                 confirm?.show(`Delete this contact?`, async () => {
-                    setSelected([id]);
-                    await bulkDelete();
+                    await bulkDelete(selectionOf(id), 1);
                 })
             }
             onRemoveFromCampaign={
@@ -390,40 +722,68 @@ export default function ContactsTable({
                     ? (id) =>
                           confirm?.show(
                               "Remove this lead from the campaign? The contact stays in your workspace.",
-                              async () => removeFromCampaign([id]),
+                              async () => removeFromCampaign(selectionOf(id), 1),
                           )
                     : undefined
             }
+            onPauseLead={embedded && campaignWrite.allowed ? (id, name) => setPauseTarget({ id, name }) : undefined}
+            onResumeLead={embedded && campaignWrite.allowed ? resumeOne : undefined}
             emptyTitle={
                 subFilter !== "all"
                     ? `No ${subFilter} contacts`
-                    : leadFilterActive
-                        ? "No leads match"
-                        : current_campaign
-                            ? "No contacts in this campaign"
-                            : "No contacts yet"
+                    : narrowed
+                        ? current_campaign
+                            ? "No leads match"
+                            : "No contacts match"
+                        : linkedEmptyReason
+                            ? "No leads from your linked segments yet"
+                            : linksPending
+                                ? "No leads loaded yet"
+                                : current_campaign
+                                    ? "No contacts in this campaign"
+                                : segment
+                                    ? "No contacts in this segment"
+                                    : "No contacts yet"
             }
             emptyBody={
                 subFilter !== "all"
                     ? "Switch to All to see the full list."
-                    : leadFilterActive
-                        ? "Clear the status or engagement filter to see every lead."
-                        : current_campaign
-                            ? "Pick people from your contacts, import a file, or add one by hand."
-                            : "Add or upload contacts to get started."
+                    : narrowed
+                        ? `Clear the filters to see every ${current_campaign ? "lead" : "contact"}.`
+                        : linkedEmptyReason
+                            ? linkedEmptyReason
+                            : linksPending
+                                ? "Checking the campaign's linked segments…"
+                                : current_campaign
+                                    ? campaignSegments.isError
+                                        ? "Pick people from your contacts, import a file, or add one by hand. The linked segments could not be loaded."
+                                        : "Pick people from your contacts, link a segment, import a file, or add one by hand."
+                                : segment
+                                    ? "Nothing matches it yet. Pin people in from your contacts, import a file, or add one by hand."
+                                    : "Add or upload contacts to get started."
             }
             emptyCta={
                 subFilter !== "all" ? (
                     <TopbarAction variant="ghost" onClick={() => setSubFilter("all")}>
                         Show all
                     </TopbarAction>
-                ) : leadFilterActive ? (
+                ) : narrowed ? (
                     <TopbarAction variant="ghost" onClick={clearLeadFilters}>
-                        Show all leads
+                        {current_campaign ? "Show all leads" : "Clear filters"}
                     </TopbarAction>
-                ) : current_campaign ? (
-                    <div className="flex items-center justify-center gap-1.5">
+                ) : linksPending ? null : current_campaign ? (
+                    <div className="flex flex-wrap items-center justify-center gap-1.5">
+                        {canReenrol && (
+                            <TopbarAction
+                                icon={<UserPlusIcon className="w-3 h-3" />}
+                                onClick={() => reenrolSegments(heldOutLinks)}
+                                disabled={reenrol.isPending}
+                            >
+                                Add {heldOut.toLocaleString()} back
+                            </TopbarAction>
+                        )}
                         <TopbarAction
+                            variant={canReenrol ? "ghost" : "primary"}
                             icon={<UsersIcon className="w-3 h-3" />}
                             onClick={() => setFromContactsOpen(true)}
                         >
@@ -434,7 +794,7 @@ export default function ContactsTable({
                             icon={<LayersIcon className="w-3 h-3" />}
                             onClick={() => campaignWrite.guard(() => setFromSegmentOpen(true))({})}
                         >
-                            Link a segment
+                            {linkedSegments.length > 0 || campaignSegments.isError ? "Manage segments" : "Link a segment"}
                         </TopbarAction>
                         <TopbarAction
                             variant="ghost"
@@ -442,6 +802,29 @@ export default function ContactsTable({
                             onClick={() => setImportOpen(true)}
                         >
                             Import file
+                        </TopbarAction>
+                    </div>
+                ) : segment ? (
+                    <div className="flex flex-wrap items-center justify-center gap-1.5">
+                        <TopbarAction
+                            icon={<UsersIcon className="w-3 h-3" />}
+                            onClick={() => setFromContactsOpen(true)}
+                        >
+                            Add contacts
+                        </TopbarAction>
+                        <TopbarAction
+                            variant="ghost"
+                            icon={<UploadIcon className="w-3 h-3" />}
+                            onClick={() => setImportOpen(true)}
+                        >
+                            Import file
+                        </TopbarAction>
+                        <TopbarAction
+                            variant="ghost"
+                            icon={<UserPlusIcon className="w-3 h-3" />}
+                            onClick={() => setNewOpen(true)}
+                        >
+                            New contact
                         </TopbarAction>
                     </div>
                 ) : (
@@ -456,6 +839,9 @@ export default function ContactsTable({
             hasNextPage={!!contactsData.hasNextPage}
             isFetchingNextPage={contactsData.isFetchingNextPage}
             onLoadMore={() => contactsData.fetchNextPage()}
+            nextPageFailed={contactsData.isFetchNextPageError}
+            loadedCount={contacts?.length ?? 0}
+            totalCount={total}
         />
     );
 
@@ -469,6 +855,7 @@ export default function ContactsTable({
                         placeholder="Search leads…"
                         className="w-full sm:w-56"
                     />
+                    {viewControls}
                     <TopbarAction
                         variant="ghost"
                         icon={<LayersIcon className="w-3 h-3" />}
@@ -491,6 +878,15 @@ export default function ContactsTable({
                     >
                         Import
                     </TopbarAction>
+                    {isExternal && (
+                        <TopbarAction
+                            variant="ghost"
+                            icon={<CrmMark provider={crm.id} className="w-3 h-3" />}
+                            onClick={() => setCrmImportOpen(true)}
+                        >
+                            From {crm.name}
+                        </TopbarAction>
+                    )}
                     <TopbarAction
                         variant="ghost"
                         icon={<SheetIcon className="w-3 h-3" />}
@@ -499,16 +895,33 @@ export default function ContactsTable({
                         Sheet sync
                     </TopbarAction>
                     <TopbarAction
+                        variant="ghost"
+                        icon={<DownloadIcon className="w-3 h-3" />}
+                        onClick={() => setExportOpen(true)}
+                    >
+                        Export
+                    </TopbarAction>
+                    <TopbarAction
                         icon={<UserPlusIcon className="w-3 h-3" />}
                         onClick={() => setNewOpen(true)}
                     >
                         Add lead
                     </TopbarAction>
                 </SectionBar>
+                <LinkedSegmentsStrip
+                    links={linkedSegments}
+                    activeSegmentId={activeSegmentId}
+                    onToggle={toggleSegmentScope}
+                    onManage={() => campaignWrite.guard(() => setFromSegmentOpen(true))({})}
+                    onReenrol={campaignWrite.allowed ? (l) => reenrolSegments([l]) : undefined}
+                    reenrolling={reenrolling}
+                />
                 <FilterBar
+                    browseName={browseName}
                     filters={searchProps}
                     setFilters={setSearchProps}
                     activeCampaign={current_campaign}
+                    resetToken={filterResetToken}
                     total={total}
                     loading={contactsData.isFetching}
                     onSaveAsSegment={saveAsSegment}
@@ -525,11 +938,14 @@ export default function ContactsTable({
                 />
                 {tableNode}
                 <SelectionBar
-                    count={selected.length}
+                    count={selectionCount}
                     deleting={del}
                     pushTargets={pushTargets}
                     pushing={pushContacts.isPending}
                     onPush={pushToCRM}
+                    apolloTargets={apolloTargets}
+                    enriching={startEnrich.isPending}
+                    onEnrich={enrichWithApollo}
                     onBulkEdit={() => setBulkEdit(true)}
                     onResearch={bulkResearch}
                     researching={batchResearch.isPending}
@@ -538,20 +954,20 @@ export default function ContactsTable({
                     verifying={verification.isPending}
                     onDelete={() =>
                         confirm?.show(
-                            `Are you sure you want to delete ${selected.length} contacts?`,
-                            bulkDelete,
+                            deletePrompt(selectionCount),
+                            () => bulkDelete(selection, selectionCount),
                         )
                     }
-                    onClear={() => setSelected([])}
-                    selected={selected}
+                    onClear={clearSelection}
+                    selection={selection}
                     segment={segment}
                     onExclude={excludeFromSegment}
                     excluding={segmentMembers.isPending}
                     campaign={current_campaign}
                     onRemoveFromCampaign={() =>
                         confirm?.show(
-                            `Remove ${selected.length} lead${selected.length === 1 ? "" : "s"} from this campaign? The contacts stay in your workspace.`,
-                            async () => removeFromCampaign(selected),
+                            `Remove ${selectionCount.toLocaleString()} lead${selectionCount === 1 ? "" : "s"} from this campaign? The contacts stay in your workspace.`,
+                            async () => removeFromCampaign(selection, selectionCount),
                         )
                     }
                     removing={bulkUpdate.isPending}
@@ -564,9 +980,19 @@ export default function ContactsTable({
                 <ContactsEditBulk
                     active={bulkEdit}
                     setActive={setBulkEdit}
-                    selected={selected}
+                    selection={selection}
+                    count={selectionCount}
+                    onDone={clearSelection}
                     scope={current_campaign ? { kind: "campaign", name: current_campaign.name } : undefined}
                 />
+                {current_campaign && (
+                    <PauseLeadDialog
+                        open={!!pauseTarget}
+                        onClose={() => setPauseTarget(null)}
+                        campaign={current_campaign}
+                        lead={pauseTarget}
+                    />
+                )}
                 <NewContactDialog open={newOpen} onClose={() => setNewOpen(false)} campaign={current_campaign} />
                 <SyncSourcesPanel
                     open={syncOpen}
@@ -575,9 +1001,20 @@ export default function ContactsTable({
                 />
                 <ImportWizard
                     open={importOpen}
-                    onClose={() => setImportOpen(false)}
+                    onClose={closeImport}
                     lockedCampaign={current_campaign}
+                    initialImportId={importId}
+                    initialStep={importStep}
+                    onRoute={routeImport}
                 />
+                {isExternal && (
+                    <CrmImportDialog
+                        open={crmImportOpen}
+                        onClose={() => setCrmImportOpen(false)}
+                        onContinue={continueImport}
+                        target={current_campaign ? `Adding to ${current_campaign.name}` : undefined}
+                    />
+                )}
                 <AddFromContactsDialog
                     open={fromContactsOpen}
                     onClose={() => setFromContactsOpen(false)}
@@ -587,6 +1024,14 @@ export default function ContactsTable({
                     open={fromSegmentOpen}
                     onClose={() => setFromSegmentOpen(false)}
                     campaign={current_campaign}
+                />
+                <ExportDialog
+                    open={exportOpen}
+                    onClose={() => setExportOpen(false)}
+                    filters={searchOptions}
+                    selectedIds={rowSel.all ? [] : rowSel.ids}
+                    totalKnown={total}
+                    scopeContext={exportScope}
                 />
             </>
         );
@@ -615,6 +1060,12 @@ export default function ContactsTable({
                         Add contacts
                     </TopbarAction>
                 )}
+                <RunningImportChip
+                    onOpen={(id) => {
+                        setImportId(id);
+                        setImportOpen(true);
+                    }}
+                />
                 <div className="hidden md:contents">
                     <TopbarAction
                         variant="ghost"
@@ -623,6 +1074,15 @@ export default function ContactsTable({
                     >
                         Import
                     </TopbarAction>
+                    {isExternal && (
+                        <TopbarAction
+                            variant="ghost"
+                            icon={<CrmMark provider={crm.id} className="w-3 h-3" />}
+                            onClick={() => setCrmImportOpen(true)}
+                        >
+                            Import from {crm.name}
+                        </TopbarAction>
+                    )}
                     <TopbarAction
                         variant="ghost"
                         icon={<SheetIcon className="w-3 h-3" />}
@@ -650,6 +1110,14 @@ export default function ContactsTable({
                             <PopoverMenuItem onSelect={() => setImportOpen(true)}>
                                 Import
                             </PopoverMenuItem>
+                            {isExternal && (
+                                <PopoverMenuItem
+                                    icon={<CrmMark provider={crm.id} className="w-3.5 h-3.5" />}
+                                    onSelect={() => setCrmImportOpen(true)}
+                                >
+                                    Import from {crm.name}
+                                </PopoverMenuItem>
+                            )}
                             <PopoverMenuItem onSelect={() => setSyncOpen(true)}>
                                 Sheet sync
                             </PopoverMenuItem>
@@ -697,7 +1165,7 @@ export default function ContactsTable({
 
             <SectionBar
                 label={segment ? "Segment members" : subFilter === "all" ? "All contacts" : `${subFilter[0].toUpperCase()}${subFilter.slice(1)}`}
-                count={filtered.length}
+                count={total}
             >
                 <SearchInput
                     value={searchProps.query}
@@ -705,51 +1173,15 @@ export default function ContactsTable({
                     placeholder="Search by name, email, company…"
                     className="w-full sm:w-72"
                 />
-                <PopoverMenu align="end">
-                    <PopoverMenuTrigger asChild>
-                        <SelectButton
-                            icon={<Settings2Icon className="w-3.5 h-3.5" />}
-                            label="Sort"
-                        />
-                    </PopoverMenuTrigger>
-                    <PopoverMenuContent>
-                        <PopoverMenuLabel>Sort by</PopoverMenuLabel>
-                        {[
-                            ["created_at", "Date added"],
-                            ["email", "Email"],
-                            ["first_name", "First name"],
-                            ["last_name", "Last name"],
-                            ["company", "Company"],
-                        ].map(([key, label]) => (
-                            <PopoverMenuItem
-                                key={key}
-                                selected={searchProps.sort_by === key}
-                                onSelect={() =>
-                                    setSearchProps((s) => ({
-                                        ...s,
-                                        sort_by: key as SearchContacts["sort_by"],
-                                    }))
-                                }
-                            >
-                                {label}
-                            </PopoverMenuItem>
-                        ))}
-                        <PopoverMenuSeparator />
-                        <PopoverMenuItem
-                            selected={searchProps.reverse}
-                            onSelect={() => setSearchProps((s) => ({ ...s, reverse: !s.reverse }))}
-                            closeOnSelect={false}
-                        >
-                            Reverse order
-                        </PopoverMenuItem>
-                    </PopoverMenuContent>
-                </PopoverMenu>
+                {viewControls}
             </SectionBar>
 
             <FilterBar
+                browseName={browseName}
                 filters={searchProps}
                 setFilters={setSearchProps}
                 hideSegments={!!segment}
+                resetToken={filterResetToken}
                 total={total}
                 loading={contactsData.isFetching}
                 onSaveAsSegment={saveAsSegment}
@@ -760,11 +1192,14 @@ export default function ContactsTable({
             </PageBody>
 
             <SelectionBar
-                count={selected.length}
+                count={selectionCount}
                 deleting={del}
                 pushTargets={pushTargets}
                 pushing={pushContacts.isPending}
                 onPush={pushToCRM}
+                apolloTargets={apolloTargets}
+                enriching={startEnrich.isPending}
+                onEnrich={enrichWithApollo}
                 onBulkEdit={() => setBulkEdit(true)}
                 onResearch={bulkResearch}
                 researching={batchResearch.isPending}
@@ -773,30 +1208,30 @@ export default function ContactsTable({
                 verifying={verification.isPending}
                 onDelete={() =>
                     confirm?.show(
-                        `Are you sure you want to delete ${selected.length} contacts?`,
-                        bulkDelete,
+                        deletePrompt(selectionCount),
+                        () => bulkDelete(selection, selectionCount),
                     )
                 }
-                onClear={() => setSelected([])}
-                selected={selected}
+                onClear={clearSelection}
+                selection={selection}
                 segment={segment}
                 onExclude={excludeFromSegment}
                 excluding={segmentMembers.isPending}
             />
 
-            {filtered.length === 0 && !contactsData.isPending ? null : null}
-
             <SegmentEditor
                 open={segmentPreset !== null}
                 onClose={() => setSegmentPreset(null)}
                 preset={segmentPreset}
-                onSaved={(saved) => navigate(`/app/contacts/segments/${saved.id}`)}
+                onSaved={(saved) => navigate({ to: "/app/contacts/segments/$id", params: { id: saved.id } })}
             />
             <ContactEdit contacts={contacts ?? []} active={edit} setActive={setEdit} initialTab={editTab} />
             <ContactsEditBulk
                 active={bulkEdit}
                 setActive={setBulkEdit}
-                selected={selected}
+                selection={selection}
+                count={selectionCount}
+                onDone={clearSelection}
                 scope={segment ? { kind: "segment", name: segment.name } : undefined}
             />
             <NewContactDialog open={newOpen} onClose={() => setNewOpen(false)} segment={segment} />
@@ -810,15 +1245,28 @@ export default function ContactsTable({
             <ExportDialog
                 open={exportOpen}
                 onClose={() => setExportOpen(false)}
-                filters={searchProps}
-                selectedIds={selected}
+                filters={searchOptions}
+                selectedIds={rowSel.all ? [] : rowSel.ids}
                 totalKnown={total}
+                scopeContext={exportScope}
             />
             <ImportWizard
                 open={importOpen}
-                onClose={() => setImportOpen(false)}
+                onClose={closeImport}
+                lockedSegment={segment}
+                initialImportId={importId}
+                initialStep={importStep}
+                onRoute={routeImport}
             />
-            <SyncSourcesPanel open={syncOpen} onClose={() => setSyncOpen(false)} />
+            {isExternal && (
+                <CrmImportDialog
+                    open={crmImportOpen}
+                    onClose={() => setCrmImportOpen(false)}
+                    onContinue={continueImport}
+                    target={segment ? `Adding to ${segment.name}` : undefined}
+                />
+            )}
+            <SyncSourcesPanel open={syncOpen} onClose={() => setSyncOpen(false)} segment={segment} />
         </Page>
     );
 }
@@ -831,19 +1279,28 @@ function ContactsTableBody({
     onRetry,
     isRefetching,
     contacts,
-    selected,
+    columns,
+    sort,
+    onSort,
+    isRowSelected,
     onToggle,
     isSelectedAll,
     onToggleAll,
+    banner,
     onRowClick,
     onDelete,
     onRemoveFromCampaign,
+    onPauseLead,
+    onResumeLead,
     emptyTitle,
     emptyBody,
     emptyCta,
     hasNextPage,
     isFetchingNextPage,
     onLoadMore,
+    nextPageFailed,
+    loadedCount,
+    totalCount,
 }: {
     embedded?: boolean;
     isLoading: boolean;
@@ -851,41 +1308,41 @@ function ContactsTableBody({
     errorMessage: string;
     onRetry: () => void;
     isRefetching: boolean;
-    contacts: {
-        id: string;
-        first_name: string;
-        last_name: string;
-        email: string;
-        company: string;
-        phone: string;
-        subscribed: boolean;
-        campaigns: { id: string }[];
-        categories?: { id: string; title: string; color: string }[];
-        campaign_lead?: ContactCampaignProgress | null;
-        verification_status?: VerificationStatus;
-        verification_sub_status?: string;
-        verification_source?: VerificationSource;
-        verification_provider?: string;
-        verification_checked_at?: string | null;
-        verification_confidence?: number;
-        created_at: Date;
-    }[];
-    selected: string[];
+    contacts: ContactRow[];
+    // The saved view: the columns in order (Name first) and the current sort.
+    columns: ContactColumn[];
+    sort: ViewSortState;
+    onSort: (col: ContactColumn) => void;
+    isRowSelected: (id: string) => boolean;
     onToggle: (id: string, on: boolean) => void;
     isSelectedAll: boolean;
     onToggleAll: () => void;
+    // Sits between the header and the rows: "select all N matching".
+    banner: React.ReactNode;
     onRowClick: (id: string, tab?: ContactSlideTab) => void;
     onDelete: (id: string) => void;
     // In a campaign, the row's destructive action detaches the lead instead
     // of deleting the contact from the whole workspace.
     onRemoveFromCampaign?: (id: string) => void;
+    // The per-lead hold, in the campaign Leads view only. Undefined for a
+    // member without campaign write access, which takes the control off the
+    // row rather than offering one that fails.
+    onPauseLead?: (id: string, name: string) => void;
+    onResumeLead?: (id: string, copied?: boolean) => void;
     emptyTitle: string;
     emptyBody: string;
     emptyCta: React.ReactNode;
     hasNextPage: boolean;
     isFetchingNextPage: boolean;
     onLoadMore: () => void;
+    // Whether the failure was the next page rather than a refetch of the whole
+    // list, which decides what "Try again" runs.
+    nextPageFailed: boolean;
+    // How far through the list we are, so "Load more" says how much is left.
+    loadedCount: number;
+    totalCount: number;
 }) {
+
     if (isLoading) {
         return (
             <div className="divide-y divide-slate-200/60">
@@ -901,7 +1358,11 @@ function ContactsTableBody({
             </div>
         );
     }
-    if (isError) {
+    // A page that fails once rows are loaded is reported in the footer instead;
+    // throwing away 500 loaded leads because page 13 failed is worse than the
+    // failure. The count is of rows LOADED, not of rows left after the
+    // client-side subscription filter, which can hide all of them.
+    if (isError && loadedCount === 0) {
         return (
             <div className="px-5 py-12 text-center">
                 <div className="mx-auto mb-3 size-8 rounded-md bg-red-50 text-red-600 flex items-center justify-center">
@@ -936,45 +1397,94 @@ function ContactsTableBody({
             </div>
         );
     }
+    // "Try again" runs the request that actually failed: the page that did not
+    // arrive, or a refetch of the whole list when it was the refetch that broke.
+    const retry = nextPageFailed ? onLoadMore : onRetry;
+    const retrying = nextPageFailed ? isFetchingNextPage : isRefetching;
+    const footer = isError ? (
+        <div className="px-5 py-3 flex flex-col items-center gap-2 border-t border-slate-200/60">
+            <p className="text-[11.5px] text-slate-500 text-center max-w-[52ch] leading-relaxed">
+                <AlertTriangleIcon className="w-3 h-3 inline-block mr-1 -mt-px text-red-500" />
+                {errorMessage}
+            </p>
+            <button
+                type="button"
+                onClick={retry}
+                disabled={retrying}
+                className="h-7 px-3 rounded-md border border-slate-200 hover:border-slate-300 text-[12px] text-slate-700 hover:text-slate-900 inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
+            >
+                {retrying ? (
+                    <Loader2Icon className="w-3 h-3 animate-spin" />
+                ) : (
+                    <RefreshCcwIcon className="w-3 h-3" />
+                )}
+                Try again
+            </button>
+        </div>
+    ) : hasNextPage ? (
+        <div className="px-5 py-3 flex justify-center border-t border-slate-200/60">
+            <button
+                onClick={onLoadMore}
+                disabled={isFetchingNextPage}
+                className="h-7 px-3 rounded-md border border-slate-200 hover:border-slate-300 text-[12px] text-slate-700 hover:text-slate-900 inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
+            >
+                {isFetchingNextPage ? (
+                    <>
+                        <Loader2Icon className="w-3 h-3 animate-spin" />
+                        Loading…
+                    </>
+                ) : (
+                    <>
+                        <PlusIcon className="w-3 h-3" />
+                        Load more
+                        {totalCount > loadedCount && (
+                            <span className="text-slate-400">
+                                · {loadedCount.toLocaleString()} of {totalCount.toLocaleString()}
+                            </span>
+                        )}
+                    </>
+                )}
+            </button>
+        </div>
+    ) : null;
+
+    // Rows are loaded but the sub-filter hides all of them: still say so, and
+    // still surface a failed page rather than swallowing it.
     if (contacts.length === 0) {
-        return <EmptyBlock title={emptyTitle} body={emptyBody} cta={emptyCta} />;
+        return (
+            <>
+                <EmptyBlock title={emptyTitle} body={emptyBody} cta={emptyCta} />
+                {footer}
+            </>
+        );
     }
     return (
         <>
-            <table className="w-full text-left">
+            {banner}
+            {/* table-fixed, not auto: under auto layout one long company name
+                sets its column's min-content and widens the table past the
+                panel, which is what put a horizontal scrollbar under the list
+                (issue #461). So every column carries a width and every cell
+                clips; content that overflows a cell still extends the scroll
+                container. */}
+            <table className="w-full table-fixed text-left">
                 <thead className="sticky top-0 bg-white z-[1]">
                     <tr className="border-b border-slate-200">
-                        <th className="pl-5 pr-2 py-2 w-9">
-                            <input
-                                type="checkbox"
-                                className="w-3.5 h-3.5 rounded accent-sky-600"
+                        <th className="pl-5 pr-2 py-2 w-11">
+                            <Checkbox
                                 checked={isSelectedAll}
                                 onChange={onToggleAll}
                             />
                         </th>
-                        <Th className="max-w-0 w-full md:max-w-none md:w-auto">Name</Th>
-                        <Th className="hidden md:table-cell">Company</Th>
-                        <Th className="hidden lg:table-cell">Phone</Th>
-                        <Th className="w-auto md:w-32">{embedded ? "Progress" : "Status"}</Th>
-                        {embedded && (
-                            <>
-                                <Th className="w-16 hidden md:table-cell">Opened</Th>
-                                <Th className="w-16 hidden md:table-cell">Clicked</Th>
-                                <Th className="w-16 hidden md:table-cell">Replied</Th>
-                            </>
-                        )}
-                        {embedded ? (
-                            <Th className="w-28 hidden md:table-cell">Current step</Th>
-                        ) : (
-                            <Th className="w-24 text-right hidden md:table-cell">Campaigns</Th>
-                        )}
-                        <Th className="w-24 text-right hidden md:table-cell">{embedded ? "Last activity" : "Added"}</Th>
-                        <th className="px-3 py-2 w-12"></th>
+                        {columns.map((col) => (
+                            <Th key={col.id} col={col} sort={sort} onSort={onSort} />
+                        ))}
+                        <th className="px-3 py-2 w-[76px]"></th>
                     </tr>
                 </thead>
                 <tbody>
                     {contacts.map((c) => {
-                        const isSel = selected.includes(c.id);
+                        const isSel = isRowSelected(c.id);
                         const name =
                             (c.first_name || c.last_name)
                                 ? `${c.first_name ?? ""} ${c.last_name ?? ""}`.trim()
@@ -989,6 +1499,15 @@ function ContactsTableBody({
                             (lead.status === "replied" ||
                                 lead.status === "bounced" ||
                                 lead.status === "unsubscribed");
+                        // A lead routing will never offer again cannot be
+                        // held: pausing it would report success and change
+                        // nothing on the row.
+                        const terminal =
+                            processed ||
+                            (!!lead &&
+                                (lead.status === "failed" ||
+                                    lead.status === "completed" ||
+                                    lead.status === "undeliverable"));
                         const isActiveLead = embedded && lead?.status === "active";
                         return (
                             <tr
@@ -1008,137 +1527,43 @@ function ContactsTableBody({
                                     className="pl-5 pr-2"
                                     onClick={(e) => e.stopPropagation()}
                                 >
-                                    <input
-                                        type="checkbox"
-                                        className="w-3.5 h-3.5 rounded accent-sky-600"
+                                    <Checkbox
                                         checked={isSel}
                                         onChange={() => onToggle(c.id, !isSel)}
                                     />
                                 </td>
-                                <td className="px-3 max-w-0 w-full md:max-w-none md:w-auto">
-                                    <div className="flex items-center gap-2.5 min-w-0">
-                                        <div className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center shrink-0">
-                                            <span className="text-[9.5px] font-semibold text-slate-600">
-                                                {(c.first_name || c.email)?.slice(0, 2).toUpperCase()}
-                                            </span>
-                                        </div>
-                                        <div className="min-w-0">
-                                            <div className={`text-[12.5px] font-medium truncate leading-tight flex items-center gap-1.5 ${processed ? "text-slate-400" : "text-slate-900"}`}>
-                                                <span className="truncate">{name}</span>
-                                                {c.categories && c.categories.length > 0 && (
-                                                    <span className="inline-flex items-center gap-0.5 shrink-0">
-                                                        {c.categories.slice(0, 2).map((cat) => (
-                                                            <CategoryChip key={cat.id} category={cat} compact />
-                                                        ))}
-                                                        {c.categories.length > 2 && (
-                                                            <span
-                                                                className="inline-flex items-center h-4 px-1 rounded text-[10px] font-medium bg-slate-100 text-slate-500"
-                                                                title={c.categories.slice(2).map((x) => x.title).join(", ")}
-                                                            >
-                                                                +{c.categories.length - 2}
-                                                            </span>
-                                                        )}
-                                                    </span>
-                                                )}
-                                            </div>
-                                            <div className="text-[10.5px] text-slate-400 truncate font-mono leading-tight flex items-center gap-1">
-                                                <MailIcon className="w-2.5 h-2.5 shrink-0" />
-                                                <span className="truncate">{c.email}</span>
-                                                <VerificationBadge contact={c} />
-                                            </div>
-                                        </div>
-                                    </div>
-                                </td>
-                                <td className="px-3 text-[12px] text-slate-600 truncate hidden md:table-cell">
-                                    {c.company ? (
-                                        <span className="inline-flex items-center gap-1.5">
-                                            <Building2Icon className="w-3 h-3 text-slate-400" />
-                                            {c.company}
-                                        </span>
-                                    ) : (
-                                        <span className="text-slate-300">—</span>
-                                    )}
-                                </td>
-                                <td className="px-3 text-[12px] text-slate-600 truncate hidden lg:table-cell font-mono">
-                                    {c.phone ? (
-                                        <span className="inline-flex items-center gap-1.5">
-                                            <PhoneIcon className="w-3 h-3 text-slate-400" />
-                                            {c.phone}
-                                        </span>
-                                    ) : (
-                                        <span className="text-slate-300">—</span>
-                                    )}
-                                </td>
-                                <td className="px-3">
-                                    {embedded ? (
-                                        <LeadStatusPill lead={lead} />
-                                    ) : (
-                                        <StatusPill subscribed={c.subscribed} />
-                                    )}
-                                </td>
-                                {embedded && (
-                                    <>
-                                        <EngagementCell
-                                            n={lead?.opened ?? 0}
-                                            sent={(lead?.sent ?? 0) > 0}
-                                            Icon={MailOpenIcon}
-                                            label="opened"
-                                            auto={(lead?.machine_opened ?? 0) > 0}
-                                        />
-                                        <EngagementCell
-                                            n={lead?.clicked ?? 0}
-                                            sent={(lead?.sent ?? 0) > 0}
-                                            Icon={MousePointerClickIcon}
-                                            label="clicked"
-                                        />
-                                        <EngagementCell
-                                            n={lead?.replied ?? 0}
-                                            sent={(lead?.sent ?? 0) > 0}
-                                            Icon={CornerUpLeftIcon}
-                                            label="replied"
-                                        />
-                                    </>
-                                )}
-                                {embedded ? (
-                                    <td className="px-3 hidden md:table-cell">
-                                        {lead?.current_step ? (
-                                            <span
-                                                title={lead.current_step}
-                                                className={`inline-flex items-center h-5 px-1.5 rounded text-[11px] font-medium max-w-[108px] ${
-                                                    processed
-                                                        ? "bg-slate-100 text-slate-400"
-                                                        : "bg-sky-100 text-sky-700"
-                                                }`}
-                                            >
-                                                <span className="truncate">{lead.current_step}</span>
-                                            </span>
-                                        ) : (
-                                            <span className="text-[11px] text-slate-300">Not started</span>
-                                        )}
+                                {columns.map((col) => (
+                                    <td
+                                        key={col.id}
+                                        className={`px-3 overflow-hidden ${columnClass(col)} ${col.cellClassName ?? ""}`}
+                                    >
+                                        {col.cell({ c, lead, processed: !!processed, embedded: !!embedded })}
                                     </td>
-                                ) : (
-                                    <td className="px-3 text-right font-mono text-[12px] text-slate-600 tabular-nums hidden md:table-cell">
-                                        {c.campaigns?.length ?? 0}
-                                    </td>
-                                )}
-                                <td className="px-3 text-right font-mono text-[11px] text-slate-500 tabular-nums hidden md:table-cell">
-                                    {embedded
-                                        ? lead?.last_activity_at
-                                            ? new Date(lead.last_activity_at).toLocaleDateString("en-US", {
-                                                  month: "short",
-                                                  day: "numeric",
-                                              })
-                                            : "—"
-                                        : c.created_at
-                                            ? new Date(c.created_at).toLocaleDateString("en-US", {
-                                                  month: "short",
-                                                  day: "numeric",
-                                              })
-                                            : "—"}
-                                </td>
+                                ))}
                                 <td className="px-3" onClick={(e) => e.stopPropagation()}>
                                     {/* Touch-safe: always visible on mobile, hover-reveal on desktop. */}
                                     <div className="flex items-center gap-0.5 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
+                                        {lead?.hold && onResumeLead ? (
+                                            <button
+                                                type="button"
+                                                aria-label="Resume lead"
+                                                title={`${holdSummary(lead.hold)}. Resume now`}
+                                                onClick={() => onResumeLead(c.id, lead.hold?.source === "cc")}
+                                                className="size-6 rounded text-violet-500 hover:text-violet-700 hover:bg-violet-50 flex items-center justify-center transition-colors"
+                                            >
+                                                <PlayIcon className="w-3 h-3" />
+                                            </button>
+                                        ) : onPauseLead && !terminal ? (
+                                            <button
+                                                type="button"
+                                                aria-label="Pause lead"
+                                                title="Pause this lead until a date, without unsubscribing them"
+                                                onClick={() => onPauseLead(c.id, name)}
+                                                className="size-6 rounded text-slate-400 hover:text-violet-600 hover:bg-violet-50 flex items-center justify-center transition-colors"
+                                            >
+                                                <PauseIcon className="w-3 h-3" />
+                                            </button>
+                                        ) : null}
                                         {onRemoveFromCampaign ? (
                                             <button
                                                 type="button"
@@ -1173,142 +1598,33 @@ function ContactsTableBody({
                     })}
                 </tbody>
             </table>
-            {hasNextPage && (
-                <div className="px-5 py-3 flex justify-center border-t border-slate-200/60">
-                    <button
-                        onClick={onLoadMore}
-                        disabled={isFetchingNextPage}
-                        className="h-7 px-3 rounded-md border border-slate-200 hover:border-slate-300 text-[12px] text-slate-700 hover:text-slate-900 inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
-                    >
-                        {isFetchingNextPage ? (
-                            <>
-                                <Loader2Icon className="w-3 h-3 animate-spin" />
-                                Loading…
-                            </>
-                        ) : (
-                            <>
-                                <PlusIcon className="w-3 h-3" />
-                                Load more
-                            </>
-                        )}
-                    </button>
-                </div>
-            )}
+            {footer}
         </>
     );
 }
 
-function Th({ children, className }: { children: React.ReactNode; className?: string }) {
+// A header cell. A sortable column's header is the sort control: the arrow
+// shows on hover, and stays while the column is the active sort.
+function Th({ col, sort, onSort }: { col: ContactColumn; sort: ViewSortState; onSort: (col: ContactColumn) => void }) {
+    const base = `px-3 py-2 text-[10px] font-medium text-slate-400 uppercase tracking-[0.14em] truncate ${columnClass(col)}`;
+    const content = col.header ?? col.label;
+    if (!col.sortKey) return <th className={base}>{content}</th>;
+    const active = sort.by === col.sortKey;
+    const Dir = sort.reverse ? ArrowUpIcon : ArrowDownIcon;
     return (
-        <th
-            className={`px-3 py-2 text-[10px] font-medium text-slate-400 uppercase tracking-[0.14em] ${className ?? ""}`}
-        >
-            {children}
+        <th className={base} aria-sort={active ? (sort.reverse ? "ascending" : "descending") : "none"}>
+            <button
+                type="button"
+                onClick={() => onSort(col)}
+                title={`Sort by ${col.label}`}
+                className={`group/th inline-flex items-center gap-1 max-w-full uppercase tracking-[0.14em] hover:text-slate-700 transition-colors ${
+                    active ? "text-slate-700" : ""
+                } ${col.align === "right" ? "flex-row-reverse" : ""}`}
+            >
+                <span className="truncate">{content}</span>
+                <Dir className={`w-3 h-3 shrink-0 ${active ? "" : "opacity-0 group-hover/th:opacity-60"}`} aria-hidden />
+            </button>
         </th>
-    );
-}
-
-function StatusPill({ subscribed }: { subscribed: boolean }) {
-    if (subscribed) {
-        return (
-            <span className="inline-flex items-center gap-1 text-[10.5px] font-medium text-emerald-700 uppercase tracking-[0.08em]">
-                <span className="size-1.5 rounded-full bg-emerald-500" />
-                <span className="hidden sm:inline">subscribed</span>
-            </span>
-        );
-    }
-    return (
-        <span className="inline-flex items-center gap-1 text-[10.5px] font-medium text-slate-500 uppercase tracking-[0.08em]">
-            <span className="size-1.5 rounded-full bg-slate-300" />
-            <span className="hidden sm:inline">unsubscribed</span>
-        </span>
-    );
-}
-
-// One engagement column of the Leads view. A count of steps engaged, a dash
-// for a lead that was sent but never did, and blank for a lead never emailed.
-// A machine-only open (Apple MPP prefetch) reads "auto" so it is not mistaken
-// for a person.
-function EngagementCell({
-    n,
-    sent,
-    Icon,
-    label,
-    auto = false,
-}: {
-    n: number;
-    sent: boolean;
-    Icon: typeof MailOpenIcon;
-    label: string;
-    auto?: boolean;
-}) {
-    return (
-        <td className="px-3 hidden md:table-cell">
-            {n > 0 ? (
-                <span
-                    className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 tabular-nums"
-                    title={`${label} ${n} ${n === 1 ? "email" : "emails"}`}
-                >
-                    <Icon className="w-3 h-3 shrink-0" />
-                    {n}
-                </span>
-            ) : auto ? (
-                <span
-                    className="text-[10.5px] text-slate-400"
-                    title="Opened by a mail client automatically, not by a person"
-                >
-                    auto
-                </span>
-            ) : sent ? (
-                <span className="text-slate-300 text-[11px]" aria-label={`not ${label}`}>
-                    —
-                </span>
-            ) : null}
-        </td>
-    );
-}
-
-// Per-lead processing state inside a campaign (campaign Leads view only).
-// `active` renders the animated dot-grid loader (the same "processing" motif
-// used across the app); every other state is a distinct lucide icon.
-const LEAD_META: Record<
-    LeadStatus,
-    { label: string; dot: string; text: string; Icon: typeof ClockIcon }
-> = {
-    pending: { label: "Queued", dot: "bg-slate-300", text: "text-slate-500", Icon: ClockIcon },
-    active: { label: "Processing", dot: "bg-sky-500", text: "text-sky-700", Icon: ClockIcon },
-    completed: { label: "Done", dot: "bg-indigo-500", text: "text-indigo-700", Icon: CheckIcon },
-    replied: { label: "Replied", dot: "bg-emerald-500", text: "text-emerald-700", Icon: CornerUpLeftIcon },
-    bounced: { label: "Bounced", dot: "bg-rose-500", text: "text-rose-600", Icon: AlertTriangleIcon },
-    failed: { label: "Failed", dot: "bg-rose-500", text: "text-rose-600", Icon: AlertTriangleIcon },
-    unsubscribed: { label: "Unsubscribed", dot: "bg-slate-300", text: "text-slate-400", Icon: BanIcon },
-    undeliverable: { label: "Undeliverable", dot: "bg-amber-500", text: "text-amber-600", Icon: AlertTriangleIcon },
-};
-
-function LeadStatusPill({ lead }: { lead?: ContactCampaignProgress | null }) {
-    const status: LeadStatus = lead?.status ?? "pending";
-    const meta = LEAD_META[status];
-    const Icon = meta.Icon;
-    // A failed lead carries the worker's reason; surface it on hover since the
-    // pill itself only has room for the word.
-    const title =
-        status === "failed" && lead?.failure_reason
-            ? `Could not send: ${lead.failure_reason}`
-            : status === "undeliverable"
-                ? "Address verification refused this recipient, so the campaign skips it"
-                : undefined;
-    return (
-        <span
-            className={`inline-flex items-center gap-1.5 text-[10.5px] font-medium uppercase tracking-[0.08em] ${meta.text}`}
-            title={title}
-        >
-            {status === "active" ? (
-                <span className="campaign-grid text-sky-600 shrink-0" aria-hidden />
-            ) : (
-                <Icon className="w-3 h-3 shrink-0" />
-            )}
-            <span className="hidden sm:inline">{meta.label}</span>
-        </span>
     );
 }
 
@@ -1349,6 +1665,7 @@ function LeadProgressStrip({
                 bounced: serverCounts.bounced,
                 failed: serverCounts.failed,
                 unsubscribed: serverCounts.unsubscribed,
+                paused: serverCounts.paused ?? 0,
                 undeliverable: serverCounts.undeliverable ?? 0,
             } satisfies Record<LeadStatus, number>;
         }
@@ -1360,6 +1677,7 @@ function LeadProgressStrip({
             bounced: 0,
             failed: 0,
             unsubscribed: 0,
+            paused: 0,
             undeliverable: 0,
         };
         for (const ct of contacts) c[ct.campaign_lead?.status ?? "pending"]++;
@@ -1400,6 +1718,7 @@ function LeadProgressStrip({
         { key: "pending", color: "bg-slate-300" },
         { key: "bounced", color: "bg-rose-400" },
         { key: "failed", color: "bg-rose-500" },
+        { key: "paused", color: "bg-violet-400" },
         { key: "unsubscribed", color: "bg-slate-200" },
         { key: "undeliverable", color: "bg-amber-500" },
     ];
@@ -1427,6 +1746,9 @@ function LeadProgressStrip({
                 <StripChip dot="bg-rose-400" label="Bounced" n={counts.bounced} {...status("bounced")} />
                 {(counts.failed > 0 || leadStatus === "failed") && (
                     <StripChip dot="bg-rose-500" label="Failed" n={counts.failed} {...status("failed")} />
+                )}
+                {(counts.paused > 0 || leadStatus === "paused") && (
+                    <StripChip dot="bg-violet-400" label="Paused" n={counts.paused} {...status("paused")} />
                 )}
                 {(counts.undeliverable > 0 || leadStatus === "undeliverable") && (
                     <StripChip dot="bg-amber-500" label="Undeliverable" n={counts.undeliverable} {...status("undeliverable")} />
@@ -1504,12 +1826,82 @@ function StripChip({
     );
 }
 
+// deletePrompt words the confirm so a 12,000-row select-all does not read the
+// same as three ticked rows.
+function deletePrompt(count: number): string {
+    if (count === 1) return "Delete this contact? It is removed from every campaign and segment it belongs to.";
+    return `Delete ${count.toLocaleString()} contacts? They are removed from every campaign and segment they belong to. This cannot be undone.`;
+}
+
+// The bridge between "every row on screen" and "every row that matches". The
+// table only ever holds the pages it has loaded, so ticking the header can
+// never mean the whole filtered set on its own; this says what is selected and
+// offers the rest in one click.
+function SelectAllBanner({
+    noun,
+    selectAll,
+    count,
+    loadedCount,
+    total,
+    canSelectAllMatching,
+    onSelectAllMatching,
+    onClear,
+}: {
+    noun: string;
+    selectAll: boolean;
+    count: number;
+    loadedCount: number;
+    total: number;
+    canSelectAllMatching: boolean;
+    onSelectAllMatching: () => void;
+    onClear: () => void;
+}) {
+    if (!selectAll && !canSelectAllMatching) return null;
+    const plural = (n: number) => (n === 1 ? noun : `${noun}s`);
+    return (
+        <div className="px-5 py-2 bg-sky-50/70 border-b border-sky-100 text-[12px] text-sky-900 flex flex-wrap items-center justify-center gap-x-1.5 gap-y-1 text-center">
+            {selectAll ? (
+                <>
+                    <span>
+                        All <span className="font-medium">{count.toLocaleString()}</span> {plural(count)} matching this
+                        view are selected.
+                    </span>
+                    <button
+                        type="button"
+                        onClick={onClear}
+                        className="font-medium underline underline-offset-2 hover:text-sky-700"
+                    >
+                        Clear selection
+                    </button>
+                </>
+            ) : (
+                <>
+                    <span>
+                        The <span className="font-medium">{loadedCount.toLocaleString()}</span> {plural(loadedCount)} loaded
+                        here are selected.
+                    </span>
+                    <button
+                        type="button"
+                        onClick={onSelectAllMatching}
+                        className="font-medium underline underline-offset-2 hover:text-sky-700"
+                    >
+                        Select all {total.toLocaleString()} matching
+                    </button>
+                </>
+            )}
+        </div>
+    );
+}
+
 function SelectionBar({
     count,
     deleting,
     pushTargets,
     pushing,
     onPush,
+    apolloTargets,
+    enriching,
+    onEnrich,
     onBulkEdit,
     onResearch,
     researching,
@@ -1518,7 +1910,7 @@ function SelectionBar({
     verifying,
     onDelete,
     onClear,
-    selected,
+    selection,
     segment,
     onExclude,
     excluding,
@@ -1531,6 +1923,9 @@ function SelectionBar({
     pushTargets: IntegrationConnection[];
     pushing: boolean;
     onPush: (connectionId: string, providerLabel: string) => void;
+    apolloTargets: IntegrationConnection[];
+    enriching: boolean;
+    onEnrich: (connectionId: string, overwrite: boolean) => void;
     onBulkEdit: () => void;
     onResearch: () => void;
     researching: boolean;
@@ -1539,7 +1934,7 @@ function SelectionBar({
     verifying: boolean;
     onDelete: () => void;
     onClear: () => void;
-    selected: string[];
+    selection: ContactSelection;
     segment?: { id: string; name: string };
     onExclude: () => void;
     excluding: boolean;
@@ -1556,7 +1951,7 @@ function SelectionBar({
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-30 flex items-center max-w-[calc(100vw-16px)] flex-wrap justify-center md:max-w-none md:flex-nowrap gap-1.5 rounded-md border border-slate-200 bg-white shadow-[0_6px_20px_-4px_rgba(15,23,42,0.12),0_2px_4px_rgba(15,23,42,0.04)] px-2 py-1.5">
             <div className="inline-flex items-center gap-1.5 px-2 h-7 rounded bg-sky-50 text-sky-700 text-[12px] font-medium">
                 <CheckIcon className="w-3 h-3" />
-                <span>{count} selected</span>
+                <span>{count.toLocaleString()} selected</span>
             </div>
             {pushTargets.length > 0 && (
                 <PopoverMenu side="top" align="center">
@@ -1575,7 +1970,7 @@ function SelectionBar({
                         </button>
                     </PopoverMenuTrigger>
                     <PopoverMenuContent>
-                        <PopoverMenuLabel>Push {count} to</PopoverMenuLabel>
+                        <PopoverMenuLabel>Push {count.toLocaleString()} to</PopoverMenuLabel>
                         {pushTargets.map((t) => {
                             const label = PROVIDER_LABELS[t.provider];
                             const custom = t.label && t.label.toLowerCase() !== t.provider ? ` · ${t.label}` : "";
@@ -1589,6 +1984,32 @@ function SelectionBar({
                     </PopoverMenuContent>
                 </PopoverMenu>
             )}
+            {apolloTargets.length > 0 && (
+                <PopoverMenu side="top" align="center">
+                    <PopoverMenuTrigger asChild>
+                        <button
+                            type="button"
+                            disabled={enriching}
+                            className="h-7 px-2.5 rounded text-[12px] text-slate-700 hover:text-slate-900 hover:bg-slate-100 font-medium inline-flex items-center gap-1.5 transition-colors disabled:opacity-60"
+                        >
+                            {enriching ? <Loader2Icon className="w-3 h-3 animate-spin" /> : <DatabaseZapIcon className="w-3 h-3" />}
+                            <span className="hidden sm:inline">Enrich</span>
+                        </button>
+                    </PopoverMenuTrigger>
+                    <PopoverMenuContent>
+                        <PopoverMenuLabel>Enrich {count.toLocaleString()} with Apollo</PopoverMenuLabel>
+                        {apolloTargets.map((t) => {
+                            const custom = apolloTargets.length > 1 ? ` · ${t.label}` : "";
+                            return (
+                                <React.Fragment key={t.id}>
+                                    <PopoverMenuItem onSelect={() => onEnrich(t.id, false)}>Fill empty fields{custom}</PopoverMenuItem>
+                                    <PopoverMenuItem onSelect={() => onEnrich(t.id, true)}>Replace with Apollo data{custom}</PopoverMenuItem>
+                                </React.Fragment>
+                            );
+                        })}
+                    </PopoverMenuContent>
+                </PopoverMenu>
+            )}
             <button
                 type="button"
                 onClick={onBulkEdit}
@@ -1596,7 +2017,7 @@ function SelectionBar({
             >
                 Edit
             </button>
-            <AddToSegmentMenu contacts={selected} onDone={onClear} />
+            <AddToSegmentMenu selection={selection} count={count} onDone={onClear} />
             {segment && (
                 <button
                     type="button"
@@ -1641,7 +2062,7 @@ function SelectionBar({
                 </PopoverMenuTrigger>
                 <PopoverMenuContent>
                     <PopoverMenuLabel>Address verification</PopoverMenuLabel>
-                    <PopoverMenuItem onSelect={onVerify}>Re-verify {count}</PopoverMenuItem>
+                    <PopoverMenuItem onSelect={onVerify}>Re-verify {count.toLocaleString()}</PopoverMenuItem>
                     <PopoverMenuItem onSelect={onMarkDeliverable}>Mark deliverable</PopoverMenuItem>
                 </PopoverMenuContent>
             </PopoverMenu>

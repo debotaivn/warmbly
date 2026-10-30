@@ -7,6 +7,12 @@ import { useRealtimeEvents } from './useRealtimeEvents'
 import { PresenceProvider } from './PresenceProvider'
 import useUnseenCount from '@/lib/api/hooks/app/unibox/useUnseenCount'
 
+// Heartbeat roundtrip bands behind the header's connection indicator. A healthy
+// socket answers in tens of milliseconds, and the provider's own watchdog gives
+// up at 8s and reconnects, so "poor" stays well under that.
+const DEGRADED_LATENCY_MS = 500
+const POOR_LATENCY_MS = 2000
+
 export function RealtimeManager({ children }: { children: React.ReactNode }) {
   const { isConnected, reconnectAttempt, joinChannel, leaveChannel } = useSocket()
   const { user } = useUserProfile()
@@ -17,10 +23,9 @@ export function RealtimeManager({ children }: { children: React.ReactNode }) {
   const addJoinedChannel = useAppStore((s) => s.addJoinedChannel)
   const removeJoinedChannel = useAppStore((s) => s.removeJoinedChannel)
   const setUnseenCount = useAppStore((s) => s.setUnseenCount)
+  const wsLatencyMs = useAppStore((s) => s.wsLatencyMs)
 
   const queryClient = useQueryClient()
-  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const lastHeartbeatRef = useRef<number>(Date.now())
   const hadConnectionRef = useRef(false)
 
   // Catch-up on reconnect: events are fire-and-forget, so anything emitted
@@ -101,34 +106,30 @@ export function RealtimeManager({ children }: { children: React.ReactNode }) {
     }
   }, [isConnected, currentOrg?.id, joinChannel, leaveChannel, addJoinedChannel, removeJoinedChannel])
 
-  // Connection quality monitoring
+  // Connection quality, from the heartbeat roundtrip the socket provider
+  // measures. The previous version compared its own 5s interval against
+  // itself, so ordinary timer drift read as "degraded" and the header claimed
+  // "Slow connection" on a perfectly healthy socket.
   useEffect(() => {
     if (!isConnected) return
-
-    lastHeartbeatRef.current = Date.now()
-
-    heartbeatRef.current = setInterval(() => {
-      const elapsed = Date.now() - lastHeartbeatRef.current
-      if (elapsed > 15000) {
-        setConnectionQuality('poor')
-      } else if (elapsed > 5000) {
-        setConnectionQuality('degraded')
-      } else {
-        setConnectionQuality('good')
-      }
-      lastHeartbeatRef.current = Date.now()
-    }, 5000)
-
-    return () => {
-      if (heartbeatRef.current) {
-        clearInterval(heartbeatRef.current)
-      }
+    // Null until the first heartbeat reply lands: a connected socket with
+    // nothing to report yet, not a slow one.
+    if (wsLatencyMs === null) {
+      setConnectionQuality('good')
+      return
     }
-  }, [isConnected, setConnectionQuality])
+    if (wsLatencyMs > POOR_LATENCY_MS) {
+      setConnectionQuality('poor')
+    } else if (wsLatencyMs > DEGRADED_LATENCY_MS) {
+      setConnectionQuality('degraded')
+    } else {
+      setConnectionQuality('good')
+    }
+  }, [isConnected, wsLatencyMs, setConnectionQuality])
 
-  // Seed the unread inbox count from the server. The store value is otherwise
-  // session-only (realtime increments it but it starts at 0), so seeding makes
-  // the title + favicon badge reflect the real unread count.
+  // The unread inbox count comes from the server and nowhere else: realtime
+  // inbox events invalidate this query rather than counting, so the title,
+  // favicon and nav badge always match what the Inbox lists.
   //
   // This is a react-query (not a one-shot fetch) on purpose: /unibox/count is
   // org-scoped, and on a fresh login the bootstrap fires before OrgGate has
@@ -138,11 +139,13 @@ export function RealtimeManager({ children }: { children: React.ReactNode }) {
   // and corrects the badge without a reload. Gated on a selected workspace so a
   // multi-org login (which redirects to /select-org before any sync) doesn't
   // fire a NULL-org read. Best-effort: a failure leaves the current count as-is.
+  // Keyed on every fetch, not on the value, so each refetch is applied.
   const unseenQuery = useUnseenCount({ enabled: !!currentOrg })
+  const unseenFetched = unseenQuery.dataUpdatedAt
   useEffect(() => {
     const c = unseenQuery.data?.count
     if (typeof c === 'number') setUnseenCount(c)
-  }, [unseenQuery.data, setUnseenCount])
+  }, [unseenQuery.data, unseenFetched, setUnseenCount])
 
   // Set up event-to-store routing
   useRealtimeEvents()

@@ -48,8 +48,13 @@ type FeatureGateService interface {
 	// GetSubscriptionStatus returns subscription info for feature checks
 	GetSubscriptionStatus(ctx context.Context, orgID uuid.UUID) (*SubscriptionStatus, *errx.Error)
 
-	// IsPaidOrganization checks if the organization has an active paid subscription
+	// IsPaidOrganization reports whether the organization pays for the
+	// product (sending, inbox, AI, integrations). The Warmup plan does not.
 	IsPaidOrganization(ctx context.Context, orgID uuid.UUID) (bool, *errx.Error)
+
+	// HasPremiumWarmup reports whether the organization pays for any plan,
+	// the Warmup plan included, which is what the premium pool follows.
+	HasPremiumWarmup(ctx context.Context, orgID uuid.UUID) (bool, *errx.Error)
 
 	// GetStorageLimitBytes returns the org's total attachment storage quota in
 	// bytes (generous; larger for paid orgs).
@@ -86,11 +91,21 @@ type featureGateService struct {
 	selfHost bool
 	// poolLink entitles a linked workspace to warm without a paid plan; nil when not wired.
 	poolLink PoolLinkReader
+	// overrides is the per-org limit override row, so an approved daily-send
+	// increase raises what the sender enforces and not only what the
+	// dashboard shows. Nil when not wired.
+	overrides LimitOverrideReader
 }
 
 // PoolLinkReader answers whether a workspace has a live self-hosted link.
 type PoolLinkReader interface {
 	HasActiveLink(ctx context.Context, orgID uuid.UUID) bool
+}
+
+// LimitOverrideReader reads the operator override row for an organization.
+// Satisfied by the organization repository.
+type LimitOverrideReader interface {
+	GetOrganizationLimitOverrides(ctx context.Context, orgID uuid.UUID) (*models.OrganizationLimitOverrides, error)
 }
 
 func NewService(subRepo repository.SubscriptionRepository, planRepo repository.PlanRepository) FeatureGateService {
@@ -103,6 +118,21 @@ func NewService(subRepo repository.SubscriptionRepository, planRepo repository.P
 
 // WirePoolLink attaches the pool-link entitlement after construction.
 func (s *featureGateService) WirePoolLink(r PoolLinkReader) { s.poolLink = r }
+
+// WireLimitOverrides attaches the override reader after construction.
+func (s *featureGateService) WireLimitOverrides(r LimitOverrideReader) { s.overrides = r }
+
+// dailyOverride is the operator-granted daily send cap, or 0 when none.
+func (s *featureGateService) dailyOverride(ctx context.Context, orgID uuid.UUID) int {
+	if s.overrides == nil {
+		return 0
+	}
+	o, err := s.overrides.GetOrganizationLimitOverrides(ctx, orgID)
+	if err != nil || o == nil {
+		return 0
+	}
+	return o.DailyCampaignLimit
+}
 
 // CanSendCampaignEmail checks if an organization can send campaign emails
 func (s *featureGateService) CanSendCampaignEmail(ctx context.Context, orgID uuid.UUID) (bool, *errx.Error) {
@@ -119,8 +149,8 @@ func (s *featureGateService) CanSendCampaignEmail(ctx context.Context, orgID uui
 		return false, nil
 	}
 
-	// Active paid subscription = allowed
-	if sub.HasPaidSubscription() {
+	// A plan that includes sending = allowed
+	if sub.HasProductPlan() {
 		return true, nil
 	}
 
@@ -200,13 +230,16 @@ func (s *featureGateService) GetDailyEmailLimit(ctx context.Context, orgID uuid.
 	}
 
 	// Free trial users = 20 emails/day
-	if sub.IsInFreeTrial() && !sub.HasPaidSubscription() {
+	if sub.IsInFreeTrial() && !sub.HasProductPlan() {
 		return FreeTierDailyEmailLimit, nil
 	}
 
-	// Paid users = plan limit or unlimited
-	if sub.HasPaidSubscription() {
-		plan, err := s.planRepo.GetByID(ctx, sub.PlanID)
+	// Paid users = approved override, else plan limit, else unlimited
+	if sub.HasProductPlan() {
+		if ov := s.dailyOverride(ctx, orgID); ov > 0 {
+			return ov, nil
+		}
+		plan, err := s.planRepo.GetByID(ctx, sub.EffectivePlanID())
 		if err != nil || plan == nil {
 			return UnlimitedEmails, nil // Default to unlimited if plan not found
 		}
@@ -252,17 +285,19 @@ func (s *featureGateService) GetSubscriptionStatus(ctx context.Context, orgID uu
 	status.HasSubscription = true
 	status.IsInFreeTrial = sub.IsInFreeTrial()
 	status.IsFreeTrialExpired = sub.IsFreeTrialExpired()
-	status.IsPaidSubscriber = sub.HasPaidSubscription()
+	status.IsPaidSubscriber = sub.HasProductPlan()
 
 	// Load plan
-	plan, _ := s.planRepo.GetByID(ctx, sub.PlanID)
+	plan, _ := s.planRepo.GetByID(ctx, sub.EffectivePlanID())
 	status.Plan = plan
 
 	// Calculate daily limit
 	if status.IsInFreeTrial && !status.IsPaidSubscriber {
 		status.DailyEmailLimit = FreeTierDailyEmailLimit
 	} else if status.IsPaidSubscriber {
-		if plan != nil && plan.DailyCampaignLimit != nil {
+		if ov := s.dailyOverride(ctx, orgID); ov > 0 {
+			status.DailyEmailLimit = ov
+		} else if plan != nil && plan.DailyCampaignLimit != nil {
 			status.DailyEmailLimit = *plan.DailyCampaignLimit
 		} else {
 			status.DailyEmailLimit = UnlimitedEmails
@@ -272,9 +307,7 @@ func (s *featureGateService) GetSubscriptionStatus(ctx context.Context, orgID uu
 	return status, nil
 }
 
-// GetStorageLimitBytes returns the org's attachment storage quota. Paid orgs
-// get the larger pool; everyone else (trial or no subscription) gets the free
-// allowance so they can still attach files.
+// GetStorageLimitBytes returns the attachment quota: the larger pool only on a plan that sends.
 func (s *featureGateService) GetStorageLimitBytes(ctx context.Context, orgID uuid.UUID) (int64, *errx.Error) {
 	if s.selfHost {
 		return PaidStorageBytes, nil
@@ -283,7 +316,7 @@ func (s *featureGateService) GetStorageLimitBytes(ctx context.Context, orgID uui
 	if err != nil {
 		return 0, errx.New(errx.Internal, "failed to get subscription")
 	}
-	if sub != nil && sub.HasPaidSubscription() {
+	if sub.HasProductPlan() {
 		return PaidStorageBytes, nil
 	}
 	return FreeTierStorageBytes, nil
@@ -302,7 +335,11 @@ func (s *featureGateService) CanUseWritingAssistant(ctx context.Context, orgID u
 	if sub == nil {
 		return false, nil
 	}
-	return sub.HasPaidSubscription() || sub.IsInFreeTrial(), nil
+	// Paid only, like the inbox agent. The free plan carries no credit
+	// allowance, so admitting a trial here would put the assistant in front of
+	// someone who can only ever be told they have no credits, which reads as a
+	// broken feature rather than a locked one.
+	return sub.HasProductPlan(), nil
 }
 
 // CanUseInboxAgent gates the inbox agent to paid subscribers only. Unlike the
@@ -319,10 +356,11 @@ func (s *featureGateService) CanUseInboxAgent(ctx context.Context, orgID uuid.UU
 	if sub == nil {
 		return false, nil
 	}
-	return sub.HasPaidSubscription(), nil
+	return sub.HasProductPlan(), nil
 }
 
-// IsPaidOrganization checks if the organization has an active paid subscription
+// IsPaidOrganization reports whether the organization's plan includes the
+// product. The Warmup plan pays for the premium pool only, so it answers false.
 func (s *featureGateService) IsPaidOrganization(ctx context.Context, orgID uuid.UUID) (bool, *errx.Error) {
 	if s.selfHost {
 		// Treat as paid so downstream (warmup pool, storage) uses the full tier.
@@ -333,9 +371,18 @@ func (s *featureGateService) IsPaidOrganization(ctx context.Context, orgID uuid.
 		return false, errx.New(errx.Internal, "failed to get subscription")
 	}
 
-	if sub == nil {
-		return false, nil
-	}
+	return sub.HasProductPlan(), nil
+}
 
-	return sub.HasPaidSubscription(), nil
+// HasPremiumWarmup reports whether the organization pays for any plan, so its
+// mailboxes warm in the premium pool. The Warmup plan counts here.
+func (s *featureGateService) HasPremiumWarmup(ctx context.Context, orgID uuid.UUID) (bool, *errx.Error) {
+	if s.selfHost {
+		return true, nil
+	}
+	sub, err := s.subRepo.GetByOrganizationID(ctx, orgID)
+	if err != nil {
+		return false, errx.New(errx.Internal, "failed to get subscription")
+	}
+	return sub != nil && sub.HasPaidSubscription(), nil
 }

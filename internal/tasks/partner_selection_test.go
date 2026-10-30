@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
@@ -8,6 +9,63 @@ import (
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/repository"
 )
+
+func TestPickWeightedPartnerBalancesHostsBeforePlacementAndRules(t *testing.T) {
+	gmail := uuid.New()
+	candidates := []uuid.UUID{gmail}
+	sig := partnerSignals{
+		domainsByID:  map[uuid.UUID]string{gmail: "gmail.com"},
+		domainCounts: map[string]int{"gmail.com": 99},
+		hostsByID:    map[uuid.UUID]string{gmail: "gmail"},
+	}
+	for i := 0; i < 30; i++ {
+		id := uuid.New()
+		candidates = append(candidates, id)
+		sig.domainsByID[id] = fmt.Sprintf("workspace-%d.test", i)
+		sig.hostsByID[id] = "google_workspace"
+	}
+	for _, tc := range []struct {
+		name       string
+		spam, rule float64
+		min, max   int
+	}{
+		{"balanced", 0, 1, 1700, 2300},
+		{"spam still downweights", .5, 1, 700, 1300},
+		{"routing still multiplies", 0, 2, 2400, 3000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sig.ruleWeight = map[uuid.UUID]float64{gmail: tc.rule}
+			sig.placementByHost = map[string]repository.HostPlacementStat{"gmail": {Delivered: 100, Spam: int(tc.spam * 100)}}
+			hits := 0
+			for range 4000 {
+				if pickWeightedPartner(candidates, sig) == gmail {
+					hits++
+				}
+			}
+			if hits < tc.min || hits > tc.max {
+				t.Fatalf("Gmail hits %d/4000, want %d..%d", hits, tc.min, tc.max)
+			}
+		})
+	}
+}
+
+func TestPickWeightedPartnerRetainsDomainDiversityWithinAHost(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	sig := partnerSignals{
+		domainsByID:  map[uuid.UUID]string{a: "old.test", b: "fresh.test"},
+		domainCounts: map[string]int{"old.test": 99},
+		hostsByID:    map[uuid.UUID]string{a: "google_workspace", b: "google_workspace"},
+	}
+	hits := 0
+	for range 1000 {
+		if pickWeightedPartner([]uuid.UUID{a, b}, sig) == b {
+			hits++
+		}
+	}
+	if hits < 900 {
+		t.Fatalf("fresh domain drawn %d/1000", hits)
+	}
+}
 
 func TestPickWeightedPartner_FallsBackToUniformWithoutDomains(t *testing.T) {
 	a := uuid.New()
@@ -61,29 +119,15 @@ func TestPickWeightedPartner_RoutingRulePrefersProviderMatch(t *testing.T) {
 		googleRecipient:    "gmail.com",
 		microsoftRecipient: "outlook.com",
 	}
-	emailsByID := map[uuid.UUID]string{
-		googleRecipient:    "g@gmail.com",
-		microsoftRecipient: "m@outlook.com",
-	}
-	rules := []models.WarmupRoutingRule{
-		{
-			Enabled:             true,
-			Name:                "google-to-google",
-			Priority:            1,
-			SenderMatchType:     models.WarmupMatchProvider,
-			SenderMatchValue:    "google",
-			RecipientMatchType:  models.WarmupMatchProvider,
-			RecipientMatchValue: "google",
-			Weight:              10.0,
-		},
-	}
+	// The selector resolves each rule once, into the weight it produced.
+	ruleWeight := map[uuid.UUID]float64{googleRecipient: 10.0, microsoftRecipient: 1.0}
 
 	googleHits := 0
 	iterations := 2000
 	for i := 0; i < iterations; i++ {
 		picked := pickWeightedPartner(
 			[]uuid.UUID{googleRecipient, microsoftRecipient},
-			partnerSignals{domainsByID: domainsByID, rules: rules, senderEmail: "sender@gmail.com", emailsByID: emailsByID},
+			partnerSignals{domainsByID: domainsByID, ruleWeight: ruleWeight},
 		)
 		if picked == googleRecipient {
 			googleHits++
@@ -95,70 +139,59 @@ func TestPickWeightedPartner_RoutingRulePrefersProviderMatch(t *testing.T) {
 	}
 }
 
-func TestPickWeightedPartner_RoutingRuleZeroWeightExcludes(t *testing.T) {
-	allowedID := uuid.New()
-	blockedID := uuid.New()
-	domainsByID := map[uuid.UUID]string{
-		allowedID: "good.com",
-		blockedID: "blocked.com",
-	}
-	emailsByID := map[uuid.UUID]string{
-		allowedID: "a@good.com",
-		blockedID: "b@blocked.com",
-	}
-	rules := []models.WarmupRoutingRule{
-		{
-			Enabled:             true,
-			Name:                "exclude-blocked",
-			Priority:            1,
-			SenderMatchType:     models.WarmupMatchAny,
-			RecipientMatchType:  models.WarmupMatchDomain,
-			RecipientMatchValue: "blocked.com",
-			Weight:              0,
-		},
+// A candidate with no rule of its own weighs the same as one with no rules at
+// all; a bare map lookup would have zeroed it and excluded everybody.
+func TestPickWeightedPartner_MissingRuleWeightIsNeutral(t *testing.T) {
+	ruled := uuid.New()
+	unruled := uuid.New()
+	sig := partnerSignals{
+		domainsByID:  map[uuid.UUID]string{ruled: "a.com", unruled: "b.com"},
+		domainCounts: map[string]int{"a.com": 0, "b.com": 0},
+		ruleWeight:   map[uuid.UUID]float64{ruled: 1.0},
 	}
 
-	for i := 0; i < 500; i++ {
-		picked := pickWeightedPartner(
-			[]uuid.UUID{allowedID, blockedID},
-			partnerSignals{domainsByID: domainsByID, rules: rules, senderEmail: "sender@whatever.io", emailsByID: emailsByID},
-		)
-		if picked == blockedID {
-			t.Fatalf("weight=0 rule should exclude blocked partner")
+	unruledHits := 0
+	iterations := 2000
+	for i := 0; i < iterations; i++ {
+		if pickWeightedPartner([]uuid.UUID{ruled, unruled}, sig) == unruled {
+			unruledHits++
 		}
+	}
+	if unruledHits < iterations/4 {
+		t.Fatalf("the unruled partner was picked %d/%d times; equal weights should be near half", unruledHits, iterations)
 	}
 }
 
-func TestProviderPenalty(t *testing.T) {
+func TestHostPenalty(t *testing.T) {
 	partner := uuid.New()
-	// Keys are models.WarmupProvider values: who RUNS the recipient's mail.
-	sig := func(sends, placements int) partnerSignals {
+	// Keys are mailhost.Host values: who RUNS the recipient's mail.
+	sig := func(delivered, spam int) partnerSignals {
 		return partnerSignals{
-			providersByID:       map[uuid.UUID]string{partner: "microsoft"},
-			placementByProvider: map[string]repository.ProviderPlacementStat{"microsoft": {Sends: sends, Placements: placements}},
+			hostsByID:       map[uuid.UUID]string{partner: "microsoft365"},
+			placementByHost: map[string]repository.HostPlacementStat{"microsoft365": {Delivered: delivered, Spam: spam}},
 		}
 	}
 
-	if got := sig(100, 0).providerPenalty(partner); got != 1.0 {
+	if got := sig(100, 0).hostPenalty(partner); got != 1.0 {
 		t.Errorf("clean provider penalty = %v, want 1.0", got)
 	}
 	// 25% junk rate halves the weight at k=4.
-	if got := sig(100, 25).providerPenalty(partner); got != 0.5 {
+	if got := sig(100, 25).hostPenalty(partner); got != 0.5 {
 		t.Errorf("25%% rate penalty = %v, want 0.5", got)
 	}
 	// Even total failure downweights rather than excluding: a sender that stops
 	// mailing a provider never learns whether it recovered.
-	if got := sig(100, 100).providerPenalty(partner); got <= 0 {
+	if got := sig(100, 100).hostPenalty(partner); got <= 0 {
 		t.Errorf("total-failure penalty = %v, want a positive weight", got)
 	}
 	// One placement out of two sends is noise, not a pattern.
-	if got := sig(2, 1).providerPenalty(partner); got != 1.0 {
+	if got := sig(2, 1).hostPenalty(partner); got != 1.0 {
 		t.Errorf("below-sample penalty = %v, want 1.0", got)
 	}
-	if got := (partnerSignals{}).providerPenalty(partner); got != 1.0 {
+	if got := (partnerSignals{}).hostPenalty(partner); got != 1.0 {
 		t.Errorf("no-signal penalty = %v, want 1.0", got)
 	}
-	if got := sig(100, 25).providerPenalty(uuid.New()); got != 1.0 {
+	if got := sig(100, 25).hostPenalty(uuid.New()); got != 1.0 {
 		t.Errorf("unknown-partner penalty = %v, want 1.0", got)
 	}
 }
@@ -169,12 +202,12 @@ func TestPickWeightedPartner_AvoidsTheProviderItKeepsLandingInJunkAt(t *testing.
 	sig := partnerSignals{
 		// Equal domain frequency, so per-provider placement is the only signal
 		// separating the two.
-		domainsByID:   map[uuid.UUID]string{msID: "outlook.com", googleID: "gmail.com"},
-		domainCounts:  map[string]int{"outlook.com": 1, "gmail.com": 1},
-		providersByID: map[uuid.UUID]string{msID: "microsoft", googleID: "google"},
-		placementByProvider: map[string]repository.ProviderPlacementStat{
-			"microsoft": {Sends: 40, Placements: 20}, // 50% junk
-			"google":    {Sends: 40, Placements: 0},  // clean
+		domainsByID:  map[uuid.UUID]string{msID: "outlook.com", googleID: "gmail.com"},
+		domainCounts: map[string]int{"outlook.com": 1, "gmail.com": 1},
+		hostsByID:    map[uuid.UUID]string{msID: "microsoft365", googleID: "google_workspace"},
+		placementByHost: map[string]repository.HostPlacementStat{
+			"microsoft365":     {Delivered: 40, Spam: 20}, // 50% junk
+			"google_workspace": {Delivered: 40, Spam: 0},  // clean
 		},
 	}
 
@@ -191,5 +224,49 @@ func TestPickWeightedPartner_AvoidsTheProviderItKeepsLandingInJunkAt(t *testing.
 	}
 	if googleHits == iterations {
 		t.Error("the failing provider was excluded entirely; it must stay reachable")
+	}
+}
+
+// Custom domains are told apart by who hosts them, so junk at a small host
+// never costs a Workspace partner its draw weight, or the other way round.
+func TestPartnerHostKeysByWhoRunsTheMail(t *testing.T) {
+	cases := []struct {
+		name string
+		c    models.WarmupPartnerCandidate
+		want string
+	}{
+		{"workspace over oauth", models.WarmupPartnerCandidate{Email: "a@acme.test", Provider: "gmail"}, "google_workspace"},
+		{"workspace over imap", models.WarmupPartnerCandidate{Email: "b@acme.test", Provider: "smtp_imap", MailHost: "google_workspace"}, "google_workspace"},
+		{"small host", models.WarmupPartnerCandidate{Email: "c@shop.test", Provider: "smtp_imap", MailHost: "hostinger"}, "hostinger"},
+		{"consumer gmail", models.WarmupPartnerCandidate{Email: "d@gmail.com", Provider: "smtp_imap"}, "gmail"},
+		{"undetected", models.WarmupPartnerCandidate{Email: "e@shop.test", Provider: "smtp_imap"}, "other"},
+	}
+	for _, tc := range cases {
+		if got := partnerHost(tc.c); got != tc.want {
+			t.Errorf("%s: host = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A free Gmail or Outlook.com sender warms where a major provider junks it, and still avoids a junking small host.
+func TestHostPenalty_ConsumerSenderWarmsWhereJunked(t *testing.T) {
+	msID, smallID := uuid.New(), uuid.New()
+	sig := partnerSignals{
+		hostsByID: map[uuid.UUID]string{msID: "outlook", smallID: "hostinger"},
+		placementByHost: map[string]repository.HostPlacementStat{
+			"outlook":   {Delivered: 40, Spam: 20},
+			"hostinger": {Delivered: 40, Spam: 20},
+		},
+		warmWhereJunked: true,
+	}
+	if got := sig.hostPenalty(msID); got != 1.5 {
+		t.Errorf("junked major provider weight = %v, want 1.5", got)
+	}
+	if got := sig.hostPenalty(smallID); got >= 1.0 {
+		t.Errorf("junking small host weight = %v, want a penalty", got)
+	}
+	sig.warmWhereJunked = false
+	if got := sig.hostPenalty(msID); got >= 1.0 {
+		t.Errorf("company sender weight at a junking provider = %v, want a penalty", got)
 	}
 }

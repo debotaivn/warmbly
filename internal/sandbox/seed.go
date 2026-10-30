@@ -11,6 +11,7 @@ import (
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/pkg/argon2"
 	"github.com/warmbly/warmbly/internal/pkg/encrypt"
+	"github.com/warmbly/warmbly/internal/repository"
 	"github.com/warmbly/warmbly/internal/seed"
 )
 
@@ -84,7 +85,6 @@ type mailboxProfile struct {
 	paused        bool
 	healthState   string
 	healthScore   int
-	spamScore     int
 	campaignToday int // today's cold sends (daily_email_counts)
 	accountAge    int // created_at, days ago
 }
@@ -103,37 +103,37 @@ func profileFor(i int) mailboxProfile {
 	case i < 6:
 		return mailboxProfile{
 			warmupDaysAgo: 45 + i*3, warmupBase: 10, warmupInc: 1, warmupMax: 40 + (i%3)*5,
-			healthState: "healthy", healthScore: 93 + i%6, spamScore: i % 3,
+			healthState: "healthy", healthScore: i % 3,
 			campaignToday: 45 + (i*3)%11, accountAge: 60 + i*4,
 		}
 	case i < 14:
 		return mailboxProfile{
 			warmupDaysAgo: 5 + (i - 6) + (i % 3), warmupBase: 10, warmupInc: 2, warmupMax: 40,
-			healthState: "healthy", healthScore: 84 + (i*7)%12, spamScore: (i * 3) % 6,
+			healthState: "healthy", healthScore: (i * 3) % 6,
 			campaignToday: 14 + (i*5)%17, accountAge: 25 + i,
 		}
 	case i < 17:
 		return mailboxProfile{
 			warmupDaysAgo: i - 13, warmupBase: 10, warmupInc: 2, warmupMax: 40,
-			healthState: "healthy", healthScore: 80 + (i*5)%9, spamScore: 0,
+			healthState: "healthy", healthScore: (i * 5) % 4,
 			campaignToday: 4 + i%5, accountAge: 4 + (i - 13),
 		}
 	case i == 17:
 		return mailboxProfile{
 			warmupDaysAgo: 12, warmupBase: 10, warmupInc: 2, warmupMax: 40,
-			healthState: "healthy", healthScore: 88, spamScore: 1,
+			healthState: "healthy", healthScore: 2,
 			campaignToday: 18, accountAge: 30,
 		}
 	case i == 18:
 		return mailboxProfile{
 			warmupDaysAgo: 9, warmupBase: 10, warmupInc: 2, warmupMax: 40,
-			healthState: "watch", healthScore: 62, spamScore: 14,
+			healthState: "watch", healthScore: 12,
 			campaignToday: 6, accountAge: 28,
 		}
 	default:
 		return mailboxProfile{
 			warmupDaysAgo: 50, warmupBase: 10, warmupInc: 1, warmupMax: 50,
-			healthState: "healthy", healthScore: 90, spamScore: 2,
+			healthState: "healthy", healthScore: 1,
 			campaignToday: 48, accountAge: 70,
 		}
 	}
@@ -265,6 +265,9 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 	if err := seedMailboxes(ctx, pool); err != nil {
 		return err
 	}
+	if err := seedPlacementPanel(ctx, pool); err != nil {
+		return err
+	}
 	if err := seedSubscription(ctx, pool); err != nil {
 		return err
 	}
@@ -303,6 +306,7 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 	fmt.Println("sandbox seeded:")
 	fmt.Printf("  dashboard  %s / %s (org: Sunrise Labs)\n", SandboxLoginEmail, SandboxLoginPassword)
 	fmt.Printf("  mailboxes  %d senders on @sunrise.test (SMTP -> mailpit, IMAP -> dovecot), signatures + tags on all\n", len(sandboxMailboxes))
+	fmt.Printf("  placement  %d seed inboxes on the instance panel; the simulator files each test copy into Inbox or Junk\n", len(sandboxSeeds))
 	fmt.Println("  campaigns  active, paused, completed, and draft - every list bucket filled")
 	fmt.Println("  warmup     enabled on all senders, premium pool, 10 days of ramp stats")
 	fmt.Println("  history    funnel progress, unified inbox, CRM pipeline, templates, notifications, chart rollups")
@@ -313,6 +317,7 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 	if err := runAdvisor(ctx, pool); err != nil {
 		return err
 	}
+	seed.ForgetCachedUsers(ctx, pool)
 	return nil
 }
 
@@ -370,12 +375,16 @@ func seedIdentity(ctx context.Context, pool *pgxpool.Pool) error {
 			return err
 		}
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO users (id, first_name, last_name, email, password_hash)
-			VALUES ($1, 'Sunny', 'Sandbox', $2, $3)
+			INSERT INTO users (id, first_name, last_name, email, password_hash, onboarding_completed_at)
+			VALUES ($1, 'Sunny', 'Sandbox', $2, $3, NOW())
 			ON CONFLICT (id) DO NOTHING`,
 			sandboxUser, SandboxLoginEmail, hash); err != nil {
 			return err
 		}
+	}
+	// The demo account lands straight in the dashboard, even on a database seeded before this rule.
+	if _, err := pool.Exec(ctx, `UPDATE users SET onboarding_completed_at = NOW() WHERE id = $1 AND onboarding_completed_at IS NULL`, sandboxUser); err != nil {
+		return err
 	}
 
 	if _, err := pool.Exec(ctx, `
@@ -406,40 +415,20 @@ func seedIdentity(ctx context.Context, pool *pgxpool.Pool) error {
 // placement and the reconciler treat it as live; the real worker process adopts
 // the row on its first heartbeat.
 func seedWorker(ctx context.Context, pool *pgxpool.Pool) error {
-	// The conflict branch must also assert the tier tuple: `make seed` upserts
-	// this same UUID as free-tier, and the sandbox org is on a paid plan, so a
-	// leftover free-tier row gets its mailboxes unassigned by placement and
-	// every send fails with "no available workers".
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO fleet_nodes (id, role, name, notes, address, active, last_seen_at)
+		VALUES ($1, 'worker', 'worker-sandbox-1', 'Sandbox worker (make sandbox / make worker)', '127.0.0.1', TRUE, now())
+		ON CONFLICT (id) DO UPDATE SET active = TRUE, last_seen_at = now(), updated_at = now()`,
+		sandboxWorker); err != nil {
+		return err
+	}
 	_, err := pool.Exec(ctx, `
-		INSERT INTO workers (id, name, notes, ip_addr, active, worker_type, account_count, free_tier)
-		VALUES ($1, 'worker-sandbox-1', 'Sandbox worker (make sandbox / make worker)', '127.0.0.1', TRUE, 'shared', 0, FALSE)
-		ON CONFLICT (id) DO UPDATE SET active = TRUE, worker_type = 'shared', free_tier = FALSE, updated_at = NOW()`,
-		sandboxWorker)
+		INSERT INTO workers (id, account_count) VALUES ($1, 0)
+		ON CONFLICT (id) DO NOTHING`, sandboxWorker)
 	return err
 }
 
 func seedMailboxes(ctx context.Context, pool *pgxpool.Pool) error {
-	// The free/premium warmup pool rows: nothing else creates them (no
-	// migration seeds warmup_pools and the app only joins existing pools), so
-	// without this the participant insert below is a silent no-op and warmup
-	// partner selection has an empty pool.
-	for _, wp := range []struct {
-		id       string
-		poolType string
-		name     string
-	}{
-		{"77777777-aaaa-0000-0000-000000000001", "free", "Free warmup pool"},
-		{"77777777-aaaa-0000-0000-000000000002", "premium", "Premium warmup pool"},
-	} {
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO warmup_pools (id, pool_type, name, description, max_participants)
-			VALUES ($1, $2::warmup_pool_type, $3, 'Seeded by the sandbox', 1000)
-			ON CONFLICT (id) DO NOTHING`,
-			uuid.MustParse(wp.id), wp.poolType, wp.name); err != nil {
-			return fmt.Errorf("warmup pool %s: %w", wp.poolType, err)
-		}
-	}
-
 	for i, m := range sandboxMailboxes {
 		// Each mailbox sits at its cohort's lifecycle point (see profileFor).
 		// The send window starts at 00:01, NOT 00:00: the scheduler treats a
@@ -490,22 +479,18 @@ func seedMailboxes(ctx context.Context, pool *pgxpool.Pool) error {
 			p.warmupBase, p.warmupInc, p.warmupMax, p.paused, p.accountAge); err != nil {
 			return fmt.Errorf("mailbox %s: %w", m.email, err)
 		}
-		// Pool membership with the cohort's evaluated health record, so the
-		// health column shows a believable spread instead of zeros.
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO warmup_pool_participants
-				(pool_id, email_account_id, health_state, last_health_score, spam_score, last_health_evaluated_at)
-			SELECT id, $1, $2, $3, $4, NOW()
-			FROM warmup_pools WHERE pool_type = 'premium'::warmup_pool_type
-			ON CONFLICT (pool_id, email_account_id) DO UPDATE SET
-				health_state = EXCLUDED.health_state,
-				last_health_score = EXCLUDED.last_health_score,
-				spam_score = EXCLUDED.spam_score,
-				last_health_evaluated_at = NOW(),
-				blocked_at = NULL,
-				blocked_until = NULL`,
-			m.id, p.healthState, p.healthScore, p.spamScore); err != nil {
+		// Pool membership with the cohort's evaluated health record. The score
+		// is a severity, as the bands write it: low is good.
+		if err := repository.NewWarmupRepository(pool).MoveToPool(ctx, models.WarmupPoolPremiumID, m.id, "sender_receiver"); err != nil {
 			return fmt.Errorf("pool join %s: %w", m.email, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE warmup_pool_participants
+			   SET health_state = $2, last_health_score = $3,
+			       last_health_evaluated_at = NOW(), blocked_at = NULL, blocked_until = NULL
+			 WHERE email_account_id = $1`,
+			m.id, p.healthState, p.healthScore); err != nil {
+			return fmt.Errorf("pool health %s: %w", m.email, err)
 		}
 		// Give the first few mailboxes a sending-behaviour profile so the
 		// Sending tab has a real rolled workday to show, and the rest keep the
@@ -816,8 +801,8 @@ func repairContactVerification(ctx context.Context, pool *pgxpool.Pool) error {
 // an assignment ping-pong that strands mailboxes mid-send.
 func deactivateIdleFixtureWorkers(ctx context.Context, pool *pgxpool.Pool) error {
 	tag, err := pool.Exec(ctx, `
-		UPDATE workers SET active = FALSE, updated_at = NOW()
-		WHERE active AND id <> $1`,
+		UPDATE fleet_nodes SET active = FALSE, updated_at = NOW()
+		WHERE active AND role = 'worker' AND id <> $1`,
 		sandboxWorker)
 	if err != nil {
 		return err

@@ -41,10 +41,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/warmbly/warmbly/internal/infrastructure/db"
+	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/pkg/argon2"
+	"github.com/warmbly/warmbly/internal/repository"
 	"github.com/warmbly/warmbly/internal/seed"
 )
 
@@ -70,6 +73,12 @@ var (
 )
 
 func main() {
+	// This seeder plants accounts with published passwords and ships inside the
+	// release backend image, so it runs only where APP_ENV says development.
+	if err := seed.DevEnvironment(); err != nil {
+		log.Fatalf("Refusing to seed: %v", err)
+	}
+
 	dsn := os.Getenv("PRIMARY_DB")
 	if dsn == "" {
 		dsn = "postgres://warmbly:warmbly@localhost:5432/warmbly_dev?sslmode=disable"
@@ -88,7 +97,11 @@ func main() {
 	// assume migrations are already applied, but running them here makes it
 	// robust standalone: without it, new tables (e.g. crm_task_types) are
 	// missing and the seed aborts partway, which looks like "nothing seeded".
-	if err := db.RunMigrations(dsn); err != nil {
+	directDSN, err := db.DirectEndpoint(dsn, os.Getenv("PRIMARY_DB_DIRECT"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := db.RunMigrations(directDSN); err != nil {
 		log.Fatalf("migrations: %v", err)
 	}
 
@@ -120,6 +133,8 @@ func main() {
 		result.Print(os.Stdout)
 	}
 
+	seed.ForgetCachedUsers(ctx, pool)
+
 	fmt.Println("seed complete")
 }
 
@@ -133,9 +148,9 @@ func seedBaseline(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 
-	// Worker for dev accounts. Matches the docker-compose shared worker
-	// hostname so the running worker container can pick the assignments up.
-	if err := upsertWorker(ctx, pool, workerShared, "shared-1", "10.0.0.11", "shared", true, true); err != nil {
+	// Worker for dev accounts. Matches the docker-compose worker hostname so
+	// the running worker container can pick the assignments up.
+	if err := upsertWorker(ctx, pool, workerShared, "worker-1", "10.0.0.11", "", true); err != nil {
 		return fmt.Errorf("dev worker: %w", err)
 	}
 
@@ -254,19 +269,18 @@ func seedRich(ctx context.Context, pool *pgxpool.Pool) error {
 
 	// workers
 	workers := []struct {
-		id       uuid.UUID
-		name     string
-		ip       string
-		wtype    string
-		freeTier bool
-		active   bool
+		id     uuid.UUID
+		name   string
+		ip     string
+		region string
+		active bool
 	}{
-		{workerShared, "shared-1", "10.0.0.11", "shared", true, true},
-		{workerPremium, "premium-1", "10.0.0.12", "shared", false, true},
-		{workerDedicated, "dedicated-1", "10.0.0.13", "dedicated", false, true},
+		{workerShared, "worker-1", "10.0.0.11", "eu-central", true},
+		{workerPremium, "worker-2", "10.0.0.12", "eu-central", true},
+		{workerDedicated, "worker-3", "10.0.0.13", "us-east", true},
 	}
 	for _, w := range workers {
-		if err := upsertWorker(ctx, pool, w.id, w.name, w.ip, w.wtype, w.freeTier, w.active); err != nil {
+		if err := upsertWorker(ctx, pool, w.id, w.name, w.ip, w.region, w.active); err != nil {
 			return fmt.Errorf("worker %s: %w", w.name, err)
 		}
 	}
@@ -368,15 +382,17 @@ func upsertUser(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, first, la
 		return err
 	}
 	if exists {
-		return nil
+		// Fixture accounts skip the first-run wizard, including ones seeded before this rule.
+		_, err := pool.Exec(ctx, `UPDATE users SET onboarding_completed_at = NOW(), updated_at = NOW() WHERE email = $1 AND onboarding_completed_at IS NULL`, email)
+		return err
 	}
 	hash, err := argon2.Hash(password)
 	if err != nil {
 		return err
 	}
 	_, err = pool.Exec(ctx, `
-		INSERT INTO users (id, first_name, last_name, email, password_hash)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO users (id, first_name, last_name, email, password_hash, onboarding_completed_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
 		ON CONFLICT (id) DO NOTHING`,
 		id, first, last, email, hash)
 	return err
@@ -406,18 +422,23 @@ func upsertOrg(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, name, slug
 	return tx.Commit(ctx)
 }
 
-func upsertWorker(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, name, ip, wtype string, freeTier, active bool) error {
-	_, err := pool.Exec(ctx, `
-		INSERT INTO workers (id, name, ip_addr, worker_type, free_tier, active)
-		VALUES ($1, $2, $3, $4, $5, $6)
+func upsertWorker(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, name, ip, region string, active bool) error {
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO fleet_nodes (id, role, name, address, region, active, last_seen_at)
+		VALUES ($1, 'worker', $2, $3, $4, $5, now())
 		ON CONFLICT (id) DO UPDATE SET
 			name = EXCLUDED.name,
-			ip_addr = EXCLUDED.ip_addr,
-			worker_type = EXCLUDED.worker_type,
-			free_tier = EXCLUDED.free_tier,
+			address = EXCLUDED.address,
+			region = EXCLUDED.region,
 			active = EXCLUDED.active,
-			updated_at = NOW()`,
-		id, name, ip, wtype, freeTier, active)
+			last_seen_at = now(),
+			updated_at = now()`,
+		id, name, ip, region, active); err != nil {
+		return err
+	}
+	_, err := pool.Exec(ctx, `
+		INSERT INTO workers (id, account_count) VALUES ($1, 0)
+		ON CONFLICT (id) DO NOTHING`, id)
 	return err
 }
 
@@ -429,13 +450,13 @@ func upsertEmailAccount(ctx context.Context, pool *pgxpool.Pool, id, userID, org
 			email, name,
 			signature_plain, signature_html,
 			provider, status,
-			warmup_tag, warmup_pool_type
+			warmup_tag, warmup_pool_type, test_mode
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6,
 			'', '',
 			'smtp_imap', 'active',
-			$7, $8
+			$7, $8, 'legacy'
 		)
 		ON CONFLICT (id) DO NOTHING`,
 		id, userID, orgID, workerID, email, name, warmupTag, poolType)
@@ -446,12 +467,13 @@ func joinWarmupPool(ctx context.Context, pool *pgxpool.Pool, accountID uuid.UUID
 	if poolType == "" {
 		return nil
 	}
-	_, err := pool.Exec(ctx, `
-		INSERT INTO warmup_pool_participants (pool_id, email_account_id)
-		SELECT id, $1 FROM warmup_pools WHERE pool_type = $2::warmup_pool_type
-		ON CONFLICT DO NOTHING`,
-		accountID, poolType)
-	return err
+	poolID, ok := models.WarmupPoolID(poolType)
+	if !ok {
+		return fmt.Errorf("unknown warmup pool type %q", poolType)
+	}
+	// MoveToPool moves a mailbox that sits in the other pool rather than
+	// skipping it, which the one-membership-per-mailbox index requires.
+	return repository.NewWarmupRepository(pool).MoveToPool(ctx, poolID, accountID, "sender_receiver")
 }
 
 func upsertDevTrialSubscription(ctx context.Context, pool *pgxpool.Pool) error {
@@ -498,8 +520,8 @@ func seedLegacyUnibox(ctx context.Context, pool *pgxpool.Pool, rows []legacyUnib
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO unibox_mailboxes (email_id, uid_validity, mailbox, attributes, highestmodseq, updated_at)
 			VALUES ($1, $2, 'INBOX', ARRAY['\HasNoChildren'], 1, NOW())
-			ON CONFLICT (email_id, uid_validity) DO UPDATE SET
-				mailbox = EXCLUDED.mailbox,
+			ON CONFLICT (email_id, mailbox) DO UPDATE SET
+				uid_validity = EXCLUDED.uid_validity,
 				attributes = EXCLUDED.attributes,
 				highestmodseq = EXCLUDED.highestmodseq,
 				updated_at = NOW()

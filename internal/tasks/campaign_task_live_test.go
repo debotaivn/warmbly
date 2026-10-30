@@ -43,6 +43,10 @@ func liveCampaignDB(t *testing.T) *db.DB {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() { handle.Pool.Close() })
+	var version int64
+	if err := handle.Pool.QueryRow(context.Background(), `SELECT version FROM schema_migrations LIMIT 1`).Scan(&version); err != nil || version < 156 {
+		t.Fatalf("WARMBLY_TEST_DB is at schema version %d (err %v); this branch needs 156 or later", version, err)
+	}
 	return handle
 }
 
@@ -244,6 +248,9 @@ type recordingSender struct {
 	mu   sync.Mutex
 	sent int
 	fail error
+	// msgs is every message handed over, in order, so a test can assert on
+	// what the recipient would actually receive (headers included).
+	msgs []EmailMessage
 }
 
 func (r *recordingSender) Send(ctx context.Context, taskID uuid.UUID, msg EmailMessage, account models.Email) error {
@@ -253,7 +260,19 @@ func (r *recordingSender) Send(ctx context.Context, taskID uuid.UUID, msg EmailM
 		return r.fail
 	}
 	r.sent++
+	r.msgs = append(r.msgs, msg)
 	return nil
+}
+
+// message returns the i-th message handed over.
+func (r *recordingSender) message(t *testing.T, i int) EmailMessage {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i >= len(r.msgs) {
+		t.Fatalf("wanted message %d, only %d were sent", i, len(r.msgs))
+	}
+	return r.msgs[i]
 }
 
 // count reads the send tally under the lock.
@@ -420,5 +439,61 @@ func TestLiveHealthyCampaignStillSends(t *testing.T) {
 	}
 	if n := f.sendsRecorded(t); n != 1 {
 		t.Fatalf("%d sends stamped, want 1", n)
+	}
+}
+
+// A mailbox that points its replies at another address records that address on
+// the send's task, which is what credits a reply landing there.
+func TestLiveCampaignSendRecordsItsReplyTo(t *testing.T) {
+	handle := liveCampaignDB(t)
+	sender := &recordingSender{}
+	svc := liveCampaignService(t, handle, sender)
+	f := newCampaignSendFixture(t, handle.Pool)
+	ctx := context.Background()
+	if _, err := handle.Pool.Exec(ctx, `UPDATE email_accounts SET reply_to = 'replies@test.local' WHERE id = $1`, f.mailbox); err != nil {
+		t.Fatalf("set reply-to: %v", err)
+	}
+
+	taskID := f.queueTick(t, svc.taskRepo)
+	if xerr := svc.HandleCampaignTask(&proto.ProcessTask{TaskId: taskID.String()}); xerr != nil {
+		t.Fatalf("campaign tick returned an error: %v", xerr)
+	}
+	if sender.count() != 1 {
+		t.Fatalf("sender saw %d sends, want 1", sender.count())
+	}
+	var replyTo string
+	if err := handle.Pool.QueryRow(ctx, `SELECT reply_to FROM tasks WHERE id = $1`, taskID).Scan(&replyTo); err != nil {
+		t.Fatalf("read task: %v", err)
+	}
+	if replyTo != "replies@test.local" {
+		t.Fatalf("task reply_to = %q, want the mailbox's reply-to", replyTo)
+	}
+}
+
+// A retry reuses the task row, so an attempt sending without a Reply-To clears
+// the one an earlier attempt recorded.
+func TestLiveCampaignSendClearsAStaleReplyTo(t *testing.T) {
+	handle := liveCampaignDB(t)
+	sender := &recordingSender{}
+	svc := liveCampaignService(t, handle, sender)
+	f := newCampaignSendFixture(t, handle.Pool)
+	ctx := context.Background()
+
+	taskID := f.queueTick(t, svc.taskRepo)
+	if _, err := handle.Pool.Exec(ctx, `UPDATE tasks SET reply_to = 'earlier@test.local' WHERE id = $1`, taskID); err != nil {
+		t.Fatalf("stale reply-to: %v", err)
+	}
+	if xerr := svc.HandleCampaignTask(&proto.ProcessTask{TaskId: taskID.String()}); xerr != nil {
+		t.Fatalf("campaign tick returned an error: %v", xerr)
+	}
+	if sender.count() != 1 {
+		t.Fatalf("sender saw %d sends, want 1", sender.count())
+	}
+	var replyTo string
+	if err := handle.Pool.QueryRow(ctx, `SELECT reply_to FROM tasks WHERE id = $1`, taskID).Scan(&replyTo); err != nil {
+		t.Fatalf("read task: %v", err)
+	}
+	if replyTo != "" {
+		t.Fatalf("task reply_to = %q, want it cleared for a send without one", replyTo)
 	}
 }

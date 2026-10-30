@@ -110,7 +110,7 @@ func (h *Handler) UpdateEmailBehavior(c *gin.Context) {
 
 	var patch models.UpdateSendingBehavior
 	if err := c.ShouldBindJSON(&patch); err != nil {
-		errx.Handle(c, errx.ErrInvalid)
+		errx.Handle(c, errx.InvalidBody(err))
 		return
 	}
 
@@ -118,6 +118,11 @@ func (h *Handler) UpdateEmailBehavior(c *gin.Context) {
 	if err != nil {
 		handleBehaviorError(c, err)
 		return
+	}
+
+	// The profile shapes both warmup's and campaigns' hours, so their parked slots move with it.
+	if orgID := middleware.GetOrganizationID(c); orgID != nil {
+		h.replaceParkedSends(c.Request.Context(), *orgID, accountID, true, true)
 	}
 
 	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityEmailAccount, &accountID, nil, nil)

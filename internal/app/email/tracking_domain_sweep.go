@@ -7,6 +7,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/warmbly/warmbly/internal/config"
+	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/pkg/trackdns"
 )
 
@@ -66,6 +67,8 @@ func (s *emailService) runTrackingDomainSweep(ctx context.Context, staleAfter ti
 		lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		res := trackdns.VerifyWith(lookupCtx, trackdns.DefaultResolver, t.Domain, target)
 		cancel()
+		// A mailbox that is not verified yet needs the workspace's TXT proof too.
+		res = s.customHosts.Gate(ctx, res, t.OrganizationID, t.Verified)
 		if res.Code == trackdns.CodeLookupError {
 			// A resolver hiccup is not evidence of a broken record, and
 			// revoking on one would move a working customer's links back to
@@ -77,6 +80,10 @@ func (s *emailService) runTrackingDomainSweep(ctx context.Context, staleAfter ti
 		case res.Verified:
 			now := time.Now().UTC()
 			if err := s.emailRepository.SetTrackingDomainVerified(ctx, t.ID, true, &now); err != nil {
+				if err == errx.ErrTrackingDomainTaken {
+					// Another workspace holds this host; it stays unverified here.
+					continue
+				}
 				log.Warn().Str("domain", t.Domain).Str("error", err.Error()).Msg("tracking-domain sweep: failed to persist")
 				continue
 			}

@@ -19,7 +19,7 @@ import {
     SunsetIcon,
     TimerIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 
 import { Toggle } from "@/components/app/campaigns/preferences/components/CampaignPreferenceBoolBox";
 import WeekdayBitmask from "@/components/app/campaigns/schedule/WeekdayBitmask";
@@ -224,7 +224,7 @@ function TodayCard({ mailboxId, enabled }: { mailboxId: string; enabled: boolean
                     <b className="text-slate-900 tabular-nums">{p.sent_today}</b> of{" "}
                     <b className="text-slate-900 tabular-nums">{p.daily_limit}</b> sent
                 </span>
-                <span className="text-slate-400 tabular-nums">{p.remaining_today} left</span>
+                <span className="text-slate-400 tabular-nums">{p.remaining_today} left in plan</span>
             </div>
             <div className="mt-1.5 h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
                 <div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${used}%` }} />
@@ -309,7 +309,7 @@ export default function SendingBehaviorTab({ mailboxId, timezone }: { mailboxId:
                         </div>
                         <div className="min-w-0">
                             <div className="text-[12.5px] font-medium text-slate-900">
-                                {form.enabled ? "Sending like a person" : "Fixed schedule"}
+                                {form.enabled ? "Variable sending plan" : "Fixed schedule"}
                             </div>
                             <div className="text-[11px] text-slate-400">
                                 {form.enabled
@@ -323,130 +323,156 @@ export default function SendingBehaviorTab({ mailboxId, timezone }: { mailboxId:
 
                 <TodayCard mailboxId={mailboxId} enabled={form.enabled && query.data?.enabled === true} />
 
-                {/* Working days */}
-                <div className="px-5 py-5 space-y-2">
-                    <Eyebrow>Working days</Eyebrow>
-                    <WeekdayBitmask
-                        weekdays={[...WEEKDAY_LABELS]}
-                        value={form.weekdays}
-                        setValue={(v) => update({ weekdays: v })}
-                    />
-                    <p className="text-[10.5px] text-slate-400 leading-relaxed">
-                        Days this mailbox sends anything at all, cold outreach and warmup alike.
-                    </p>
-                </div>
-
-                {/* Workday */}
-                <div className="px-5 py-5 space-y-5">
-                    <Eyebrow>Workday</Eyebrow>
-                    <RangeRow
-                        icon={<SunriseIcon className="w-3.5 h-3.5" />}
-                        label="Starts somewhere between"
-                        hint="A different start time each day, so the mailbox never opens on the same minute twice."
-                    >
-                        <ClockPair
-                            min={form.work_start_min}
-                            max={form.work_start_max}
-                            onMin={(v) => update({ work_start_min: v })}
-                            onMax={(v) => update({ work_start_max: v })}
-                        />
-                    </RangeRow>
-                    <RangeRow
-                        icon={<SunsetIcon className="w-3.5 h-3.5" />}
-                        label="Finishes somewhere between"
-                        hint="Nothing is scheduled after the day's rolled finish time."
-                    >
-                        <ClockPair
-                            min={form.work_end_min}
-                            max={form.work_end_max}
-                            onMin={(v) => update({ work_end_min: v })}
-                            onMax={(v) => update({ work_end_max: v })}
-                        />
-                    </RangeRow>
-                </div>
-
-                {/* Lunch */}
-                <div className="px-5 py-5 space-y-5">
-                    <div className="flex items-center justify-between gap-3">
-                        <Eyebrow>Lunch break</Eyebrow>
-                        <Toggle value={form.lunch_enabled} onChange={(v) => update({ lunch_enabled: v })} />
+                {!form.enabled && (
+                    <div className="px-5 py-3">
+                        <p className="text-[11.5px] text-slate-500 leading-relaxed">
+                            This mailbox uses its fixed cap and minimum gap. Enable the variable sending plan to choose
+                            a daily target from your range, with varied hours and spacing. Campaign and mailbox maximums
+                            still apply, so this never raises either ceiling.
+                        </p>
                     </div>
-                    {form.lunch_enabled && (
-                        <>
-                            <RangeRow icon={<CoffeeIcon className="w-3.5 h-3.5" />} label="Starts somewhere between">
-                                <ClockPair
-                                    min={form.lunch_earliest}
-                                    max={form.lunch_latest}
-                                    onMin={(v) => update({ lunch_earliest: v })}
-                                    onMax={(v) => update({ lunch_latest: v })}
-                                />
-                            </RangeRow>
-                            <FieldShell label="Lasts" hint="A quiet gap in the middle of the day, like any real inbox has.">
-                                <PairField
-                                    min={form.lunch_min_minutes}
-                                    max={form.lunch_max_minutes}
-                                    onMin={(v) => update({ lunch_min_minutes: v })}
-                                    onMax={(v) => update({ lunch_max_minutes: v })}
-                                    suffix="minutes"
-                                />
-                            </FieldShell>
-                        </>
-                    )}
-                </div>
+                )}
 
-                {/* Volume + spacing */}
-                <div className="px-5 py-5 space-y-5">
-                    <Eyebrow>Volume and spacing</Eyebrow>
-                    <FieldShell
-                        label="Cold emails per day"
-                        hint="Rolled once a day inside this range. It can only lower the mailbox's daily cap, never raise it."
-                    >
-                        <PairField
-                            min={form.daily_limit_min}
-                            max={form.daily_limit_max}
-                            onMin={(v) => update({ daily_limit_min: v })}
-                            onMax={(v) => update({ daily_limit_max: v })}
-                            suffix="/ day"
-                            lowerBound={1}
+                {/* Everything below the toggle IS the profile. A native fieldset
+                    greys it and takes it out of the tab order on the fixed
+                    schedule, so the panel stops reading as live settings when
+                    none of it applies (issue #469). */}
+                <fieldset
+                    disabled={!form.enabled}
+                    className={cn(
+                        // m-0/p-0/min-w-0 undo the UA fieldset defaults, including
+                        // the min-inline-size that would stop the width-100% pairs
+                        // shrinking inside the drawer.
+                        "block m-0 p-0 min-w-0 divide-y divide-slate-200/60 transition-opacity",
+                        !form.enabled && "opacity-60",
+                    )}
+                >
+                    {/* Working days */}
+                    <div className="px-5 py-5 space-y-2">
+                        <Eyebrow>Working days</Eyebrow>
+                        <WeekdayBitmask
+                            weekdays={[...WEEKDAY_LABELS]}
+                            value={form.weekdays}
+                            setValue={(v) => update({ weekdays: v })}
                         />
-                    </FieldShell>
-                    <FieldShell
-                        label="Cold emails per hour"
-                        hint="Stops a whole day's allowance landing in one burst before lunch."
-                    >
-                        <PairField
-                            min={form.hourly_limit_min}
-                            max={form.hourly_limit_max}
-                            onMin={(v) => update({ hourly_limit_min: v })}
-                            onMax={(v) => update({ hourly_limit_max: v })}
-                            suffix="/ hour"
-                            lowerBound={1}
-                        />
-                    </FieldShell>
-                    <FieldShell
-                        label="Delay between emails"
-                        hint={`Drawn fresh for every send, so the intervals stay irregular. Currently ${secondsToLabel(form.gap_min_seconds)} to ${secondsToLabel(form.gap_max_seconds)}.`}
-                    >
-                        <PairField
-                            min={form.gap_min_seconds}
-                            max={form.gap_max_seconds}
-                            onMin={(v) => update({ gap_min_seconds: v })}
-                            onMax={(v) => update({ gap_max_seconds: v })}
-                            suffix="seconds"
-                            step={15}
-                            lowerBound={30}
-                        />
-                    </FieldShell>
-                </div>
+                        <p className="text-[10.5px] text-slate-400 leading-relaxed">
+                            Days this mailbox sends anything at all, cold outreach and warmup alike.
+                        </p>
+                    </div>
+
+                    {/* Workday */}
+                    <div className="px-5 py-5 space-y-5">
+                        <Eyebrow>Workday</Eyebrow>
+                        <RangeRow
+                            icon={<SunriseIcon className="w-3.5 h-3.5" />}
+                            label="Starts somewhere between"
+                            hint="A different start time each day, so the mailbox never opens on the same minute twice."
+                        >
+                            <ClockPair
+                                min={form.work_start_min}
+                                max={form.work_start_max}
+                                onMin={(v) => update({ work_start_min: v })}
+                                onMax={(v) => update({ work_start_max: v })}
+                            />
+                        </RangeRow>
+                        <RangeRow
+                            icon={<SunsetIcon className="w-3.5 h-3.5" />}
+                            label="Finishes somewhere between"
+                            hint="Nothing is scheduled after the day's rolled finish time."
+                        >
+                            <ClockPair
+                                min={form.work_end_min}
+                                max={form.work_end_max}
+                                onMin={(v) => update({ work_end_min: v })}
+                                onMax={(v) => update({ work_end_max: v })}
+                            />
+                        </RangeRow>
+                    </div>
+
+                    {/* Lunch */}
+                    <div className="px-5 py-5 space-y-5">
+                        <div className="flex items-center justify-between gap-3">
+                            <Eyebrow>Lunch break</Eyebrow>
+                            <Toggle value={form.lunch_enabled} onChange={(v) => update({ lunch_enabled: v })} />
+                        </div>
+                        {form.lunch_enabled && (
+                            <>
+                                <RangeRow icon={<CoffeeIcon className="w-3.5 h-3.5" />} label="Starts somewhere between">
+                                    <ClockPair
+                                        min={form.lunch_earliest}
+                                        max={form.lunch_latest}
+                                        onMin={(v) => update({ lunch_earliest: v })}
+                                        onMax={(v) => update({ lunch_latest: v })}
+                                    />
+                                </RangeRow>
+                                <FieldShell label="Lasts" hint="A quiet gap in the middle of the day, like any real inbox has.">
+                                    <PairField
+                                        min={form.lunch_min_minutes}
+                                        max={form.lunch_max_minutes}
+                                        onMin={(v) => update({ lunch_min_minutes: v })}
+                                        onMax={(v) => update({ lunch_max_minutes: v })}
+                                        suffix="minutes"
+                                    />
+                                </FieldShell>
+                            </>
+                        )}
+                    </div>
+
+                    {/* Volume + spacing */}
+                    <div className="px-5 py-5 space-y-5">
+                        <Eyebrow>Volume and spacing</Eyebrow>
+                        <FieldShell
+                            label="Daily cold-email target range"
+                            hint="New-mailbox default: 28–32/day, about 30. Chosen once per local day and kept stable across retries. Mailbox and campaign maximums can lower it. Saved range changes apply from the next local day."
+                        >
+                            <PairField
+                                min={form.daily_limit_min}
+                                max={form.daily_limit_max}
+                                onMin={(v) => update({ daily_limit_min: v })}
+                                onMax={(v) => update({ daily_limit_max: v })}
+                                suffix="/ day"
+                                lowerBound={1}
+                            />
+                        </FieldShell>
+                        <FieldShell
+                            label="Cold emails per hour"
+                            hint="Stops a whole day's allowance landing in one burst before lunch."
+                        >
+                            <PairField
+                                min={form.hourly_limit_min}
+                                max={form.hourly_limit_max}
+                                onMin={(v) => update({ hourly_limit_min: v })}
+                                onMax={(v) => update({ hourly_limit_max: v })}
+                                suffix="/ hour"
+                                lowerBound={1}
+                            />
+                        </FieldShell>
+                        <FieldShell
+                            label="Delay between emails"
+                            hint={`Drawn fresh for every send, so the intervals stay irregular. Currently ${secondsToLabel(form.gap_min_seconds)} to ${secondsToLabel(form.gap_max_seconds)}. It replaces the mailbox's minimum gap while this is on, rather than adding to it.`}
+                        >
+                            <PairField
+                                min={form.gap_min_seconds}
+                                max={form.gap_max_seconds}
+                                onMin={(v) => update({ gap_min_seconds: v })}
+                                onMax={(v) => update({ gap_max_seconds: v })}
+                                suffix="seconds"
+                                step={15}
+                                lowerBound={30}
+                            />
+                        </FieldShell>
+                    </div>
+                </fieldset>
 
                 {/* Timezone note */}
                 <div className="px-5 py-4">
                     <div className="rounded-md border border-sky-100 bg-sky-50/70 px-3 py-2.5 flex gap-2.5">
                         <InfoIcon className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
                         <p className="text-[11.5px] text-sky-900/90 leading-relaxed">
-                            Every time here is local to <b>{tz || "UTC"}</b>, this mailbox&apos;s own timezone. Mailboxes in
-                            other regions keep their own working hours on the same campaign. Change the timezone on the
-                            mailbox to move the whole schedule.
+                            Every time here is local to <b>{tz || "UTC"}</b>: this mailbox&apos;s own timezone, or the
+                            workspace timezone when it has none. Mailboxes in other regions keep their own working hours on
+                            the same campaign. Change it on this mailbox&apos;s Settings tab. The workspace timezone under
+                            Settings &gt; Profile &gt; Timezones moves this schedule only while the mailbox follows it.
                         </p>
                     </div>
                 </div>

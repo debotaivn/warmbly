@@ -1,24 +1,40 @@
-// Sticky top bar. Holds the env pill, a search slot (unused for now —
-// reserved for the cmd-K palette we'll add later), and the user menu.
-// The 3px admin stripe sits *above* this bar in AppShell so it's the
-// first thing the eye lands on.
+// Mobile-only bar at the top of the page panel: the hamburger, the brand and
+// the search button. On desktop the sidebar carries all three.
 
-import { EnvPill } from "./EnvPill";
-import { UserMenu } from "./UserMenu";
+import { useState } from "react";
+import { Menu, Search } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Logo } from "@/components/Logo";
+import { openCommandPalette } from "./CommandPalette";
+import { MobileNav } from "./MobileNav";
 
 export function Topbar() {
+    const [mobileOpen, setMobileOpen] = useState(false);
+
     return (
-        <header className="h-14 shrink-0 border-b border-border bg-background/80 backdrop-blur sticky top-0 z-30">
-            <div className="h-full flex items-center gap-3 px-4">
-                <div className="flex items-center gap-2">
-                    <EnvPill />
-                    <span className="text-xs text-muted-foreground hidden sm:inline">
-                        Connected to <code className="text-foreground font-mono">/admin/*</code>
-                    </span>
-                </div>
-                <div className="flex-1" />
-                <UserMenu />
+        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 md:hidden">
+            <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Open navigation"
+                onClick={() => setMobileOpen(true)}
+            >
+                <Menu className="size-4" />
+            </Button>
+            <MobileNav open={mobileOpen} onOpenChange={setMobileOpen} />
+            <div className="flex items-center gap-2 text-[13px] font-medium">
+                <Logo className="size-4" />
+                Warmbly Admin
             </div>
+            <Button
+                variant="ghost"
+                size="icon-sm"
+                className="ml-auto"
+                aria-label="Search and go to"
+                onClick={openCommandPalette}
+            >
+                <Search className="size-4" />
+            </Button>
         </header>
     );
 }

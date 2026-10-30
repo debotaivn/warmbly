@@ -1,6 +1,8 @@
 import { NoAccess } from "@/components/layout/NoAccess";
 import { usePermission } from "@/hooks/usePermission";
 import { useUserProfile } from "@/hooks/context/user";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseText, campaignStatusSchema, campaignSortSchema } from "@/lib/browse-contacts-campaigns";
 import useCampaigns from "@/lib/api/hooks/app/campaigns/useCampaigns";
 import useStartCampaign from "@/lib/api/hooks/app/campaigns/useStartCampaign";
 import useStopCampaign from "@/lib/api/hooks/app/campaigns/useStopCampaign";
@@ -12,14 +14,14 @@ import AdvisorSummaryBar from "@/components/app/advisor/AdvisorSummaryBar";
 import { useAdvisorEntityIndex } from "@/lib/api/hooks/app/advisor/useAdvisor";
 import LaunchCampaignDialog from "@/components/app/campaigns/LaunchCampaignDialog";
 import CampaignActionsMenu from "@/components/app/campaigns/CampaignActionsMenu";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 import type Campaign from "@/lib/api/models/app/campaigns/Campaign";
 import type Folder from "@/lib/api/models/app/Folder";
 import { cn, hexToRgba } from "@/lib/utils";
 import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "@tanstack/react-router";
 import {
     AlertTriangleIcon,
     CalendarIcon,
@@ -28,6 +30,7 @@ import {
     FileTextIcon,
     FilterIcon,
     FolderIcon,
+    HourglassIcon,
     Loader2Icon,
     type LucideIcon,
     PauseIcon,
@@ -48,9 +51,12 @@ import {
 } from "@/components/layout/Page";
 import { SearchInput } from "@/components/ui/field";
 import {
-    CAMPAIGN_STATUS_LABEL,
+    campaignDisplayLabel,
+    CAMPAIGN_IDLE_TONE,
+    campaignDisplayTone,
     campaignStatusBucket as statusBucket,
     campaignStatusTone as statusTone,
+    isIdleCampaign,
 } from "@/components/app/campaigns/status";
 import {
     PopoverMenu,
@@ -69,10 +75,11 @@ type SortMode = "newest" | "oldest" | "name";
 // animated dot-grid loader; every other state is a 14px lucide icon so the
 // fixed-width leading slot keeps each row's name aligned. The label/tone maps
 // live in components/app/campaigns/status so pickers share them.
-const STATUS_LABEL = CAMPAIGN_STATUS_LABEL;
-
-function CampaignStatusMark({ status }: { status: string }) {
+function CampaignStatusMark({ status, idle }: { status: string; idle?: boolean }) {
     const tone = statusTone(status);
+    if (idle) {
+        return <HourglassIcon className={cn("w-3.5 h-3.5", CAMPAIGN_IDLE_TONE)} aria-label="Waiting for leads" />;
+    }
     if (status === "active") {
         return <span className={cn("campaign-grid", tone)} aria-hidden title="Sending now" />;
     }
@@ -240,11 +247,15 @@ export default function CampaignsPage() {
     const canView = usePermission("VIEW_CAMPAIGNS");
     const startCampaign = useStartCampaign();
     const stopCampaign = useStopCampaign();
-    const [folder, setFolder] = useState<string>("");
-    const [query, setQuery] = useState<string>("");
-    const [status, setStatus] = useState<StatusFilter>("all");
-    const [sort, setSort] = useState<SortMode>("newest");
+    const [folder, setFolder] = useBrowseState("campaigns:list:folder", "", browseText);
+    const [query, setQuery] = useBrowseState("campaigns:list:query", "", browseText);
+    const [status, setStatus] = useBrowseState<StatusFilter>("campaigns:list:status", "all", campaignStatusSchema);
+    const [sort, setSort] = useBrowseState<SortMode>("campaigns:list:sort", "newest", campaignSortSchema);
     const [newOpen, setNewOpen] = useState<boolean>(false);
+    // A draft clicked in the list reopens in the new-campaign flow, for a
+    // member who may edit it; anyone else gets the campaign page.
+    const [draftId, setDraftId] = useState<string | null>(null);
+    const canManage = usePermission("MANAGE_CAMPAIGNS");
     const [launchTarget, setLaunchTarget] = useState<Campaign | null>(null);
 
     async function toggleCampaign(id: string, currentStatus: string) {
@@ -287,9 +298,7 @@ export default function CampaignsPage() {
     const activeFolder = folders.find((f) => f.id === folder);
 
     const filtered = useMemo(() => {
-        const base = status === "all"
-            ? campaigns
-            : campaigns.filter((c) => statusBucket(c.status) === status);
+        const base = campaigns.filter((c) => status === "all" || statusBucket(c.status) === status);
         const sorted = [...base];
         if (sort === "newest") {
             sorted.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -388,7 +397,7 @@ export default function CampaignsPage() {
                     <PopoverMenuTrigger asChild>
                         <SelectButton
                             icon={<FolderIcon className="w-3.5 h-3.5" />}
-                            label={activeFolder?.title ?? "All folders"}
+                            label={activeFolder?.title ?? (folder ? "Selected folder" : "All folders")}
                         />
                     </PopoverMenuTrigger>
                     <PopoverMenuContent minWidth={200}>
@@ -503,34 +512,43 @@ export default function CampaignsPage() {
                     <div className="divide-y divide-slate-200/60">
                         {filtered.map((c) => {
                             const cstatus = c.status ?? "draft";
-                            const stateLabel = STATUS_LABEL[cstatus] ?? cstatus;
+                            const stateLabel = campaignDisplayLabel(c);
                             const StateIcon =
                                 cstatus === "active" ? PauseIcon : PlayIcon;
                             return (
                                 <Link
                                     key={c.id}
-                                    to={`/app/campaigns/${c.id}`}
+                                    to="/app/campaigns/$id"
+                                    params={{ id: c.id }}
+                                    onClick={(e) => {
+                                        // A modified click still opens the page, in a new tab or not.
+                                        if (!canManage || cstatus !== "draft" || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                                        e.preventDefault();
+                                        setDraftId(c.id);
+                                    }}
                                     className="group h-11 px-5 flex items-center gap-3 hover:bg-slate-50 transition-colors"
                                 >
                                     {/* Fixed-width leading slot so every row's name aligns,
                                         whatever state mark (loader or icon) sits in it. */}
                                     <span className="shrink-0 w-3.5 flex items-center justify-center">
-                                        <CampaignStatusMark status={cstatus} />
+                                        <CampaignStatusMark status={cstatus} idle={isIdleCampaign(c)} />
                                     </span>
-                                    <span className="text-[12.5px] text-slate-900 font-medium truncate max-w-[40%]">
-                                        {c.name}
-                                    </span>
-                                    <span className="font-mono text-[10.5px] text-slate-400 tabular-nums shrink-0 hidden sm:inline">
-                                        {c.id.slice(0, 8)}
-                                    </span>
-                                    <AdvisorRowFlag findings={advisor.get(c.id)} subject={c.name} />
-                                    <CampaignFolderChips campaign={c} folders={folders} />
-                                    {c.description && (
-                                        <span className="text-[11.5px] text-slate-400 truncate hidden md:inline">
-                                            {c.description}
+                                    <div className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden">
+                                        <span className="min-w-0 text-[12.5px] text-slate-900 font-medium truncate" title={c.name}>
+                                            {c.name}
                                         </span>
-                                    )}
-                                    <span className={cn("ml-auto text-[10px] uppercase tracking-[0.1em] font-medium shrink-0", statusTone(cstatus))}>
+                                        <span className="font-mono text-[10.5px] text-slate-400 tabular-nums shrink-0 hidden sm:inline">
+                                            {c.id.slice(0, 8)}
+                                        </span>
+                                        <AdvisorRowFlag findings={advisor.get(c.id)} subject={c.name} />
+                                        <CampaignFolderChips campaign={c} folders={folders} />
+                                        {c.description && (
+                                            <span className="min-w-0 flex-1 text-[11.5px] text-slate-400 truncate hidden md:inline">
+                                                {c.description}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <span className={cn("ml-auto text-[10px] uppercase tracking-[0.1em] font-medium shrink-0", campaignDisplayTone(c))}>
                                         {stateLabel}
                                     </span>
                                     <span className="font-mono text-[10.5px] text-slate-400 tabular-nums items-center gap-1 shrink-0 hidden sm:flex">
@@ -573,7 +591,14 @@ export default function CampaignsPage() {
                 )}
             </PageBody>
 
-            <NewCampaignDialog open={newOpen} onClose={() => setNewOpen(false)} />
+            <NewCampaignDialog
+                open={newOpen || draftId !== null}
+                draftId={draftId}
+                onClose={() => {
+                    setNewOpen(false);
+                    setDraftId(null);
+                }}
+            />
             <LaunchCampaignDialog
                 campaign={launchTarget}
                 onClose={() => setLaunchTarget(null)}

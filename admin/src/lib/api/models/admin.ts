@@ -9,10 +9,6 @@ export type WorkerInstallState =
     | "uninstalling"
     | "uninstalled";
 
-export type WorkerType = "shared" | "dedicated";
-
-export type WorkerRiskPool = "clean" | "risky" | "quarantine";
-export type WorkerEgressKind = "cold_smtp" | "oauth_api" | "warmup_only";
 export type WorkerHealthState =
     | "healthy"
     | "watch"
@@ -26,11 +22,9 @@ export interface ManagedWorker {
     notes: string;
     ip_addr: string;
     active: boolean;
-    free_tier: boolean;
-    worker_type: WorkerType;
     account_count: number;
-    risk_pool: WorkerRiskPool;
-    egress_kind: WorkerEgressKind;
+    /** Sign-in geography hint the placer scores on. Empty is fine. */
+    region: string;
     health_state: WorkerHealthState;
     load_score: number;
 
@@ -66,8 +60,8 @@ export interface AdminWorkerEmail {
     risk_band: string; // clean | risky | quarantine
     risk_evaluated_at?: string | null;
     warmup_health?: string; // worst warmup health_state, "" if not in a pool
-    spam_score?: number | null;
     blocked_until?: string | null;
+    created_at: string;
 }
 
 export interface AdminWorkerEmailsResult {
@@ -82,8 +76,8 @@ export interface AdminWorkerEmailsResult {
 export interface CreateWorkerInput {
     name: string;
     notes?: string;
-    worker_type: WorkerType;
-    free_tier: boolean;
+    /** Optional sign-in geography hint. The only placement input an operator sets. */
+    region?: string;
     ssh_host: string;
     ssh_port?: number;
     ssh_user?: string;
@@ -136,9 +130,12 @@ export interface AdminAuditLogSearch {
 }
 
 export interface AdminAuditLogsResult {
-    data: AdminAuditLog[];
+    // Nullable on purpose, like AdminUserPreview's slices: a backend older than
+    // the make-not-declare fix in pg_admin.go answers null for an empty page,
+    // and typing it as an array is what let `data.data.length` crash the page.
+    data: AdminAuditLog[] | null;
     pagination: {
-        cursor?: string;
+        next_cursor?: string | null;
         has_more?: boolean;
     };
 }
@@ -193,6 +190,7 @@ export interface AdminMailboxesResult {
 }
 
 export interface AdminMailboxSearch {
+    mailbox_id?: string;
     q?: string;
     status?: string;
     provider?: string;
@@ -245,16 +243,6 @@ export interface DailyEmailStat {
 export interface HourlyEmailStat {
     hour: number;
     total_sent: number;
-}
-
-export interface WorkerLoadStat {
-    worker_id: string;
-    worker_name: string;
-    emails_sent_today: number;
-    queued_emails: number;
-    connected_emails: number;
-    cpu_usage?: number;
-    memory_usage?: number;
 }
 
 export interface UserGrowthStat {
@@ -407,82 +395,6 @@ export interface AdminLimitRequestSearch {
     sort_desc?: boolean;
 }
 
-// /admin/plans — plan catalog and custom-plan management.
-
-export interface Plan {
-    id: string;
-    name?: string | null;
-    max_contacts: number;
-    daily_emails: number;
-    ai_generation: boolean;
-    account_limit: number;
-    price: number;
-    discounted_price: number;
-    duration: { id: string; title: string } | string;
-    savings: number;
-    public: boolean;
-    stripe_price_id?: string | null;
-    stripe_product_id?: string | null;
-    dedicated_workers: number;
-    daily_campaign_limit?: number | null;
-    max_campaigns?: number | null;
-    max_active_campaigns?: number | null;
-    max_team_members?: number | null;
-    max_email_accounts?: number | null;
-    updated_at: string;
-    created_at: string;
-}
-
-export interface UpdatePlanRequest {
-    name?: string;
-    max_contacts?: number;
-    daily_emails?: number;
-    ai_generation?: boolean;
-    account_limit?: number;
-    price?: number;
-    discounted_price?: number;
-    dedicated_workers?: number;
-    daily_campaign_limit?: number;
-    max_campaigns?: number;
-    max_active_campaigns?: number;
-    max_team_members?: number;
-    max_email_accounts?: number;
-    public?: boolean;
-}
-
-export interface AdminPlanSearch {
-    q?: string;
-    visibility?: "public" | "private" | "";
-    duration?: string; // "month" | "year"; "" = any
-    ai_generation?: boolean;
-    has_stripe?: boolean;
-    has_subscribers?: boolean;
-    // Numeric ranges
-    price_min?: number;
-    price_max?: number;
-    daily_emails_min?: number;
-    daily_emails_max?: number;
-    account_limit_min?: number;
-    account_limit_max?: number;
-    // Date range
-    created_within?: number;
-    created_after?: string;
-    created_before?: string;
-    cursor?: string;
-    limit?: number;
-    sort_by?: "price" | "name" | "daily_emails" | "account_limit" | "created_at";
-    sort_desc?: boolean;
-}
-
-export interface AdminPlansResult {
-    data: Plan[];
-    pagination: {
-        total?: number | null;
-        next_cursor?: string | null;
-        has_more: boolean;
-    };
-}
-
 // /admin/campaigns/* — platform-wide campaign admin (force-stop runaway
 // campaigns, inspect engagement counters per campaign).
 
@@ -571,7 +483,7 @@ export type WarmupAppealStatus = "pending" | "approved" | "rejected";
 export interface WarmupPoolHealthSummary {
     total_participants: number;
     by_state: Record<string, number>;
-    avg_spam_score: number;
+    avg_health_score: number;
     avg_spam_placement_rate: number;
     spam_placement_by_provider: Record<string, number>;
     blocked_count: number;
@@ -664,6 +576,12 @@ export interface AdminUserDetail {
     banned_at?: string | null;
     created_at: string;
     updated_at: string;
+    /** Excused from the emailed sign-in code by an operator. */
+    login_code_exempt?: boolean;
+    login_code_exempt_reason?: string | null;
+    login_code_exempt_at?: string | null;
+    /** Set only on a tester whose password was handed out. */
+    password_expires_at?: string | null;
     organization_count: number;
     email_account_count: number;
     campaign_count: number;
@@ -782,6 +700,9 @@ export interface UnbanUserRequest {
     reason: string;
 }
 
+// The four slices are nullable on purpose: a backend older than the
+// empty-slice fix in pg_admin.go answers null, and typing them as arrays is
+// what let `email_accounts.length` take the whole page down.
 export interface AdminUserPreview {
     user: AdminUserDetail;
     organizations: Array<{
@@ -791,7 +712,7 @@ export interface AdminUserPreview {
         owner_user_id: string;
         created_at: string;
         updated_at: string;
-    }>;
+    }> | null;
     subscriptions: Array<{
         id: string;
         organization_id: string;
@@ -800,7 +721,7 @@ export interface AdminUserPreview {
         is_enterprise: boolean;
         current_period_end?: string | null;
         trial_end?: string | null;
-    }>;
+    }> | null;
     email_accounts: Array<{
         id: string;
         email: string;
@@ -809,14 +730,15 @@ export interface AdminUserPreview {
         provider: string;
         warmup_enabled: boolean;
         last_synced_at: string;
-    }>;
-    recent_bans: UserBan[];
+    }> | null;
+    recent_bans: UserBan[] | null;
     rate_limits?: AdminUserRateLimits | null;
 }
 
 // /admin/organizations* — workspace admin (read-only slice).
 
 export interface AdminOrgListItem {
+    category: "standard" | "test";
     id: string;
     name: string;
     slug?: string | null;
@@ -832,9 +754,22 @@ export interface AdminOrgListItem {
     campaign_count: number;
     active_campaigns: number;
     risk_state?: OrgRiskState | null;
+    /** Acquisition recorded once at signup; check referrer_host too, since an absent UTM source is unknown. */
+    utm_source?: string | null;
+    utm_medium?: string | null;
+    utm_campaign?: string | null;
+    landing_path?: string | null;
+    referrer_host?: string | null;
     plan_name?: string | null;
     plan_public?: boolean | null;
     is_enterprise: boolean;
+    /** Paid because an operator said so, not because Stripe says so. */
+    managed_plan: boolean;
+    /** A grant that lapsed. Distinct from never having had one: the workspace
+     *  is back on free and the reason is still on file. */
+    managed_plan_expired: boolean;
+    managed_plan_reason?: string | null;
+    managed_plan_until?: string | null;
 }
 
 /** The workspace's fused abuse posture. */
@@ -966,8 +901,17 @@ export interface AdminOrgSearch {
     created_within?: number; // days; omit for any
     has_overrides?: boolean;
     enterprise?: boolean;
+    /** Plans an operator granted rather than Stripe. */
+    managed_plan?: boolean;
     risk_state?: OrgRiskState | "";
     risk_flagged?: boolean;
+    // Acquisition channel
+    utm_source?: string;
+    utm_medium?: string;
+    utm_campaign?: string;
+    has_acquisition?: boolean;
+    no_acquisition?: boolean;
+    referrer_host?: string;
     // Subscription state
     subscription_status?: string;
     cancel_at_period_end?: boolean;
@@ -997,4 +941,359 @@ export interface AdminOrgSearch {
     limit?: number;
     sort_by?: "created_at" | "name" | "owner_email" | "member_count" | "email_account_count" | "campaign_count";
     sort_desc?: boolean;
+}
+
+/** A plan an operator granted rather than Stripe, for internal workspaces,
+ *  design partners and support gestures. */
+export interface ManagedPlan {
+    managed: boolean;
+    expired: boolean;
+    plan_id: string;
+    granted_at?: string | null;
+    granted_by?: string | null;
+    reason?: string | null;
+    until?: string | null;
+}
+
+/** A plan row as the admin plans endpoint returns it. Only the fields the
+ *  grant picker needs. */
+export interface AdminPlan {
+    id: string;
+    name?: string | null;
+    public?: boolean | null;
+    price?: number | string | null;
+}
+
+/** A private plan an operator lets one workspace buy. */
+export interface PlanOffer {
+    organization_id: string;
+    plan_id: string;
+    granted_by?: string | null;
+    reason: string;
+    granted_at: string;
+    expires_at?: string | null;
+    plan?: AdminPlan | null;
+    /** Still open: not past expires_at. */
+    active: boolean;
+}
+
+/** An operator's permission for linked instances to warm without handing over credentials. */
+export interface SelfExecutionGrant {
+    organization_id: string;
+    granted_by?: string | null;
+    reason: string;
+    granted_at: string;
+    expires_at?: string | null;
+}
+
+export interface SelfExecutionStatus {
+    grant: SelfExecutionGrant | null;
+    active: boolean;
+}
+
+export type ReporterTrustState = "trusted" | "probation" | "untrusted";
+
+/** How far Cloud trusts one credential-free mailbox's placement reports. */
+export interface SelfExecutedMailbox {
+    email_account_id: string;
+    email: string;
+    trust_state: ReporterTrustState;
+    reported_samples: number;
+    divergence?: number | null;
+    evaluated_at?: string | null;
+    last_leased_at?: string | null;
+}
+
+/** An account excused from the emailed login code. */
+export interface LoginCodeExemption {
+    user_id: string;
+    email: string;
+    reason?: string | null;
+    granted_at?: string | null;
+    /** When the handed-out password stops working; absent for an account
+     *  exempted without one. */
+    password_expires_at?: string | null;
+    test_workspace_id?: string | null;
+    sample_data_seeded_at?: string | null;
+}
+
+/** The one time the password is readable. It is not stored in a form anyone
+ *  can recover, so losing it means making another tester. */
+export interface CreatedTester {
+    user_id: string;
+    email: string;
+    organization_id: string;
+    password: string;
+    /** When the password stops working. */
+    password_expires_at: string;
+    /** True when the tester joined a workspace that already existed rather
+     *  than one minted for it. */
+    joined_existing: boolean;
+}
+
+/** A workspace role, as the Testers page offers them. Roles are ordinary rows
+ *  an org can rename or delete, so the list is per workspace and not fixed. */
+export interface AdminOrgRole {
+    id: string;
+    organization_id: string;
+    name: string;
+    description?: string | null;
+    color?: string | null;
+    permissions: number;
+}
+
+// --- Promo codes -----------------------------------------------------------
+//
+// Mirrors internal/models/discount.go. A code is the operator-owned half of
+// the discount system: the customer types it at checkout, the backend
+// validates it here and mints a matching one-off Stripe coupon per redemption.
+
+export type DiscountType = "percent" | "fixed" | "trial_extension";
+export type DiscountDuration = "once" | "repeating" | "forever";
+export type DiscountCodeStatus = "active" | "disabled" | "expired";
+export type DiscountRedemptionStatus = "pending" | "applied" | "canceled";
+
+export interface DiscountCode {
+    id: string;
+    code: string;
+    description: string;
+    type: DiscountType;
+
+    percent_off?: number | null;
+    amount_off?: number | null;
+    currency?: string | null;
+    trial_extension_days?: number | null;
+
+    duration: DiscountDuration;
+    duration_in_months?: number | null;
+
+    /** null = uncapped across all workspaces. */
+    max_redemptions?: number | null;
+    times_redeemed: number;
+    /** How many times ONE workspace may redeem it. Always at least 1. */
+    per_account_limit: number;
+
+    applies_to_all_plans: boolean;
+    plan_ids: string[];
+
+    status: DiscountCodeStatus;
+    starts_at?: string | null;
+    expires_at?: string | null;
+
+    created_by?: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+/** One workspace's use of a code. The value fields are a snapshot taken at
+ *  redemption, so editing the code later never rewrites history. */
+export interface DiscountRedemption {
+    id: string;
+    discount_code_id: string;
+    organization_id: string;
+    redeemed_by?: string | null;
+    subscription_id?: string | null;
+    plan_id?: string | null;
+    stripe_coupon_id?: string | null;
+    stripe_checkout_session_id?: string | null;
+
+    type: DiscountType;
+    percent_off?: number | null;
+    amount_off?: number | null;
+    currency?: string | null;
+    trial_extension_days?: number | null;
+
+    status: DiscountRedemptionStatus;
+    redeemed_at: string;
+    applied_at?: string | null;
+    code?: string;
+}
+
+export interface AdminDiscountsResult {
+    data: DiscountCode[];
+    pagination: {
+        total?: number | null;
+        next_cursor?: string | null;
+        has_more: boolean;
+    };
+}
+
+export interface AdminDiscountRedemptionsResult {
+    data: DiscountRedemption[];
+    pagination: {
+        total?: number | null;
+        next_cursor?: string | null;
+        has_more: boolean;
+    };
+}
+
+export interface AdminDiscountSearch {
+    /** The backend binds free text as `search`, not `q`. */
+    search?: string;
+    status?: DiscountCodeStatus | "all" | "";
+    type?: DiscountType | "";
+    duration?: DiscountDuration | "";
+
+    plan_scope?: "all" | "specific" | "";
+    plan_id?: string;
+
+    has_redemptions?: boolean;
+    has_max_redemptions?: boolean;
+    exhausted?: boolean;
+    has_expiry?: boolean;
+
+    times_redeemed_min?: number;
+    times_redeemed_max?: number;
+    percent_off_min?: number;
+    percent_off_max?: number;
+
+    created_within?: number;
+    created_after?: string;
+    created_before?: string;
+    starts_after?: string;
+    starts_before?: string;
+    expires_after?: string;
+    expires_before?: string;
+
+    cursor?: string;
+    limit?: number;
+    sort_by?:
+        | "created_at"
+        | "code"
+        | "status"
+        | "times_redeemed"
+        | "expires_at"
+        | "starts_at"
+        | "updated_at";
+    sort_desc?: boolean;
+}
+
+export interface CreateDiscountCodeRequest {
+    code: string;
+    description?: string;
+    type: DiscountType;
+    percent_off?: number;
+    amount_off?: number;
+    currency?: string;
+    trial_extension_days?: number;
+    duration?: DiscountDuration;
+    duration_in_months?: number;
+    max_redemptions?: number;
+    per_account_limit?: number;
+    applies_to_all_plans: boolean;
+    plan_ids?: string[];
+    status?: DiscountCodeStatus;
+    starts_at?: string;
+    expires_at?: string;
+}
+
+/** Partial update. `type` is immutable; recreate the code to change kinds.
+ *  The three caps take an explicit null to clear them: an omitted key leaves
+ *  the column alone, which is not the same as lifting an expiry. */
+export type UpdateDiscountCodeRequest = Partial<
+    Omit<CreateDiscountCodeRequest, "code" | "type" | "max_redemptions" | "starts_at" | "expires_at">
+> & {
+    max_redemptions?: number | null;
+    starts_at?: string | null;
+    expires_at?: string | null;
+};
+
+// Community app directory (/admin/app-listings). published = link only (listed
+// once enough workspaces use it), featured = picked by us, hidden = taken down.
+export type AppListingStatus = "published" | "featured" | "hidden";
+
+export interface AdminAppListing {
+    application_id: string;
+    organization_id: string;
+    slug: string;
+    tagline: string;
+    description: string;
+    category: string;
+    install_url: string;
+    support_url: string;
+    privacy_url: string;
+    status: AppListingStatus;
+    status_note?: string;
+    status_at?: string | null;
+    submitted_at: string;
+    created_at: string;
+    updated_at: string;
+    name: string;
+    logo_url: string;
+    website_url: string;
+    scopes: number;
+    permissions: { name: string; value: number; description: string; category: string }[];
+    app_status: string;
+    organization_name: string;
+    installs: number;
+    /** Shown in the directory: featured, or used by enough workspaces. */
+    listed: boolean;
+    status_by?: string | null;
+    status_by_email?: string;
+}
+
+export interface AdminAppListingsResult {
+    data: AdminAppListing[];
+    pagination: {
+        total?: number | null;
+        next_cursor?: string | null;
+        has_more: boolean;
+    };
+}
+
+export interface AdminAppListingSearch {
+    q?: string;
+    status?: AppListingStatus | "";
+    limit?: number;
+    cursor?: string;
+}
+
+// OAuth app moderation (/admin/oauth-apps) and developer blocks.
+export interface AdminOAuthApp {
+    id: string;
+    organization_id: string;
+    organization_name: string;
+    created_by: string;
+    created_by_email: string;
+    name: string;
+    description: string;
+    logo_url: string;
+    website_url: string;
+    client_id: string;
+    redirect_uris: string[];
+    webhook_url: string;
+    permissions: { name: string; value: number; description: string; category: string }[];
+    status: "active" | "disabled";
+    is_public: boolean;
+    suspended_at?: string | null;
+    suspended_reason?: string;
+    installs: number;
+    listing_slug?: string;
+    listing_status?: AppListingStatus | "";
+    org_blocked: boolean;
+    creator_blocked: boolean;
+    created_at: string;
+}
+
+export interface AdminOAuthAppsResult {
+    data: AdminOAuthApp[];
+    pagination: { total?: number | null; next_cursor?: string | null; has_more: boolean };
+}
+
+export interface AdminOAuthAppSearch {
+    q?: string;
+    status?: "active" | "disabled" | "suspended" | "";
+    limit?: number;
+    cursor?: string;
+}
+
+export interface OAuthDeveloperBlock {
+    id: string;
+    organization_id?: string | null;
+    organization_name?: string;
+    user_id?: string | null;
+    user_email?: string;
+    reason: string;
+    blocked_by_email?: string;
+    created_at: string;
 }

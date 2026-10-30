@@ -6,7 +6,7 @@
 //   - usage graph (24h request volume, status-code split)
 //   - top endpoints
 //   - recent request log
-//   - actions (revoke, edit name/description)
+//   - actions (revoke, delete once revoked, edit name/description)
 //
 // Slides in from the right; closes on backdrop click or Escape.
 
@@ -23,19 +23,24 @@ import {
     NetworkIcon,
     RefreshCwIcon,
     ShieldCheckIcon,
+    Trash2Icon,
     TrashIcon,
     XIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 
 import type APIKey from "@/lib/api/models/app/apikeys/APIKey";
+import { keyCanAuthenticate, keyStatus } from "@/lib/api/models/app/apikeys/APIKey";
 import useAPIKeyAnalytics from "@/lib/api/hooks/app/api-keys/useAPIKeyAnalytics";
 import useAPIKeyUsageLogs from "@/lib/api/hooks/app/api-keys/useAPIKeyUsageLogs";
 import useAPIPermissions from "@/lib/api/hooks/app/api-keys/useAPIPermissions";
 import useRevokeAPIKey from "@/lib/api/hooks/app/api-keys/useRevokeAPIKey";
+import useDeleteAPIKey from "@/lib/api/hooks/app/api-keys/useDeleteAPIKey";
 import useUpdateAPIKey from "@/lib/api/hooks/app/api-keys/useUpdateAPIKey";
 import { StackedBars } from "./Sparkline";
 import { useConfirm } from "@/hooks/context/confirm";
+import type { AppError } from "@/lib/api/client/normalizeError";
+import buildError from "@/lib/helper/buildError";
 
 export default function KeyDetailDrawer({
     apiKey,
@@ -84,6 +89,7 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
     const logs = useAPIKeyUsageLogs(apiKey.id, { limit: 50 });
     const perms = useAPIPermissions();
     const revoke = useRevokeAPIKey();
+    const remove = useDeleteAPIKey();
     const update = useUpdateAPIKey();
     const confirm = useConfirm();
 
@@ -131,6 +137,23 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
         );
     }
 
+    // Deleting is the second step after revoking, never a shortcut past it:
+    // the backend refuses a key that can still authenticate.
+    function confirmDelete() {
+        confirm.show(
+            `Delete "${apiKey.name}" for good? The key and its request history are removed, and that cannot be undone.`,
+            async () => {
+                try {
+                    await remove.mutateAsync(apiKey.id);
+                    toast.success("Key deleted");
+                    onClose();
+                } catch (err) {
+                    toast.error(buildError(err as AppError));
+                }
+            },
+        );
+    }
+
     const grantedPermissions = React.useMemo(() => {
         if (!perms.data) return [];
         return perms.data.permissions.filter((p) => (apiKey.permissions & p.value) !== 0);
@@ -147,7 +170,7 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
                 <span className="font-mono text-[11.5px] text-slate-900 truncate">
                     {apiKey.key_prefix}…{apiKey.key_suffix}
                 </span>
-                <StatusBadge status={apiKey.status} />
+                <StatusBadge status={keyStatus(apiKey)} />
                 <button
                     type="button"
                     onClick={onClose}
@@ -200,7 +223,7 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
                         <div>
                             <div className="flex items-center gap-2">
                                 <h2 className="text-[15px] font-medium text-slate-900 truncate">{apiKey.name}</h2>
-                                {apiKey.status === "active" && (
+                                {keyCanAuthenticate(apiKey) && (
                                     <button
                                         type="button"
                                         onClick={() => setEditing(true)}
@@ -213,7 +236,7 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
                             {apiKey.description && (
                                 <p className="text-[12px] text-slate-500 mt-0.5 leading-relaxed">{apiKey.description}</p>
                             )}
-                            <div className="mt-2 grid grid-cols-3 gap-3 text-[10.5px]">
+                            <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-3 text-[10.5px]">
                                 <MiniField label="Created" value={fmtRelative(apiKey.created_at)} />
                                 <MiniField label="Last used" value={apiKey.last_used_at ? fmtRelative(apiKey.last_used_at) : "never"} />
                                 <MiniField label="Last IP" value={apiKey.last_request_ip || "—"} mono />
@@ -351,7 +374,7 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
                 {/* Activity log */}
                 <section className="px-5 py-4">
                     <SectionLabel
-                        title={`Recent activity${logs.data ? ` · ${logs.data.data.length}` : ""}`}
+                        title={`Recent activity${logs.data?.data ? ` · ${logs.data.data.length}` : ""}`}
                         icon={<ClockIcon className="w-3 h-3" />}
                     />
                     {logs.isPending ? (
@@ -385,8 +408,8 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
             </div>
 
             {/* Footer */}
-            <div className="h-12 px-4 border-t border-slate-200 flex items-center bg-white shrink-0">
-                {apiKey.status === "active" ? (
+            <div className="h-12 px-4 border-t border-slate-200 flex items-center gap-2 bg-white shrink-0">
+                {keyCanAuthenticate(apiKey) ? (
                     <button
                         type="button"
                         onClick={confirmRevoke}
@@ -397,16 +420,43 @@ function Inner({ apiKey, onClose }: { apiKey: APIKey; onClose: () => void }) {
                         Revoke key
                     </button>
                 ) : (
-                    <span className="text-[11.5px] text-slate-500 inline-flex items-center gap-1.5">
-                        <span className="size-1.5 rounded-full bg-rose-500" />
-                        Revoked {apiKey.revoked_at ? fmtRelative(apiKey.revoked_at) : ""}
-                        {apiKey.revoked_reason ? ` · ${apiKey.revoked_reason}` : ""}
-                    </span>
+                    <>
+                        {/* flex-1 rather than a second ml-auto: two auto margins
+                            in one row split the free space and park the button
+                            in the middle of the footer. */}
+                        <span className="flex-1 min-w-0 text-[11.5px] text-slate-500 inline-flex items-center gap-1.5">
+                            <span
+                                className={`size-1.5 rounded-full shrink-0 ${
+                                    keyStatus(apiKey) === "expired" ? "bg-slate-400" : "bg-rose-500"
+                                }`}
+                            />
+                            <span className="truncate">{endedNote(apiKey)}</span>
+                        </span>
+                        <button
+                            type="button"
+                            onClick={confirmDelete}
+                            disabled={remove.isPending}
+                            className="shrink-0 h-7 px-3 rounded-md border border-rose-200 text-rose-700 hover:bg-rose-50 hover:border-rose-300 text-[12px] inline-flex items-center gap-1.5 transition-colors disabled:opacity-60"
+                        >
+                            {remove.isPending ? <Loader2Icon className="w-3 h-3 animate-spin" /> : <Trash2Icon className="w-3 h-3" />}
+                            Delete key
+                        </button>
+                    </>
                 )}
-                <ChevronRightIcon className="w-3 h-3 text-slate-300 ml-auto" />
+                <ChevronRightIcon className="w-3 h-3 text-slate-300 ml-auto shrink-0" />
             </div>
         </>
     );
+}
+
+// What ended the key, for the footer of a key that can no longer authenticate.
+function endedNote(key: APIKey): string {
+    if (keyStatus(key) === "expired") {
+        return `Expired ${key.expires_at ? fmtRelative(key.expires_at) : ""}`.trim();
+    }
+    const when = key.revoked_at ? ` ${fmtRelative(key.revoked_at)}` : "";
+    const why = key.revoked_reason ? ` · ${key.revoked_reason}` : "";
+    return `Revoked${when}${why}`;
 }
 
 function StatusBadge({ status }: { status: "active" | "revoked" | "expired" }) {
@@ -495,7 +545,7 @@ function Legend({ color, label }: { color: string; label: string }) {
     );
 }
 
-function fmtRelative(iso: string): string {
+function fmtRelative(iso: string | Date): string {
     try {
         const d = new Date(iso);
         const diff = Date.now() - d.getTime();
@@ -513,7 +563,7 @@ function fmtRelative(iso: string): string {
     }
 }
 
-function fmtFull(iso: string): string {
+function fmtFull(iso: string | Date): string {
     try {
         const d = new Date(iso);
         return d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -524,7 +574,7 @@ function fmtFull(iso: string): string {
 
 // Compact HH:MM for the mobile activity log, where the full timestamp
 // would crowd out the endpoint path.
-function fmtTime(iso: string): string {
+function fmtTime(iso: string | Date): string {
     try {
         const d = new Date(iso);
         return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });

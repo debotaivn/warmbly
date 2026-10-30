@@ -3,6 +3,7 @@ package scheduler
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/warmbly/warmbly/internal/config"
@@ -25,15 +26,17 @@ var (
 	ErrNoEmailAccounts = errors.New("no email accounts available for this campaign")
 
 	// ErrNoEligibleMailbox is the narrower case: the campaign HAS mailboxes,
-	// but every one was gated out for both today and tomorrow (daily cap
-	// reached, warmup health, or outside its own sending window). Reporting
-	// that as ErrNoEmailAccounts sent people looking at their tag configuration
-	// for a problem that was never there.
+	// but none can send under its current settings, and waiting will not
+	// change that (a sending-behaviour profile with no working days). A gate
+	// that lifts on its own, such as a spent daily budget, a closed sending
+	// window or a warmup health hold, is a deferral instead, never this.
+	// Reporting this as ErrNoEmailAccounts sent people looking at their tag
+	// configuration for a problem that was never there.
 	//
 	// It wraps ErrNoEmailAccounts so existing callers that pause the campaign
 	// on errors.Is(err, ErrNoEmailAccounts) keep behaving exactly as before.
 	ErrNoEligibleMailbox = fmt.Errorf(
-		"%w: every mailbox is outside its sending window or over its daily budget", ErrNoEmailAccounts)
+		"%w: no mailbox can send under its current sending settings", ErrNoEmailAccounts)
 
 	// ErrDomainAuthFailing is the narrower case again: every mailbox in the
 	// campaign's pool was gated by the sending-domain authentication check.
@@ -50,14 +53,42 @@ var (
 	// ErrDailyLimitReached is returned when the daily limit has been reached
 	ErrDailyLimitReached = errors.New("daily email limit reached")
 
-	// ErrCampaignDeferred is returned when there IS a valid contact to send but
-	// no eligible mailbox right now — ESP-strict has no same-provider mailbox
-	// under budget, or the daily new-lead cap is reached. The caller must
-	// reschedule at the returned (defer) time WITHOUT sending. The returned pair
-	// is always nil on this path so it can never be mistaken for a sendable
-	// contact; the returned accountID is a nominal pool mailbox for the wakeup
-	// task only (the next invocation re-evaluates selection from scratch).
+	// ErrCampaignDeferred is returned when there ARE valid contacts to send but
+	// nothing can go right now — every usable mailbox has spent its daily
+	// budget or is outside its hours, the daily new-lead cap is reached, the
+	// step's own wait has not elapsed, or every due lead was refused for a
+	// reason of its own (see ErrLeadDeferred). The caller must reschedule at the
+	// returned (defer) time WITHOUT sending. The returned pair is always nil on
+	// this path so it can never be mistaken for a sendable contact; the returned
+	// accountID is a nominal pool mailbox for the wakeup task only (the next
+	// invocation re-evaluates selection from scratch).
 	ErrCampaignDeferred = errors.New("campaign send deferred - no eligible mailbox for this contact right now")
+
+	// ErrLeadDeferred is the deferral that belongs to ONE lead rather than to
+	// the campaign: this recipient cannot be placed right now (ESP-strict finds
+	// no same-provider mailbox for their domain, their own mailbox is busy,
+	// their preferred hours are hours away), while the pool itself is fine and
+	// the lead behind them may well be sendable this second.
+	//
+	// The scheduler answers it by moving to the next routed lead instead of
+	// parking the campaign. Before that, one such lead at the head of the
+	// routing order stopped every other lead in the campaign from ever being
+	// sent: the tick deferred, woke, routed to the same lead, and deferred
+	// again, forever (issue #437).
+	//
+	// It wraps ErrCampaignDeferred so every caller outside the scheduler —
+	// which only ever reschedules on a deferral — behaves exactly as before.
+	ErrLeadDeferred = fmt.Errorf("%w: this lead cannot be placed right now", ErrCampaignDeferred)
+
+	// ErrSenderBusy is the narrower lead deferral: this lead's sequence belongs
+	// to one mailbox, and that mailbox has nothing left today. Every step of a
+	// conversation comes from the address the contact first heard from, so the
+	// lead waits for it rather than being written to by a stranger.
+	//
+	// It wraps ErrLeadDeferred (and so ErrCampaignDeferred), so the scheduler
+	// moves on to the next lead and every other caller reschedules exactly as
+	// before; only the contact drawer, which words the reason, tests for it.
+	ErrSenderBusy = fmt.Errorf("%w: the mailbox this lead's sequence belongs to has no capacity left today", ErrLeadDeferred)
 )
 
 // DeferSlot is the wakeup time a caller must use after CalculateNextCampaignTime
@@ -79,4 +110,20 @@ func DeferSlot(at time.Time) time.Time {
 		return horizon
 	}
 	return at
+}
+
+// ClaimRetrySlot is where a pass that lost its mailbox to another campaign
+// looks again: soon, and spread so the losers do not collide a second time.
+func ClaimRetrySlot() time.Time {
+	secs := config.CampaignSendClaimRetrySeconds + rand.Intn(config.CampaignSendClaimRetrySeconds+1)
+	return time.Now().Add(time.Duration(secs) * time.Second)
+}
+
+// WakeSlot is where a chain seeded outside a tick first wakes: now for a
+// sendable pair, whose time is the paced slot of the send after it.
+func WakeSlot(at time.Time, err error) time.Time {
+	if errors.Is(err, ErrCampaignDeferred) {
+		return DeferSlot(at)
+	}
+	return time.Now()
 }

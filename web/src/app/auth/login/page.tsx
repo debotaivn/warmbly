@@ -1,11 +1,11 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Link, useNavigate, useLocation } from "react-router-dom";
+import { Link, useNavigate, useLocation } from "@tanstack/react-router";
 import { motion, AnimatePresence } from "motion/react";
 import { useForm } from "react-hook-form";
 import { useQueryClient } from "@tanstack/react-query";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { ArrowLeft, Pencil, LockIcon, Loader2Icon } from "lucide-react";
 import { usePasswordStrength } from "@/hooks/usePasswordStrength";
 
@@ -17,20 +17,28 @@ import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp
 import useLogin from "@/lib/api/hooks/auth/useLogin";
 import useLoginConfirm from "@/lib/api/hooks/auth/useLoginConfirm";
 import { useTwoFactorVerify } from "@/lib/api/hooks/auth/useTwoFactor";
+import useLinkSSO from "@/lib/api/hooks/auth/useLinkSSO";
 import useRegister from "@/lib/api/hooks/auth/useRegister";
 import useRegisterConfirm from "@/lib/api/hooks/auth/useRegisterConfirm";
-import { saveTokens } from "@/lib/auth";
+import { saveTokens, takeSessionEndedNotice, SESSION_ENDED_MESSAGE } from "@/lib/auth";
 import getUser from "@/lib/api/client/auth/getUser";
-import { WEBSITE_URL, TURNSTILE_KEY, API_URL } from "@/lib/information";
+import { TURNSTILE_KEY, API_URL } from "@/lib/information";
+import useBrand from "@/hooks/useBrand";
 import useAuthConfig from "@/lib/api/hooks/auth/useAuthConfig";
 import type Session from "@/lib/api/models/auth/Session";
+import type { SSOLinkChallenge } from "@/lib/api/models/auth/LoginResult";
 import beginSSO from "@/lib/api/client/auth/beginSSO";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
-import * as Sentry from "@sentry/react";
+import { postAuthNext } from "@/lib/helper/safeNext";
+import { hrefTarget } from "@/lib/routerSearch";
+import { captureException } from "@/lib/observability";
+import { isEmpty, readAcquisition } from "@/lib/acquisition";
 import type Token from "@/lib/api/models/auth/Token";
+import { getTrustedDevice, setTrustedDevice, forgetTrustedDevice } from "@/lib/trustedDevice";
 import {
     beginPasskeyLogin,
+    passkeyChallengeUnavailable,
     passkeyLogin,
     passkeySupported,
     passkeyAutofillSupported,
@@ -38,6 +46,7 @@ import {
     safariNeedsExplicitPasskeyGesture,
     cancelPasskeyCeremony,
     PasskeyCancelled,
+    PasskeyAutofillUnavailable,
     SUGGEST_PASSKEY_FLAG,
     type PasskeyLoginChallenge,
 } from "@/lib/passkey";
@@ -149,7 +158,7 @@ function useCountdown(seconds: number) {
    Main multi-step auth page
    ═══════════════════════════════════════════ */
 
-type Step = "email" | "signin" | "signup" | "verify" | "2fa";
+type Step = "email" | "signin" | "signup" | "verify" | "2fa" | "link";
 type PasskeyStatus = "preparing" | "ready" | "waiting" | "timeout" | "not-found" | "error";
 // Why a signup cannot proceed. Either read off /auth/config before the form is
 // shown, or returned by the API when the policy changed mid-session.
@@ -174,15 +183,19 @@ export default function LoginPage() {
     // A brand new instance has no account to sign in as. Send them to the
     // claim link rather than showing a form that cannot succeed.
     useEffect(() => {
-        if (authConfigReady && authConfig.setup_required) navigate("/setup", { replace: true });
+        if (authConfigReady && authConfig.setup_required) navigate({ to: "/setup", replace: true });
     }, [authConfigReady, authConfig.setup_required, navigate]);
 
     // The SSO callback redirects here with a reason when the provider or the
     // exchange refused, so the failure is visible instead of silent.
     useEffect(() => {
-        const reason = new URLSearchParams(location.search).get("sso_error");
+        const reason = new URLSearchParams(location.searchStr).get("sso_error");
         if (reason) toast.error(reason);
-    }, [location.search]);
+    }, [location.searchStr]);
+    // Landing here because the server ended the session gets one plain line.
+    useEffect(() => {
+        if (takeSessionEndedNotice()) toast(SESSION_ENDED_MESSAGE, { id: "session-ended" });
+    }, []);
     const captchaRequired = authConfig.captcha;
     const turnstileBypassToken = import.meta.env.DEV
         ? (import.meta.env.VITE_TURNSTILE_BYPASS_TOKEN?.trim() || "")
@@ -191,19 +204,24 @@ export default function LoginPage() {
     // A social or single sign-on login that hits an enrolled TOTP comes back
     // here with its pending challenge rather than a session, because the 2FA
     // form lives on this screen. See the SSO landing page.
-    const ssoTwoFA = (location.state as { two_fa_pending?: string } | null)?.two_fa_pending ?? "";
+    const ssoTwoFA = location.state.two_fa_pending ?? "";
+    // A federated sign-in whose address already belongs to an account with a
+    // password comes back the same way: the identity is attached, and the
+    // session issued, only once that password is entered here.
+    const ssoLink = location.state.sso_link ?? null;
     // The pending token is single use, so it must not survive a reload of this
     // screen: history state does, and would leave a form that can only fail.
     useEffect(() => {
-        if (ssoTwoFA) navigate(location.pathname + location.search, { replace: true, state: null });
+        if (ssoTwoFA || ssoLink) navigate({ ...hrefTarget(location.pathname + location.searchStr), replace: true, state: {} });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     /* State */
-    const [step, setStep] = useState<Step>(ssoTwoFA ? "2fa" : "email");
+    const [step, setStep] = useState<Step>(ssoTwoFA ? "2fa" : ssoLink ? "link" : "email");
+    const [linkChallenge, setLinkChallenge] = useState<SSOLinkChallenge | null>(ssoLink);
     const [mode, setMode] = useState<"signin" | "signup">(() =>
         location.pathname.includes("/register") ||
-        new URLSearchParams(location.search).get("mode") === "signup"
+        new URLSearchParams(location.searchStr).get("mode") === "signup"
             ? "signup"
             : "signin"
     );
@@ -211,9 +229,16 @@ export default function LoginPage() {
     // The invitation token from /invite. It is the only thing that reopens
     // signup on an invite_only instance, so it drives the whole screen.
     const inviteToken = useMemo(
-        () => new URLSearchParams(location.search).get("invite") ?? "",
-        [location.search],
+        () => new URLSearchParams(location.searchStr).get("invite") ?? "",
+        [location.searchStr],
     );
+    // Where this signup came from, read once from the URL so a re-render or a
+    // history replace cannot lose it. Empty for a direct visit.
+    const acquisition = useMemo(() => {
+        const acq = readAcquisition();
+        return isEmpty(acq) ? undefined : acq;
+    }, []);
+
     const signupPossible = authConfig.registration === "false" || !!inviteToken;
     // Set when the API refuses a signup the screen believed was possible.
     const [refusal, setRefusal] = useState<SignupBlock | null>(null);
@@ -224,21 +249,28 @@ export default function LoginPage() {
     const passkeysEnabled = authConfig.passkeys;
 
     /* Mode change — update URL without remounting */
+    const invitationConsumed = useRef(false);
     const handleModeChange = (m: "signin" | "signup") => {
         setMode(m);
         setRefusal(null);
         // Keep the query string: dropping it is how ?invite= and ?next= were
         // silently lost on a toggle, turning an invited signup into a refused one.
+        // The current state carries the router's entry key; null would wipe it.
+        const params = new URLSearchParams(location.searchStr);
+        if (invitationConsumed.current) {
+            params.delete("invite");
+            params.set("next", postAuthNext(params.get("next"), true));
+        }
         window.history.replaceState(
-            null,
+            window.history.state,
             "",
-            `${m === "signin" ? "/auth/login" : "/auth/register"}${location.search}`,
+            `${m === "signin" ? "/auth/login" : "/auth/register"}${params.size ? `?${params}` : ""}`,
         );
     };
     // /invite sends the invited address along, because the backend only accepts
     // a signup whose email matches the invitation exactly.
     const [email, setEmail] = useState(
-        () => new URLSearchParams(location.search).get("email")?.trim() ?? "",
+        () => new URLSearchParams(location.searchStr).get("email")?.trim() ?? "",
     );
     const [password, setPassword] = useState("");
     const [session, setSession] = useState("");
@@ -255,6 +287,7 @@ export default function LoginPage() {
     const registerMutation = useRegister();
     const loginConfirmMutation = useLoginConfirm();
     const verify2FAMutation = useTwoFactorVerify();
+    const linkMutation = useLinkSSO();
     const registerConfirmMutation = useRegisterConfirm();
 
     const pending = captchaLoading ||
@@ -271,6 +304,7 @@ export default function LoginPage() {
     const [passkeyStatus, setPasskeyStatus] = useState<PasskeyStatus>("preparing");
     const explicitPasskeyChallengeRef = useRef<PasskeyLoginChallenge | null>(null);
     const explicitPasskeyChallengePendingRef = useRef(false);
+    const passkeyAutofillUnavailableRef = useRef(false);
 
     const completeSession = useCallback(async (token: Token) => {
         saveTokens(token as unknown as Record<string, unknown>);
@@ -292,42 +326,50 @@ export default function LoginPage() {
         }
         // Honor a post-auth ?next= (internal paths only), else the default
         // home. Powers the /invite link: sign in, then bounce back to accept.
-        const params = new URLSearchParams(location.search);
+        const params = new URLSearchParams(location.searchStr);
         const next = params.get("next");
-        const safeNext = next && next.startsWith("/") && !next.startsWith("//") ? next : "/app/emails";
-        navigate(safeNext);
-    }, [navigate, queryClient, location.search]);
+        navigate(hrefTarget(postAuthNext(next, invitationConsumed.current)));
+    }, [navigate, queryClient, location.searchStr]);
 
     // Conditional UI: surface passkeys inside the email field's native autofill
     // — no modal, no layout shift. Stays pending until the user picks a passkey
     // (or it's aborted). Cancellation is silent by design. Extracted so it can
     // be re-armed after an explicit-button ceremony settles.
-    const runConditionalPasskey = useCallback(async () => {
+    const runConditionalPasskey = useCallback(async (signal?: AbortSignal) => {
+        if (passkeyAutofillUnavailableRef.current) return;
         if (safariNeedsExplicitPasskeyGesture()) return;
         if (!passkeySupported() || !(await passkeyAutofillSupported())) return;
         try {
-            const token = await passkeyLogin({ conditional: true });
+            const token = await passkeyLogin({ conditional: true, signal });
             toast.success("Welcome back!");
             await completeSession(token);
         } catch (e) {
+            if (e instanceof PasskeyAutofillUnavailable) {
+                passkeyAutofillUnavailableRef.current = true;
+                return;
+            }
             // Cancel / no-passkey is expected here; report only real failures.
-            if (!(e instanceof PasskeyCancelled)) Sentry.captureException(e);
+            if (e instanceof PasskeyCancelled || passkeyChallengeUnavailable(e)) return;
+            captureException(e);
         }
     }, [completeSession]);
 
-    const prepareExplicitPasskey = useCallback((preserveStatus = false) => {
+    const prepareExplicitPasskey = useCallback((preserveStatus = false, signal?: AbortSignal) => {
         if (!passkeySupported() || explicitPasskeyChallengeRef.current || explicitPasskeyChallengePendingRef.current) return;
 
         if (!preserveStatus) setPasskeyStatus("preparing");
         explicitPasskeyChallengePendingRef.current = true;
-        beginPasskeyLogin()
+        beginPasskeyLogin(signal)
             .then((challenge) => {
                 explicitPasskeyChallengeRef.current = challenge;
                 if (!preserveStatus) setPasskeyStatus("ready");
             })
             .catch((e) => {
+                // This one starts on mount, so leaving the page rejects it.
+                // That is not a state the page still has an opinion about.
+                if (e instanceof PasskeyCancelled) return;
                 setPasskeyStatus("error");
-                Sentry.captureException(e);
+                if (!passkeyChallengeUnavailable(e)) captureException(e);
             })
             .finally(() => {
                 explicitPasskeyChallengePendingRef.current = false;
@@ -338,9 +380,14 @@ export default function LoginPage() {
     // secure context (or with passkeys off) this only produced an opaque error.
     useEffect(() => {
         if (!passkeysEnabled) return;
-        prepareExplicitPasskey();
-        void runConditionalPasskey();
-        return () => cancelPasskeyCeremony();
+        const challenges = new AbortController();
+        prepareExplicitPasskey(false, challenges.signal);
+        void runConditionalPasskey(challenges.signal);
+        return () => {
+            // A named reason keeps leaving the page recognisable as a cancellation wherever the rejection surfaces.
+            challenges.abort(new PasskeyCancelled("aborted"));
+            cancelPasskeyCeremony();
+        };
     }, [passkeysEnabled, prepareExplicitPasskey, runConditionalPasskey]);
 
     // The "no passkey here" note is informational, not an error — auto-dismiss
@@ -387,6 +434,9 @@ export default function LoginPage() {
                 } else if (e.reason === "timeout") {
                     setPasskeyStatus("timeout");
                     toast.error("Safari didn't show a passkey prompt. Try again, or use password sign-in.");
+                } else {
+                    // Aborted: nothing to explain, but the button has to be usable again.
+                    setPasskeyStatus("ready");
                 }
             } else {
                 setPasskeyStatus("error");
@@ -523,7 +573,12 @@ export default function LoginPage() {
         setPassword(data.password);
         withCaptcha(async (token) => {
             try {
-                const res = await loginMutation.mutateAsync({ email, password: data.password, turnstile: token });
+                const res = await loginMutation.mutateAsync({
+                    email,
+                    password: data.password,
+                    turnstile: token,
+                    device_token: getTrustedDevice(email),
+                });
                 // A deployment with the login code turned off, or a device this
                 // account has used before, completes here: there is nothing to
                 // confirm and nothing was emailed.
@@ -550,10 +605,12 @@ export default function LoginPage() {
                     password: data.password,
                     turnstile: token,
                     invite: inviteToken || undefined,
+                    acquisition,
                 });
                 // Email verification off means the account already exists and
                 // is signed in: land in the dashboard.
                 if (!res.code_required) {
+                    invitationConsumed.current = !!inviteToken;
                     if (res.token) {
                         toast.success("Welcome to Warmbly!");
                         await completeSession(res.token);
@@ -582,12 +639,17 @@ export default function LoginPage() {
     };
 
     /* ── Step 3: OTP ─────────────────────── */
-    const handleVerify = (code: string) => {
-        if (code.length !== 6) return;
-        withCaptcha(async (token) => {
+    // No captcha here: sign-in already spent one, and the signed, single-use
+    // session it issued is the proof. A Turnstile token is single use, so the
+    // old second challenge could only make people solve it twice.
+    const handleVerify = (code: string, rememberDevice: boolean) => {
+        if (code.length !== 6 || pending) return;
+        void (async () => {
             try {
                 if (mode === "signin") {
-                    const res = await loginConfirmMutation.mutateAsync({ session, code, turnstile: token });
+                    const res = await loginConfirmMutation.mutateAsync({ session, code, remember_device: rememberDevice });
+                    if (res.device_token) setTrustedDevice(email, res.device_token);
+                    else if (!rememberDevice) forgetTrustedDevice(email);
                     // 2FA gate: instead of a session we got a single-use pending
                     // token — collect the TOTP/recovery code in a dedicated step.
                     if (res.two_fa_required) {
@@ -611,7 +673,8 @@ export default function LoginPage() {
                     // shell never mounts without identity (no infinite loader).
                     await completeSession(res as unknown as Token);
                 } else {
-                    const created = await registerConfirmMutation.mutateAsync({ session, code, turnstile: token });
+                    const created = await registerConfirmMutation.mutateAsync({ session, code });
+                    invitationConsumed.current = !!inviteToken;
                     if (created?.token) {
                         toast.success("Welcome to Warmbly!");
                         await completeSession(created.token);
@@ -624,7 +687,7 @@ export default function LoginPage() {
             } catch (e) {
                 toast.error(buildError(e as AppError));
             }
-        });
+        })();
     };
 
     /* ── Step 4: 2FA (TOTP / recovery) ───── */
@@ -641,20 +704,85 @@ export default function LoginPage() {
         }
     };
 
+    /* ── Link step: a provider sign-in on an existing password account ── */
+    // No captcha: the pending token is the proof of a completed provider
+    // flow, and a wrong password is metered server-side like a sign-in.
+    const handleLink = async (password: string) => {
+        if (!linkChallenge) return;
+        try {
+            const res = await linkMutation.mutateAsync({ pending_token: linkChallenge.pending_token, password });
+            if (res.two_fa_required) {
+                if (!res.pending_token) {
+                    toast.error("Something went wrong, please try again.");
+                    return;
+                }
+                setPendingToken(res.pending_token);
+                goTo("2fa");
+                return;
+            }
+            if (!res.access_token) {
+                toast.error("Something went wrong, please try again.");
+                return;
+            }
+            toast.success(`${providerLabel(linkChallenge.provider)} sign-in added to your account`);
+            await completeSession(res as unknown as Token);
+        } catch (e) {
+            toast.error(buildError(e as AppError));
+            // The challenge is gone (expired or exhausted), so the form can
+            // only fail from here: back to the start.
+            if ((e as AppError).code === "sso_link_expired") {
+                setLinkChallenge(null);
+                goTo("email", -1);
+            }
+        }
+    };
+
+    /* What a provider is called on screen. Generic OIDC carries the name the
+       operator configured, so a deployment behind Okta says Okta. */
+    const providerLabel = (provider: string): string => {
+        if (provider === "google") return "Google";
+        if (provider === "apple") return "Apple";
+        return authConfig.provider_labels?.oidc || "single sign-on";
+    };
+
     /* ── Resend OTP ─────────────────────── */
     const handleResend = useCallback(() => {
         withCaptcha(async (token) => {
             try {
                 const res = mode === "signin"
                     ? await loginMutation.mutateAsync({ email, password, turnstile: token })
-                    : await registerMutation.mutateAsync({ email, password, turnstile: token, invite: inviteToken || undefined });
+                    : await registerMutation.mutateAsync({ email, password, turnstile: token, invite: inviteToken || undefined, acquisition });
                 toast.success("Code resent!");
                 setSession(res.session ?? "");
             } catch (e) {
                 toast.error(buildError(e as AppError));
             }
         });
-    }, [mode, email, password, inviteToken, loginMutation, registerMutation, withCaptcha]);
+    }, [mode, email, password, inviteToken, acquisition, loginMutation, registerMutation, withCaptcha]);
+
+    // Rendered inside the form that needs it, so a challenge that does ask for
+    // interaction sits above the button at the inputs' width instead of
+    // dangling under the card. One step shows at a time, so one widget exists.
+    const captchaWidget = TURNSTILE_KEY && (!authConfigReady || captchaRequired) && !turnstileBypassToken ? (
+        <CaptchaWidget
+            onLoad={(bound) => {
+                turnstileRef.current = bound;
+                if (pendingRef.current) bound.execute();
+            }}
+            onUnmount={() => { turnstileRef.current = null; tokenRef.current = ""; }}
+            onVerify={onTurnstileVerify}
+            onError={onTurnstileError}
+            onExpire={() => { tokenRef.current = ""; turnstileRef.current?.reset(); }}
+            onBeforeInteractive={() => {
+                // A person is now solving a visible challenge; the timeout is
+                // for a widget that never answers, not for them.
+                if (captchaTimeoutRef.current) {
+                    clearTimeout(captchaTimeoutRef.current);
+                    captchaTimeoutRef.current = null;
+                }
+            }}
+        />
+    ) : null;
 
     return (
         <div className="relative">
@@ -717,6 +845,7 @@ export default function LoginPage() {
                             onSSO={handleSSO}
                             onBack={() => goTo("email", -1)}
                             onSubmit={handleSignIn}
+                            captcha={captchaWidget}
                         />
                     </MotionWrap>
                 )}
@@ -727,6 +856,7 @@ export default function LoginPage() {
                             pending={pending}
                             onBack={() => goTo("email", -1)}
                             onSubmit={handleSignUp}
+                            captcha={captchaWidget}
                         />
                     </MotionWrap>
                 )}
@@ -739,6 +869,23 @@ export default function LoginPage() {
                             onBack={() => goTo(mode === "signin" ? "signin" : "signup", -1)}
                             onSubmit={handleVerify}
                             onResend={handleResend}
+                            canRemember={mode === "signin" && authConfig.login_code === "new_device"}
+                            captcha={captchaWidget}
+                        />
+                    </MotionWrap>
+                )}
+
+                {!signupGate && !showSignupUnavailable && step === "link" && linkChallenge && (
+                    <MotionWrap key="link" direction={direction}>
+                        <LinkStep
+                            email={linkChallenge.email}
+                            providerLabel={providerLabel(linkChallenge.provider)}
+                            pending={linkMutation.isPending}
+                            onBack={() => {
+                                setLinkChallenge(null);
+                                goTo("email", -1);
+                            }}
+                            onSubmit={handleLink}
                         />
                     </MotionWrap>
                 )}
@@ -749,7 +896,9 @@ export default function LoginPage() {
                             pending={verify2FAMutation.isPending}
                             onBack={() => {
                                 setPendingToken("");
-                                goTo("verify", -1);
+                                // A challenge reached from a provider sign-in or
+                                // the link step has no emailed code to return to.
+                                goTo(session ? "verify" : "email", -1);
                             }}
                             onSubmit={handle2FA}
                         />
@@ -757,21 +906,6 @@ export default function LoginPage() {
                 )}
             </AnimatePresence>
 
-            {(!authConfigReady || captchaRequired) && !turnstileBypassToken && (
-                <Turnstile
-                    sitekey={TURNSTILE_KEY}
-                    execution="execute"
-                    onLoad={(_widgetId, bound) => {
-                        turnstileRef.current = bound;
-                        if (pendingRef.current) bound.execute();
-                    }}
-                    onVerify={onTurnstileVerify}
-                    onError={onTurnstileError}
-                    onTimeout={onTurnstileError}
-                    onExpire={() => { tokenRef.current = ""; turnstileRef.current?.reset(); }}
-                    size="invisible"
-                />
-            )}
         </div>
     );
 }
@@ -790,6 +924,49 @@ function MotionWrap({ children, direction }: { children: React.ReactNode; direct
         >
             {children}
         </motion.div>
+    );
+}
+
+/* ── Captcha ─────────────────────── */
+
+function CaptchaWidget({
+    onLoad,
+    onUnmount,
+    onVerify,
+    onError,
+    onExpire,
+    onBeforeInteractive,
+}: {
+    onLoad: (bound: BoundTurnstileObject) => void;
+    onUnmount: () => void;
+    onVerify: (token: string, bound?: BoundTurnstileObject) => void;
+    onError: (error?: unknown, bound?: BoundTurnstileObject) => void;
+    onExpire: () => void;
+    onBeforeInteractive: () => void;
+}) {
+    // A step change unmounts this widget; a stale handle would execute a
+    // widget Cloudflare has already removed.
+    const unmountRef = useRef(onUnmount);
+    unmountRef.current = onUnmount;
+    useEffect(() => () => unmountRef.current(), []);
+
+    return (
+        <Turnstile
+            sitekey={TURNSTILE_KEY}
+            execution="execute"
+            appearance="interaction-only"
+            // The auth screens are light-only. The default "auto" followed the
+            // OS and drew a black widget on the white card.
+            theme="light"
+            size="flexible"
+            className="w-full empty:hidden"
+            onLoad={(_widgetId, bound) => onLoad(bound)}
+            onVerify={onVerify}
+            onError={onError}
+            onTimeout={onError}
+            onExpire={onExpire}
+            onBeforeInteractive={() => onBeforeInteractive()}
+        />
     );
 }
 
@@ -1080,6 +1257,7 @@ function SignInStep({
     onSSO,
     onBack,
     onSubmit,
+    captcha,
 }: {
     email: string;
     pending: boolean;
@@ -1088,6 +1266,7 @@ function SignInStep({
     onSSO: () => void;
     onBack: () => void;
     onSubmit: (data: z.infer<typeof signInSchema>) => void;
+    captcha: React.ReactNode;
 }) {
     const { register, handleSubmit, formState: { errors } } = useForm<z.infer<typeof signInSchema>>({
         resolver: zodResolver(signInSchema),
@@ -1120,6 +1299,8 @@ function SignInStep({
                     <FieldError message={errors.password?.message} />
                 </div>
 
+                {captcha}
+
                 <div className="pt-1">
                     <AuthButton loading={pending}>Sign in</AuthButton>
                 </div>
@@ -1146,6 +1327,69 @@ function SignInStep({
     );
 }
 
+/* ── Link step ─────────────────────────── */
+
+// The provider verified the address, not the account. Asking for the password
+// is what makes "sign in with Google" on an address that already has an
+// account mean the account's owner chose it.
+function LinkStep({
+    email,
+    providerLabel,
+    pending,
+    onBack,
+    onSubmit,
+}: {
+    email: string;
+    providerLabel: string;
+    pending: boolean;
+    onBack: () => void;
+    onSubmit: (password: string) => void;
+}) {
+    const { register, handleSubmit, formState: { errors } } = useForm<z.infer<typeof signInSchema>>({
+        resolver: zodResolver(signInSchema),
+    });
+
+    return (
+        <div>
+            <div className="text-center mb-6">
+                <EmailPill email={email} onEdit={onBack} />
+                <h1 className="text-[28px] font-bold text-slate-900 tracking-tight leading-tight">Confirm it's you</h1>
+                <p className="text-sm text-slate-400 mt-1.5">
+                    This address already has a Warmbly account. Enter its password to add {providerLabel} sign-in to it.
+                </p>
+            </div>
+
+            <form onSubmit={handleSubmit((data) => onSubmit(data.password))} className="space-y-4">
+                <div>
+                    <div className="flex items-center justify-between mb-1">
+                        <label className="text-sm font-medium text-slate-600 pl-0.5">Password</label>
+                        <Link to="/auth/reset-password" className="text-xs text-sky-500 hover:text-sky-600 font-medium transition-colors">
+                            Forgot password?
+                        </Link>
+                    </div>
+                    <input
+                        type="password"
+                        placeholder="Enter your password"
+                        className={INPUT}
+                        autoComplete="current-password"
+                        autoFocus
+                        {...register("password")}
+                    />
+                    <FieldError message={errors.password?.message} />
+                </div>
+
+                <div className="pt-1">
+                    <AuthButton loading={pending}>Link and sign in</AuthButton>
+                </div>
+            </form>
+
+            <p className="text-xs text-slate-400 text-center mt-4">
+                Not you? Go back and sign in with your password instead; nothing has been changed on the account.
+            </p>
+        </div>
+    );
+}
+
 /* ── Sign-up step ─────────────────────── */
 
 function SignUpStep({
@@ -1153,11 +1397,13 @@ function SignUpStep({
     pending,
     onBack,
     onSubmit,
+    captcha,
 }: {
     email: string;
     pending: boolean;
     onBack: () => void;
     onSubmit: (data: z.infer<typeof signUpSchema>) => void;
+    captcha: React.ReactNode;
 }) {
     const { register, handleSubmit, watch, setError, formState: { errors } } = useForm<z.infer<typeof signUpSchema>>({
         resolver: zodResolver(signUpSchema),
@@ -1165,6 +1411,7 @@ function SignUpStep({
     });
     const pw = watch("password");
     const termsChecked = watch("acceptTerms");
+    const brand = useBrand();
 
     const { evaluate } = usePasswordStrength();
     const [strength, setStrength] = useState<{ score: 0 | 1 | 2 | 3 | 4; warning: string }>({ score: 0, warning: "" });
@@ -1225,16 +1472,26 @@ function SignUpStep({
                     </div>
                     <span className="text-[13px] text-slate-400 leading-relaxed">
                         I agree to the{" "}
-                        <a href={`${WEBSITE_URL}/terms`} target="_blank" rel="noopener noreferrer" className="text-sky-500 hover:text-sky-600 font-medium transition-colors">
-                            Terms of Service
-                        </a>
+                        {brand.terms_url ? (
+                            <a href={brand.terms_url} target="_blank" rel="noopener noreferrer" className="text-sky-500 hover:text-sky-600 font-medium transition-colors">
+                                Terms of Service
+                            </a>
+                        ) : (
+                            "Terms of Service"
+                        )}
                         {" "}and{" "}
-                        <a href={`${WEBSITE_URL}/privacy`} target="_blank" rel="noopener noreferrer" className="text-sky-500 hover:text-sky-600 font-medium transition-colors">
-                            Privacy Policy
-                        </a>
+                        {brand.privacy_url ? (
+                            <a href={brand.privacy_url} target="_blank" rel="noopener noreferrer" className="text-sky-500 hover:text-sky-600 font-medium transition-colors">
+                                Privacy Policy
+                            </a>
+                        ) : (
+                            "Privacy Policy"
+                        )}
                     </span>
                 </label>
                 <FieldError message={errors.acceptTerms?.message} />
+
+                {captcha}
 
                 <div className="pt-1">
                     <AuthButton loading={pending}>Create account</AuthButton>
@@ -1253,15 +1510,20 @@ function VerifyStep({
     onBack,
     onSubmit,
     onResend,
+    canRemember,
+    captcha,
 }: {
     email: string;
     pending: boolean;
     mailDelivers: boolean;
     onBack: () => void;
-    onSubmit: (code: string) => void;
+    onSubmit: (code: string, rememberDevice: boolean) => void;
     onResend: () => void;
+    canRemember: boolean;
+    captcha: React.ReactNode;
 }) {
     const [otp, setOtp] = useState("");
+    const [remember, setRemember] = useState(false);
     const { count, expired, reset } = useCountdown(60);
 
     const handleResend = () => {
@@ -1310,6 +1572,30 @@ function VerifyStep({
                     </InputOTP>
                 </div>
 
+                {canRemember && (
+                    <label className="flex items-start gap-3 cursor-pointer select-none">
+                        <div className="relative mt-0.5 shrink-0">
+                            <input
+                                type="checkbox"
+                                className="peer sr-only"
+                                checked={remember}
+                                onChange={(e) => setRemember(e.target.checked)}
+                            />
+                            <div className={`size-[18px] rounded-md border-2 transition-all duration-200 flex items-center justify-center peer-focus-visible:ring-4 peer-focus-visible:ring-sky-400/15 ${remember ? "bg-sky-500 border-sky-500" : "border-slate-300 bg-white"}`}>
+                                {remember && (
+                                    <svg className="size-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                    </svg>
+                                )}
+                            </div>
+                        </div>
+                        <span className="text-[13px] leading-relaxed">
+                            <span className="text-slate-600 font-medium">Remember this device for 30 days</span>
+                            <span className="block text-slate-400">Skip the email code when you sign in here. Don't use on a shared computer.</span>
+                        </span>
+                    </label>
+                )}
+
                 {/* Timer & resend */}
                 <div className="text-center">
                     {expired ? (
@@ -1327,7 +1613,11 @@ function VerifyStep({
                     )}
                 </div>
 
-                <div onClick={() => !pending && onSubmit(otp)}>
+                {/* Only a resend needs a captcha on this step: it starts the
+                    sign-in again. Verifying the code does not. */}
+                {captcha}
+
+                <div onClick={() => !pending && onSubmit(otp, remember)}>
                     <AuthButton loading={pending}>Verify</AuthButton>
                 </div>
             </div>

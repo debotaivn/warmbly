@@ -354,6 +354,23 @@ Every callback is an HTTP `POST` with a `Content-Type: application/json` body in
 
 There is no `version` field in the payload. If an event's payload ever changes in a backward-incompatible way, it is published under a new `event_type` name. Existing event type names are never re-versioned in place.
 
+### Reply received payload
+
+`campaign.reply_received` carries `contact_email`, `intent` and `confidence` (the workspace keyword list's reading), `subject`, `snippet`, `action_taken`, `thread_id` and `email_account_id`. `contact_id` and `campaign_id` are optional, included only when the reply is linked to the corresponding contact or campaign. When [inbox tagging](/guides/inbox-tagging/) judged the message it also carries the stored verdict:
+
+```json
+{
+  "ai_labels": ["Meeting", "Interested"],
+  "ai_intent": "scheduling",
+  "ai_intent_confidence": 0.91,
+  "ai_kind": "human_reply",
+  "ai_relevance": 82,
+  "ai_needs_review": false
+}
+```
+
+`ai_kind` and `ai_intent` are empty strings when tagging was not confident enough to act on them, and the six keys are absent when tagging never judged the message. See [Automations](/guides/automations/#filtering-replies-on-inbox-tagging) for what each holds.
+
 ### Delivery headers
 
 Each delivery carries these request headers:
@@ -458,11 +475,11 @@ The full catalog is available at `GET /webhooks/event-types`. Below is the compl
 | `campaign.deleted` | A campaign is deleted. | |
 | `campaign.email_sent` | A campaign email is dispatched by a worker. | yes |
 | `campaign.email_delivered` | A campaign email is accepted by the recipient's mail server. | yes |
-| `campaign.email_opened` | A tracked open is recorded. | yes |
-| `campaign.email_clicked` | A tracked link click is recorded. | yes |
+| `campaign.email_opened` | A person opens a tracked email. The payload carries `origin` when the open said anything about itself: the mail client, app or webmail, device and location, as on a [contact timeline](/api/reference/contacts/#list-a-contacts-timeline) event. Automated opens (mail privacy proxies, fetches inside seconds of the send) do not fire it. | yes |
+| `campaign.email_clicked` | A person clicks a tracked link. The payload carries the `url`, the link's `link_label`, and `origin` with the device and browser the link opened in. Automated clicks (security gateways walking the links) do not fire it. | yes |
 | `campaign.email_bounced` | A campaign email bounces. | |
 | `campaign.reply_received` | A human reply lands for a campaign thread. | |
-| `campaign.unsubscribed` | A recipient clicks the unsubscribe link or requests removal. | |
+| `campaign.unsubscribed` | A recipient opts out. `source` is `one_click` (the mail client's button), `link` (the link in the email), `reply` (a reply asking to stop) or `action` (a sequence's unsubscribe step). | |
 | `campaign.deliverability_warning` | The campaign's rolling bounce or complaint rate enters the early-warning band. | |
 | `campaign.action` | A sequence flow `notify` action node fires. | |
 
@@ -472,7 +489,7 @@ The full catalog is available at `GET /webhooks/event-types`. Below is the compl
 | --- | --- | --- |
 | `warmup.email_sent` | A warmup message is sent. | yes |
 | `warmup.health_changed` | A mailbox's warmup health state transitions. | |
-| `warmup.placement_in_spam` | A warmup message is observed landing in the spam folder. | |
+| `warmup.placement_in_spam` | A warmup message is observed landing in the spam folder. The payload carries the sending mailbox (`email_account_id`, `email`), `content_source`, and the recipient's `recipient_provider` (how it connects) and `recipient_host` (who runs its mail, such as `google_workspace` or `zoho`), never its address or domain. | |
 | `warmup.quarantined` | A mailbox is quarantined from the shared warmup pool. | |
 | `warmup.blocked` | A mailbox is blocked from the shared warmup pool. | |
 
@@ -507,10 +524,10 @@ The full catalog is available at `GET /webhooks/event-types`. Below is the compl
 
 | Event | Description | Firehose |
 | --- | --- | --- |
-| `contact.created` | A contact is created. | |
+| `contact.created` | A contact is created. Carries `contact_id`, `contact_email`, `first_name`, `last_name`, `company`, `phone`, `subscribed`, `custom_fields`, `source`, `source_detail`, `campaign_ids`, `category_ids` and `created_at`. Fires for contacts added by hand, through the API, by a form or by an automation; file imports, sheet syncs and a single API request adding more than 100 contacts are bulk arrivals and do not raise it. | |
 | `contact.updated` | A contact's fields change. | |
 | `contact.deleted` | A contact is deleted. | |
-| `form.submitted` | A hosted form received a submission. Carries the form id and name, the submission id, the answers, and the contact id when one was created or matched. | |
+| `form.submitted` | A hosted form received a submission. Carries the form id and name, the submission id, the answers under `data`, the mapped contact columns (`contact_email`, `first_name`, `last_name`, `company`, `phone`), `source_url`, and the contact id when one was created or matched. | |
 
 ### CRM
 
@@ -520,7 +537,7 @@ The full catalog is available at `GET /webhooks/event-types`. Below is the compl
 | `crm.deal_updated` | A deal's fields or stage change. | |
 | `crm.deal_deleted` | A deal is deleted. | |
 | `crm.task_created` | A CRM task is created. | |
-| `crm.task_updated` | A CRM task changes. | |
+| `crm.task_updated` | A CRM task changes. A bulk write ([bulk update tasks](/api/reference/crm/#bulk-update-tasks)) raises it once for the whole call, with no `entity_id` and a `metadata` of `bulk` and `count`, so treat a missing id as "re-read the tasks you track" rather than as one task. `contact.updated` behaves the same way for a bulk contact edit. | |
 | `crm.note_created` | A note is added to a contact or deal. | |
 | `crm.pipeline_updated` | A pipeline or its stages change. | |
 

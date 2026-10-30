@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 
@@ -11,6 +12,34 @@ import (
 	"github.com/warmbly/warmbly/internal/infrastructure/db"
 	"github.com/warmbly/warmbly/internal/models"
 )
+
+func TestLiveContactCampaignStateEmptySteps(t *testing.T) {
+	handle, pool := liveContactDB(t)
+	f := newSharedOrgFixture(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO campaign_leads (campaign_id, contact_id) VALUES ($1, $2)`, f.campaign, f.contact); err != nil {
+		t.Fatal(err)
+	}
+
+	states, xerr := NewContactRepostory(handle).ListCampaignStates(ctx, f.org, f.contact)
+	if xerr != nil || len(states) != 1 {
+		t.Fatalf("campaign states: %v (%d states)", xerr, len(states))
+	}
+	if states[0].Steps == nil || len(states[0].Steps) != 0 || states[0].TotalSteps != 0 {
+		t.Fatalf("empty campaign must have a non-nil empty steps slice: %+v", states[0])
+	}
+	payload, err := json.Marshal(states[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["steps"]) != "[]" {
+		t.Fatalf("steps JSON = %s, want []", fields["steps"])
+	}
+}
 
 // Regression cover for issue #187: adding a contact to a campaign silently did
 // nothing whenever the campaign had been created by a different member of the
@@ -26,6 +55,16 @@ import (
 //	WARMBLY_TEST_DB=postgres://warmbly:warmbly@localhost:15432/warmbly_dev?sslmode=disable \
 //	  go test ./internal/repository/ -run LiveContactCampaign -v
 
+// requireSchemaVersion fails loudly on a database behind the branch, where a
+// live fixture would otherwise die three calls deep on a foreign key.
+func requireSchemaVersion(t *testing.T, pool *pgxpool.Pool, min int64) {
+	t.Helper()
+	var version int64
+	if err := pool.QueryRow(context.Background(), `SELECT version FROM schema_migrations LIMIT 1`).Scan(&version); err != nil || version < min {
+		t.Fatalf("WARMBLY_TEST_DB is at schema version %d (err %v); this branch needs %d or later", version, err, min)
+	}
+}
+
 func liveContactDB(t *testing.T) (*db.DB, *pgxpool.Pool) {
 	t.Helper()
 	dsn := os.Getenv("WARMBLY_TEST_DB")
@@ -40,6 +79,7 @@ func liveContactDB(t *testing.T) (*db.DB, *pgxpool.Pool) {
 	if err := handle.Ping(context.Background()); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
+	requireSchemaVersion(t, handle.Pool, 164)
 	return handle, handle.Pool
 }
 
@@ -236,8 +276,8 @@ func TestLiveContactBulkAddToATeammatesCampaign(t *testing.T) {
 	ctx := context.Background()
 
 	updated, xerr := repo.BulkUpdate(ctx, f.mate.String(), f.org, &models.BulkEditContactsData{
-		Contacts:     []string{f.contact.String()},
-		AddCampaigns: []string{f.campaign.String()},
+		ContactSelection: models.ContactSelection{Contacts: []string{f.contact.String()}},
+		AddCampaigns:     []string{f.campaign.String()},
 	})
 	if xerr != nil {
 		t.Fatalf("bulk update: %v", xerr)

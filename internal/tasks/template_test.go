@@ -1,11 +1,230 @@
 package tasks
 
 import (
+	htmltemplate "html/template"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/warmbly/warmbly/internal/models"
 )
+
+func TestCompiledTemplateCachesRawSource(t *testing.T) {
+	for _, source := range []string{
+		`{{.unique-job title}}`,
+		`{{if .unique-job title}}broken {{.FirstName}}`,
+	} {
+		first := compiledTemplate(source)
+		cached, ok := tmplCache.Load(source)
+		if !ok || cached != first || compiledTemplate(source) != first {
+			t.Fatalf("raw source was not cached: %q", source)
+		}
+		for _, value := range []string{"Founder", "Engineer"} {
+			contact := models.Contact{FirstName: "Alex", CustomFields: map[string]string{"unique-job title": value}}
+			want := value
+			if first == nil {
+				want = "{{if .unique-job title}}broken Alex"
+			}
+			if got := RenderTemplate(source, contact); got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		}
+	}
+}
+
+func TestRenderTemplateCachedConcurrent(t *testing.T) {
+	source := `Hello {{.FirstName}} in {{.job title}} from {{.Sender.Name}}`
+	for _, name := range []string{"Alex", "Ana", "Sam", "Jo"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			contact := models.Contact{FirstName: name, CustomFields: map[string]string{"job title": name}}
+			context := TemplateContext{Sender: TemplateSender{Name: name}}
+			for i := 0; i < 100; i++ {
+				if got, want := RenderTemplateWith(source, contact, context), "Hello "+name+" in "+name+" from "+name; got != want {
+					t.Fatalf("got %q, want %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderTemplate_Sender(t *testing.T) {
+	stamp := time.Date(2026, 10, 5, 15, 0, 0, 0, time.FixedZone("local", 3600))
+	account := &models.Email{
+		Name: " Tareque M. ", Email: "tareque@example.com", SendAsEmail: "hello@example.com",
+		ReplyTo: "replies@example.com", Provider: "gmail", Timezone: "Europe/Budapest",
+		SignaturePlain: "Best, Tareque", SignatureHTML: "<b>Tareque</b>", SignatureSync: true,
+		CampaignLimit: 25, Tags: []string{"sales", "team"}, CreatedAt: stamp, Warmup: &stamp,
+	}
+	contact := models.Contact{FirstName: "Alex", Email: "alex@example.org", CustomFields: map[string]string{
+		"role": "CTO", "Job Title": "Founder", "Sender": "not the sender", "FirstName": "not Alex",
+	}}
+	context := templateContext(account, "https://example.com/unsubscribe/tok")
+	cases := []struct{ name, template, want string }{
+		{"identity", `Hi {{.FirstName}}, I'm {{.Sender.Name}} <{{.Sender.Email}}>`, "Hi Alex, I'm Tareque M. <hello@example.com>"},
+		{"addresses", `{{.Email}}|{{.Sender.MailboxEmail}}|{{.Sender.SendAsEmail}}|{{.Sender.ReplyTo}}`, "alex@example.org|tareque@example.com|hello@example.com|replies@example.com"},
+		{"contact and link", `{{.role}}|{{.Job Title}}|{{.UnsubscribeLink}}`, "CTO|Founder|https://example.com/unsubscribe/tok"},
+		{"native types", `{{if .Sender.SignatureSync}}{{.Sender.SignaturePlain}}{{end}}|{{if gt .Sender.CampaignLimit 20}}high{{end}}`, "Best, Tareque|high"},
+		{"with and range", `{{with .Sender}}{{.Name}}:{{range .Tags}}{{.}};{{end}}{{end}}`, "Tareque M.:sales;team;"},
+		{"helpers", `{{.Sender.Name | upper}}|{{.Sender.Vendor | default "direct"}}`, "TAREQUE M.|direct"},
+		{"timestamps", `{{.Sender.CreatedAt}}|{{.Sender.Warmup}}|{{.Sender.WarmupPausedAt}}`, "2026-10-05T14:00:00Z|2026-10-05T14:00:00Z|"},
+		{"html", `{{.Sender.SignatureHTML}}`, "<b>Tareque</b>"},
+		{"malformed fallback", `{{if .Company}}Hi {{.FirstName}}, {{.Sender.Name}} at {{.Sender.Email}}`, "{{if .Company}}Hi Alex, Tareque M. at hello@example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RenderTemplateWith(tc.template, contact, context); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+	account.Tags[0] = "changed"
+	if context.Sender.Tags[0] != "sales" {
+		t.Fatal("sender tags share the mailbox's mutable slice")
+	}
+}
+
+func TestTemplateSender_EmptyAndEffectiveIdentity(t *testing.T) {
+	if got := RenderTemplate(`{{.Sender.Name}}|{{.Sender.Email}}|{{.Sender.Name | default "our team"}}|{{if .Sender.SignatureSync}}yes{{else}}no{{end}}`, models.Contact{}); got != "||our team|no" {
+		t.Fatalf("empty sender: %q", got)
+	}
+	account := &models.Email{Name: "John S.", Email: "john@example.com", OrgTimezone: "America/New_York"}
+	sender := templateContext(account, "").Sender
+	if sender.Email != "john@example.com" || sender.MailboxEmail != sender.Email || sender.SendAsEmail != "" || sender.ReplyTo != "" || sender.Timezone != "America/New_York" {
+		t.Fatalf("incorrect effective sender: %+v", sender)
+	}
+	account.ReplyTo = "john@example.com"
+	if templateContext(account, "").Sender.ReplyTo != "" {
+		t.Fatal("redundant Reply-To did not match the outbound header")
+	}
+}
+
+func TestTemplateSender_SplitsName(t *testing.T) {
+	cases := []struct{ name, want string }{
+		{"  Jamie   van der  Berg ", "Jamie|van der Berg|Jamie   van der  Berg"},
+		{"Jamie", "Jamie||Jamie"},
+		{"   ", "||"},
+	}
+	for _, tc := range cases {
+		context := templateContext(&models.Email{Name: tc.name}, "")
+		if got := RenderTemplateWith(`{{.Sender.FirstName}}|{{.Sender.LastName}}|{{.Sender.Name}}`, models.Contact{}, context); got != tc.want {
+			t.Errorf("name %q: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestAIVarAvailableVarsSkipsReservedSenderNamespace(t *testing.T) {
+	vars := aiVarAvailableVars(&models.Contact{CustomFields: map[string]string{"Sender": "not a mailbox", "UnsubscribeLink": "not a link", "role": "CTO"}})
+	for _, token := range vars {
+		if token == "{{.Sender}}" || token == "{{.UnsubscribeLink}}" {
+			t.Fatalf("AI advertised a reserved contact field: %s", token)
+		}
+	}
+	if !strings.Contains(strings.Join(vars, " "), "{{.role}}") {
+		t.Fatal("valid custom field was excluded")
+	}
+}
+
+func TestTemplateSender_ExcludesInternalFieldsAndMethods(t *testing.T) {
+	typ := reflect.TypeOf(TemplateSender{})
+	for _, field := range []string{"ID", "UserID", "OrganizationID", "WorkerID", "DomainGrantID", "VendorConnectionID", "LastID", "OrgTimezone", "Password", "AccessToken", "RefreshToken"} {
+		if _, ok := typ.FieldByName(field); ok {
+			t.Errorf("unsafe sender field %s", field)
+		}
+	}
+	if typ.NumMethod() != 0 || reflect.PointerTo(typ).NumMethod() != 0 {
+		t.Fatal("sender exposes mailbox methods")
+	}
+	for _, field := range []string{"UserID", "WorkerID", "AccessToken", "SendFrom"} {
+		tmpl := "{{.Sender." + field + "}}"
+		preview := previewTemplatesWith(tmpl, "", "", models.Contact{}, templateContext(&models.Email{UserID: "private"}, ""))
+		if preview.Subject != tmpl || len(preview.Unresolved) != 1 {
+			t.Errorf("unknown sender field %s should remain unresolved: %+v", field, preview)
+		}
+	}
+}
+
+func TestTemplateSender_MapsEveryAllowedMailboxField(t *testing.T) {
+	account := &models.Email{}
+	mailbox := reflect.ValueOf(account).Elem()
+	stamp := time.Date(2026, 10, 5, 15, 0, 0, 0, time.UTC)
+	for i := 0; i < mailbox.NumField(); i++ {
+		field := mailbox.Field(i)
+		switch field.Kind() {
+		case reflect.String:
+			field.SetString(mailbox.Type().Field(i).Name + "-value")
+		case reflect.Bool:
+			field.SetBool(true)
+		case reflect.Int:
+			field.SetInt(37)
+		default:
+			switch field.Type() {
+			case reflect.TypeOf(stamp):
+				field.Set(reflect.ValueOf(stamp))
+			case reflect.TypeOf(&stamp):
+				field.Set(reflect.ValueOf(&stamp))
+			case reflect.TypeOf([]string{}):
+				field.Set(reflect.ValueOf([]string{"sales"}))
+			}
+		}
+	}
+	sender := reflect.ValueOf(templateContext(account, "").Sender)
+	for i := 0; i < sender.NumField(); i++ {
+		name := sender.Type().Field(i).Name
+		if name == "FirstName" || name == "LastName" {
+			continue // derived from Name, covered by TestTemplateSender_SplitsName
+		}
+		mailboxName := name
+		if name == "MailboxEmail" {
+			mailboxName = "Email"
+		}
+		var want any = mailbox.FieldByName(mailboxName).Interface()
+		switch v := want.(type) {
+		case time.Time:
+			want = templateTime(&v)
+		case *time.Time:
+			want = templateTime(v)
+		}
+		if name == "Email" {
+			want = account.SendFrom()
+		}
+		if name == "ReplyTo" {
+			want = account.ReplyToHeader()
+		}
+		if name == "SignatureHTML" {
+			want = htmltemplate.HTML(account.SignatureHTML)
+		}
+		if !reflect.DeepEqual(sender.Field(i).Interface(), want) {
+			t.Errorf("Sender.%s = %v, want %v", name, sender.Field(i).Interface(), want)
+		}
+	}
+}
+
+func TestRenderTemplate_RangeOverNumberRefused(t *testing.T) {
+	tmpl := "Hi {{.FirstName}}{{range 100000000000}}x{{end}}"
+	if err := TemplateError(tmpl); err == nil {
+		t.Fatal("TemplateError accepted a range over a number")
+	}
+	done := make(chan string, 1)
+	go func() { done <- RenderTemplate(tmpl, models.Contact{FirstName: "Ann"}) }()
+	select {
+	case out := <-done:
+		if strings.Contains(out, "xx") {
+			t.Fatalf("range executed: %d bytes", len(out))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("render of a range over a number did not return")
+	}
+}
+
+func TestRenderTemplate_RangeOverMapStillRenders(t *testing.T) {
+	contact := models.Contact{FirstName: "Ann"}
+	out := RenderTemplate(`{{range $k, $v := .}}{{if eq $k "FirstName"}}{{$v}}{{end}}{{end}}`, contact)
+	if out != "Ann" {
+		t.Fatalf("got %q", out)
+	}
+}
 
 func TestRenderTemplate_BasicVariables(t *testing.T) {
 	contact := models.Contact{
@@ -184,47 +403,6 @@ func TestExtractPlainTextFromHTML(t *testing.T) {
 	}
 }
 
-func TestGenerateWarmupSubject_NotEmpty(t *testing.T) {
-	subject := generateWarmupSubject()
-	if subject == "" {
-		t.Error("warmup subject should not be empty")
-	}
-}
-
-func TestRandomWarmupConversation_HasContent(t *testing.T) {
-	conv := randomWarmupConversation()
-	if conv.Theme == "" {
-		t.Error("conversation should have a theme")
-	}
-	if conv.Description == "" {
-		t.Error("conversation should have a description")
-	}
-	if len(conv.Messages) == 0 {
-		t.Error("conversation should have at least one message")
-	}
-}
-
-func TestConversationForTheme_MatchesKnownTheme(t *testing.T) {
-	conv := conversationForTheme("productivity")
-	if conv.Theme != "productivity" {
-		t.Errorf("expected theme productivity, got %q", conv.Theme)
-	}
-}
-
-func TestConversationForTheme_FallsBackOnUnknown(t *testing.T) {
-	conv := conversationForTheme("not-a-real-theme")
-	if conv.Theme == "" {
-		t.Error("fallback conversation should still have a theme")
-	}
-}
-
-func TestConversationForTheme_EmptyReturnsRandom(t *testing.T) {
-	conv := conversationForTheme("")
-	if conv.Theme == "" {
-		t.Error("empty theme should return a random conversation with a theme")
-	}
-}
-
 func TestGenerateMessageID_Format(t *testing.T) {
 	mid := generateMessageID("user@example.com")
 	if !strings.HasSuffix(mid, "@example.com>") {
@@ -232,5 +410,53 @@ func TestGenerateMessageID_Format(t *testing.T) {
 	}
 	if !strings.HasPrefix(mid, "<") {
 		t.Errorf("message ID should start with <, got %q", mid)
+	}
+}
+
+// The HTML signature is a block with a top margin, not <br><br> stacked on the
+// body's own trailing margin, and it goes inside the document when there is one.
+func TestAddSignatureSpacing(t *testing.T) {
+	out := AddSignature("<p>Hi</p>", "<p>Ana</p>", true)
+	if strings.Contains(out, "<br>") {
+		t.Errorf("signature still separated by breaks: %q", out)
+	}
+	if !strings.Contains(out, `<div style="margin-top:16px"><p>Ana</p></div>`) {
+		t.Errorf("signature not wrapped in its own block: %q", out)
+	}
+
+	doc := AddSignature("<html><body><p>Hi</p></body></html>", "<p>Ana</p>", true)
+	if !strings.HasSuffix(doc, "</body></html>") || strings.Index(doc, "Ana") > strings.Index(doc, "</body>") {
+		t.Errorf("signature landed outside the document: %q", doc)
+	}
+
+	// HTML tag names are case-insensitive, so a pasted </BODY> counts too.
+	upper := AddSignature("<HTML><BODY><p>Hi</p></BODY></HTML>", "<p>Ana</p>", true)
+	if !strings.HasSuffix(upper, "</BODY></HTML>") || strings.Index(upper, "Ana") > strings.Index(upper, "</BODY>") {
+		t.Errorf("signature landed outside an upper-case document: %q", upper)
+	}
+	spaced := AddSignature("<html><body><p>Hi</p></body ></html>", "<p>Ana</p>", true)
+	if strings.Index(spaced, "Ana") > strings.Index(spaced, "</body >") {
+		t.Errorf("signature landed outside a spaced closing tag: %q", spaced)
+	}
+
+	if plain := AddSignature("Hi", "Ana", false); plain != "Hi\n\nAna" {
+		t.Errorf("plain-text spacing changed: %q", plain)
+	}
+	if none := AddSignature("<p>Hi</p>", "", true); none != "<p>Hi</p>" {
+		t.Errorf("empty signature altered the body: %q", none)
+	}
+}
+
+// The opt-out footer still lands after the signature once both are applied to a
+// body carrying a </body>, which is the order a reader expects.
+func TestSignatureThenOptOutOrderInsideDocument(t *testing.T) {
+	body := AddSignature("<html><body><p>Hi</p></body></html>", "<p>Ana</p>", true)
+	body, _ = appendOptOut(body, "", models.UnsubscribeSettings{Mode: models.UnsubscribeModeText, Text: "Reply stop."}, "")
+	sig, foot := strings.Index(body, "Ana"), strings.Index(body, "Reply stop.")
+	if sig < 0 || foot < 0 || sig > foot {
+		t.Fatalf("footer did not follow the signature: %q", body)
+	}
+	if strings.Index(body, "</body>") < foot {
+		t.Fatalf("footer landed outside the document: %q", body)
 	}
 }

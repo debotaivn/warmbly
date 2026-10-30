@@ -4,12 +4,15 @@
 
 import { EVENT_LABELS, REPLY_INTENT_OPTIONS } from "@/lib/api/models/app/integrations/Integration";
 import type { AutomationCondition } from "@/lib/api/models/app/automations/Automation";
+import { REPLY_INTENTS } from "@/lib/api/models/app/campaigns/sequences/Branching";
 
 // Warmbly events that can trigger an automation. Order = how they're listed.
 // "campaign.action" is the manual / campaign-launched trigger: it never fires on
 // a real event, only via a campaign "Run automation" step (RunAutomationByID).
 export const TRIGGER_EVENTS: string[] = [
     "campaign.reply_received",
+    "contact.created",
+    "form.submitted",
     "meeting.booked",
     "meeting.rescheduled",
     "meeting.canceled",
@@ -38,20 +41,23 @@ export const ACTION_LABELS: Record<string, string> = {
     "discord.notify": "Send a Discord message",
     "hubspot.upsert_contact": "Create / update HubSpot contact",
     "pipedrive.upsert_person": "Create / update Pipedrive person",
-    "salesforce.upsert_contact": "Create / update Salesforce contact",
+    "salesforce.upsert_contact": "Create / update Salesforce record",
     "close.upsert_lead": "Create / update Close lead",
     "webhook.ping": "Send a webhook",
+    "clay.send_row": "Send a row to Clay",
     // Native (Warmbly built-in) actions — no external connection needed.
-    "warmbly.add_tag": "Add a tag",
-    "warmbly.remove_tag": "Remove a tag",
+    "warmbly.add_tag": "Add a label",
+    "warmbly.remove_tag": "Remove a label",
     "warmbly.create_task": "Create a task",
     "warmbly.create_deal": "Create a deal",
     "warmbly.move_deal_stage": "Move the deal stage",
     "warmbly.unsubscribe": "Unsubscribe the contact",
     "warmbly.run_automation": "Run another automation",
-    "warmbly.label_email": "Label the email",
+    "warmbly.label_email": "Label the conversation",
     "warmbly.set_variables": "Set variables",
     "warmbly.fire_event": "Fire event",
+    "warmbly.upsert_contact": "Create or update contact",
+    "warmbly.add_to_campaign": "Add to campaign",
     "warmbly.ai_step": "AI step",
     "warmbly.ai_switch": "AI switch",
 };
@@ -66,6 +72,8 @@ export function actionLabel(a: string): string {
 export const NATIVE_CONNECTION = "__native__";
 
 export const NATIVE_ACTIONS: string[] = [
+    "warmbly.upsert_contact",
+    "warmbly.add_to_campaign",
     "warmbly.add_tag",
     "warmbly.remove_tag",
     "warmbly.create_task",
@@ -117,10 +125,16 @@ export function nativeActionNeeds(
     | "automation"
     | "vars"
     | "event"
+    | "contact"
+    | "campaign"
     | "ai_step"
     | "ai_switch"
     | "none" {
     switch (action) {
+        case "warmbly.upsert_contact":
+            return "contact";
+        case "warmbly.add_to_campaign":
+            return "campaign";
         case "warmbly.ai_step":
             return "ai_step";
         case "warmbly.ai_switch":
@@ -159,6 +173,10 @@ export function actionNeedsChannel(action: string): boolean {
 export function actionNeedsURL(action: string): boolean {
     return action === "webhook.ping";
 }
+// Clay posts to the table webhook saved on the connection unless the step names another.
+export function actionTakesClayURL(action: string): boolean {
+    return action === "clay.send_row";
+}
 // Notify-style actions accept an optional custom message template.
 export function actionSupportsTemplate(action: string): boolean {
     return action === "slack.notify" || action === "discord.notify" || action === "webhook.ping";
@@ -175,7 +193,7 @@ export function triggerSupportsIntentFilter(ev: string): boolean {
 // always meaningful), plus a universal "Random split". Adding an event here +
 // to TRIGGER_VARIABLES is all it takes for new triggers to get full conditions.
 
-export type ConditionValueType = "string" | "number" | "bool" | "enum";
+export type ConditionValueType = "string" | "number" | "bool" | "enum" | "list";
 
 export interface TriggerFieldDef {
     key: string;
@@ -183,6 +201,8 @@ export interface TriggerFieldDef {
     type: ConditionValueType;
     options?: { value: string; label: string }[];
     defaultOperator: string;
+    // A list field's common values, offered as one-click picks; any value can still be typed.
+    suggestions?: string[];
 }
 
 // Sentinel field key for the random-split pseudo-condition.
@@ -209,6 +229,34 @@ const MEETING_FIELDS: TriggerFieldDef[] = [
     { key: "contact_id", label: "Matched contact", type: "string", defaultOperator: "exists" },
 ];
 
+// The labels automatic inbox tagging writes, as titled in internal/app/inboxtag
+// (labelTitles). Custom question labels are workspace-specific, so they are typed.
+export const INBOX_TAG_LABELS = [
+    "Interested",
+    "Meeting",
+    "Pricing",
+    "Question",
+    "Update",
+    "Not now",
+    "Not interested",
+    "Wrong person",
+    "Unsubscribe",
+    "Legal threat",
+    "Out of office",
+    "Auto-reply",
+    "Sales pitch",
+    "Needs review",
+];
+
+// What inbox tagging decided a message is (internal/app/inboxtag kinds).
+export const INBOX_TAG_KINDS = [
+    { value: "human_reply", label: "Human reply" },
+    { value: "auto_reply_ooo", label: "Out of office" },
+    { value: "auto_reply_ticket", label: "Auto-reply" },
+    { value: "cold_inbound", label: "Sales pitch" },
+    { value: "internal", label: "Internal" },
+];
+
 const DELIVERABILITY_FIELDS: TriggerFieldDef[] = [
     { key: "event_type", label: "Event type", type: "string", defaultOperator: "equals" },
     { key: "provider", label: "Provider", type: "string", defaultOperator: "equals" },
@@ -217,10 +265,41 @@ const DELIVERABILITY_FIELDS: TriggerFieldDef[] = [
     { key: "campaign_id", label: "From a campaign", type: "string", defaultOperator: "exists" },
 ];
 
+export const CONTACT_SOURCES = [
+    { value: "manual", label: "Added manually" },
+    { value: "campaign", label: "Added from a campaign" },
+    { value: "api", label: "API" },
+    { value: "form", label: "Form submission" },
+    { value: "automation", label: "Automation" },
+    { value: "ai_assistant", label: "Remie" },
+];
+
 export const TRIGGER_FIELDS: Record<string, TriggerFieldDef[]> = {
+    "contact.created": [
+        { key: "source", label: "Source", type: "enum", options: CONTACT_SOURCES, defaultOperator: "equals" },
+        { key: "source_detail", label: "Source detail", type: "string", defaultOperator: "contains" },
+        { key: "contact_email", label: "Contact email", type: "string", defaultOperator: "contains" },
+        { key: "company", label: "Company", type: "string", defaultOperator: "contains" },
+        { key: "phone", label: "Phone", type: "string", defaultOperator: "exists" },
+        { key: "subscribed", label: "Subscribed", type: "bool", defaultOperator: "is_true" },
+    ],
+    "form.submitted": [
+        { key: "form_name", label: "Form", type: "string", defaultOperator: "equals" },
+        { key: "contact_email", label: "Contact email", type: "string", defaultOperator: "contains" },
+        { key: "company", label: "Company", type: "string", defaultOperator: "contains" },
+        { key: "source_url", label: "Page URL", type: "string", defaultOperator: "contains" },
+        { key: "campaign_id", label: "From a campaign", type: "string", defaultOperator: "exists" },
+        { key: "contact_id", label: "Matched contact", type: "string", defaultOperator: "exists" },
+    ],
     "campaign.reply_received": [
-        { key: "intent", label: "Reply intent", type: "enum", options: REPLY_INTENT_OPTIONS, defaultOperator: "equals" },
-        { key: "confidence", label: "Classifier confidence", type: "number", defaultOperator: "gte" },
+        { key: "intent", label: "Reply intent (keywords)", type: "enum", options: REPLY_INTENT_OPTIONS, defaultOperator: "equals" },
+        { key: "confidence", label: "Keyword confidence", type: "number", defaultOperator: "gte" },
+        { key: "ai_labels", label: "Inbox tagging labels", type: "list", suggestions: INBOX_TAG_LABELS, defaultOperator: "contains" },
+        { key: "ai_intent", label: "Inbox tagging intent", type: "enum", options: REPLY_INTENTS, defaultOperator: "equals" },
+        { key: "ai_intent_confidence", label: "Inbox tagging intent confidence", type: "number", defaultOperator: "gte" },
+        { key: "ai_kind", label: "Inbox tagging kind", type: "enum", options: INBOX_TAG_KINDS, defaultOperator: "equals" },
+        { key: "ai_relevance", label: "Inbox tagging relevance", type: "number", defaultOperator: "gte" },
+        { key: "ai_needs_review", label: "Inbox tagging needs review", type: "bool", defaultOperator: "is_true" },
         { key: "contact_email", label: "Contact email", type: "string", defaultOperator: "contains" },
         { key: "subject", label: "Subject", type: "string", defaultOperator: "contains" },
         { key: "contact_id", label: "Matched contact", type: "string", defaultOperator: "exists" },
@@ -332,7 +411,9 @@ export function operatorsForType(type: ConditionValueType): { value: string; lab
               ? ["equals", "not_equals", "exists"]
               : type === "bool"
                 ? ["is_true", "exists"]
-                : ["equals", "not_equals", "contains", "exists"];
+                : type === "list"
+                  ? ["contains", "exists"]
+                  : ["equals", "not_equals", "contains", "exists"];
     return ops.map((o) => ({ value: o, label: OPERATOR_LABELS[o] ?? o }));
 }
 
@@ -354,7 +435,23 @@ export function defaultOperatorFor(field: string): string {
 // The keys present in each trigger's event payload, offered as {{.key}} inserts
 // (standard Go-template dotted field access) in action message/URL/value fields.
 export const TRIGGER_VARIABLES: Record<string, string[]> = {
-    "campaign.reply_received": ["contact_email", "contact_id", "campaign_id", "intent", "confidence", "subject", "snippet"],
+    "contact.created": ["contact_email", "contact_id", "first_name", "last_name", "company", "phone", "source", "source_detail", "subscribed"],
+    "form.submitted": ["contact_email", "contact_id", "first_name", "last_name", "company", "phone", "form_name", "form_id", "submission_id", "source_url", "campaign_id"],
+    "campaign.reply_received": [
+        "contact_email",
+        "contact_id",
+        "campaign_id",
+        "intent",
+        "confidence",
+        "subject",
+        "snippet",
+        "ai_labels",
+        "ai_intent",
+        "ai_intent_confidence",
+        "ai_kind",
+        "ai_relevance",
+        "ai_needs_review",
+    ],
     "meeting.booked": ["invitee_name", "invitee_email", "event_name", "scheduled_for", "join_url", "source", "contact_id"],
     "meeting.rescheduled": ["invitee_name", "invitee_email", "event_name", "scheduled_for", "join_url", "source", "contact_id"],
     "meeting.canceled": ["invitee_name", "invitee_email", "event_name", "scheduled_for", "source", "contact_id"],
@@ -393,6 +490,12 @@ export function sampleEventData(triggerEvent: string): Record<string, unknown> {
             base.confidence = 0.92;
             base.subject = "Re: quick question";
             base.snippet = "Sure, let's talk next week.";
+            base.ai_kind = "human_reply";
+            base.ai_intent = "scheduling";
+            base.ai_intent_confidence = 0.91;
+            base.ai_labels = ["Meeting", "Interested"];
+            base.ai_relevance = 82;
+            base.ai_needs_review = false;
             break;
         case "meeting.booked":
         case "meeting.rescheduled":
@@ -417,11 +520,36 @@ export function sampleEventData(triggerEvent: string): Record<string, unknown> {
             base.previous_state = "healthy";
             base.reason = "spam placement rising";
             break;
+        case "contact.created":
+            delete base.campaign_id;
+            delete base.campaign_name;
+            base.phone = "+1 555 0100";
+            base.subscribed = true;
+            base.custom_fields = { industry: "SaaS" };
+            base.source = "form";
+            base.source_detail = "Demo request";
+            base.campaign_ids = [];
+            base.category_ids = [];
+            break;
+        case "form.submitted":
+            delete base.campaign_name;
+            base.form_id = "00000000-0000-0000-0000-000000000003";
+            base.form_name = "Demo request";
+            base.submission_id = "00000000-0000-0000-0000-000000000004";
+            base.phone = "+1 555 0100";
+            base.source_url = "https://example.com/pricing";
+            base.data = { email: "jane@example.com", first_name: "Jane", last_name: "Doe", company: "Example Inc", team_size: "10-50" };
+            break;
     }
     return base;
 }
 
-const prettyKey = (k: string) => k.replace(/_/g, " ");
+const prettyKey = (k: string) => k.replace(/^ai_/, "AI ").replace(/_/g, " ");
+
+// Condition keys whose value is a 0..1 confidence, edited and shown as a percent.
+export function isConfidenceKey(key: string): boolean {
+    return key === "confidence" || key === "ai_intent_confidence";
+}
 
 // A short human summary of a condition, used as the IF node label.
 export function conditionLabel(c?: AutomationCondition): string {
@@ -446,11 +574,14 @@ export function conditionLabel(c?: AutomationCondition): string {
         const op = c.operator;
         if (op === "exists") return `${prettyKey(key)} is present`;
         if (op === "is_true") return `${prettyKey(key)} is true`;
-        if (key === "confidence") return `confidence ≥ ${Math.round(Number(c.value ?? 0) * 100)}%`;
         const opLbl = OPERATOR_LABELS[op] ?? op;
+        if (isConfidenceKey(key)) return `${prettyKey(key)} ${opLbl} ${Math.round(Number(c.value ?? 0) * 100)}%`;
         const valLbl =
+            (key === "ai_intent" ? REPLY_INTENTS.find((o) => o.value === c.value)?.label : undefined) ??
+            (key === "ai_kind" ? INBOX_TAG_KINDS.find((o) => o.value === c.value)?.label : undefined) ??
             REPLY_INTENT_OPTIONS.find((o) => o.value === c.value)?.label ??
             WARMUP_STATES.find((o) => o.value === c.value)?.label ??
+            (key === "source" ? CONTACT_SOURCES.find((o) => o.value === c.value)?.label : undefined) ??
             String(c.value ?? "…");
         return `${prettyKey(key)} ${opLbl} ${valLbl}`;
     }

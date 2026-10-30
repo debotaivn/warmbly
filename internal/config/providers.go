@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 // Provider selection helpers. These centralize the env-var switches and their
@@ -74,10 +75,22 @@ func CaptchaProvider() string {
 	if v := os.Getenv("CAPTCHA_PROVIDER"); v != "" {
 		return v
 	}
-	if os.Getenv("TURNSTILE_SECRET") == "" {
+	if !TurnstileSecretConfigured() {
 		return "none"
 	}
 	return "turnstile"
+}
+
+// turnstileSecretResolved is set when the auth config resolved a secret from
+// any source, including a secret store the environment does not show.
+var turnstileSecretResolved atomic.Bool
+
+// SetTurnstileSecretResolved records whether the auth config resolved a secret.
+func SetTurnstileSecretResolved(ok bool) { turnstileSecretResolved.Store(ok) }
+
+// TurnstileSecretConfigured reports whether a Turnstile secret is available.
+func TurnstileSecretConfigured() bool {
+	return os.Getenv("TURNSTILE_SECRET") != "" || turnstileSecretResolved.Load()
 }
 
 // AWSNeeded reports whether any AWS-backed provider is selected, so a fully
@@ -99,4 +112,78 @@ func providerOr(env, def string) string {
 // because the server-rendered page cannot read the SPA's runtime config.
 func TurnstileSiteKey() string {
 	return strings.TrimSpace(os.Getenv("TURNSTILE_SITE_KEY"))
+}
+
+// MailhostISPDB reports whether mailbox server detection may ask Thunderbird's
+// ISPDB (autoconfig.thunderbird.net), which sends it the domain name. On by
+// default for the hosted product and off for a self-host; MAILHOST_ISPDB overrides.
+func MailhostISPDB() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MAILHOST_ISPDB"))) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	}
+	return !SelfHosted()
+}
+
+// DevEnv reports whether APP_ENV names a development instance; unset is dev.
+func DevEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
+	case "", "dev", "development", "local":
+		return true
+	}
+	return false
+}
+
+// ExplicitDevelopment reports whether APP_ENV names development; unlike DevEnv, unset is not.
+func ExplicitDevelopment() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
+	case "dev", "development", "local":
+		return true
+	}
+	return false
+}
+
+// HostedProduction reports a hosted (not self-host) instance outside development.
+func HostedProduction() bool { return !SelfHosted() && !DevEnv() }
+
+// SMTPCRAMMD5Allowed preserves legacy mail-server compatibility outside hosted production.
+func SMTPCRAMMD5Allowed() bool { return !HostedProduction() }
+
+// UnsafeWebhookURLsAllowed reports whether outbound HTTP to customer URLs may use
+// http:// and private addresses. Only a self-hosted or development instance may opt in.
+func UnsafeWebhookURLsAllowed() bool {
+	return isTrue(os.Getenv("WARMBLY_ALLOW_UNSAFE_WEBHOOK_URLS")) && !HostedProduction()
+}
+
+// PrivateMailHostsAllowed reports whether mailbox SMTP/IMAP connections may reach
+// non-public addresses. Never on hosted production; a self-hosted or development
+// instance allows them (on-premises mail servers) unless MAIL_ALLOW_PRIVATE_HOSTS=false.
+func PrivateMailHostsAllowed() bool {
+	if HostedProduction() {
+		return false
+	}
+	return !isFalse(os.Getenv("MAIL_ALLOW_PRIVATE_HOSTS"))
+}
+
+// MailTLSInsecureAllowed reports whether MAIL_TLS_INSECURE=true applies: never
+// on hosted production, where a mailbox opts out per server with a pinned key.
+func MailTLSInsecureAllowed() bool {
+	return isTrue(os.Getenv("MAIL_TLS_INSECURE")) && !HostedProduction()
+}
+
+// SMTPTLSInsecureAllowed reports whether SMTP_TLS_INSECURE_SKIP_VERIFY=true applies: never on hosted production.
+func SMTPTLSInsecureAllowed() bool {
+	return isTrue(os.Getenv("SMTP_TLS_INSECURE_SKIP_VERIFY")) && !HostedProduction()
+}
+
+// MailvendorSandboxURL points every inbox vendor client at the sandbox's mock
+// vendor API (<url>/<vendor>). Honoured only in development (APP_ENV dev or
+// unset), so a stray value can never send real vendor keys elsewhere.
+func MailvendorSandboxURL() string {
+	if env := strings.TrimSpace(os.Getenv("APP_ENV")); env != "" && !strings.EqualFold(env, "dev") {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSpace(os.Getenv("MAILVENDOR_SANDBOX_URL")), "/")
 }

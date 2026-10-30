@@ -38,12 +38,15 @@ defmodule Realtime.Application do
 
         # Google Pub/Sub subscriber supervisor
         {Realtime.CloudPubSub.Supervisor, []}
-      ] ++ event_bridge_children()
+      ] ++ Realtime.PostHog.children() ++ event_bridge_children()
 
     opts = [strategy: :one_for_one, name: Realtime.Supervisor]
 
     Logger.info("Starting Realtime application...")
-    Logger.info("Redis URL: #{Application.get_env(:realtime, :redis_url, "not configured")}")
+
+    Logger.info(
+      "Redis URL: #{redact_userinfo(Application.get_env(:realtime, :redis_url, "not configured"))}"
+    )
 
     Logger.info(
       "Connection limits: user=#{Application.get_env(:realtime, :max_connections_per_user, 10)}, ip=#{Application.get_env(:realtime, :max_connections_per_ip, 50)}, global=#{Application.get_env(:realtime, :max_connections_global, 100_000)}"
@@ -53,6 +56,13 @@ defmodule Realtime.Application do
       "Rate limits: message=#{Application.get_env(:realtime, :rate_limit_ws_message, 120)}/min, connect=#{Application.get_env(:realtime, :rate_limit_ws_connect, 30)}/min, join=#{Application.get_env(:realtime, :rate_limit_ws_join, 30)}/min, event=#{Application.get_env(:realtime, :rate_limit_ws_event, 60)}/min"
     )
 
+    if Application.get_env(:realtime, :allow_query_credentials, false) do
+      Logger.warning(
+        "REALTIME_ALLOW_QUERY_CREDENTIALS=true: API keys and OAuth tokens are accepted in the socket URL, " <>
+          "where proxies and access logs record them. Unset it once every client sends the x-warmbly-token header."
+      )
+    end
+
     Supervisor.start_link(children, opts)
   end
 
@@ -60,6 +70,20 @@ defmodule Realtime.Application do
   # transport (local dev and any non-GCP env). In Pub/Sub environments the
   # Broadway subscriber handles fan-out, so this stays off and events are never
   # delivered twice.
+  # The Redis URL carries its password in the userinfo, and this line put it in
+  # plain text in the boot log of every deployment. Logs are read, shipped and
+  # pasted far more casually than the variable itself, so the address stays
+  # (it is what makes this line useful) and the credential goes.
+  @doc false
+  def redact_userinfo(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{userinfo: nil} -> url
+      %URI{} = uri -> URI.to_string(%{uri | userinfo: "***"})
+    end
+  end
+
+  def redact_userinfo(other), do: other
+
   defp event_bridge_children do
     if Application.get_env(:realtime, :pubsub_enabled, false) do
       []

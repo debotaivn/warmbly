@@ -17,6 +17,7 @@ type ContactSendConstraint string
 const (
 	ConstraintNone             ContactSendConstraint = ""
 	ConstraintStepWait         ContactSendConstraint = "step_wait"
+	ConstraintEntryDelay       ContactSendConstraint = "entry_delay"
 	ConstraintConditionWindow  ContactSendConstraint = "condition_window"
 	ConstraintStartDate        ContactSendConstraint = "start_date"
 	ConstraintSendingWindow    ContactSendConstraint = "sending_window"
@@ -26,10 +27,23 @@ const (
 	ConstraintNoMailbox        ContactSendConstraint = "no_mailbox"
 	ConstraintDomainAuth       ContactSendConstraint = "domain_auth"
 	ConstraintCampaignEnded    ContactSendConstraint = "campaign_ended"
+	// ConstraintSenderBusy is the whole pool being fine and one mailbox not:
+	// the lead's sequence belongs to a mailbox that has nothing left today.
+	ConstraintSenderBusy ContactSendConstraint = "sender_busy"
+	// ConstraintLeadHold is this one lead parked: an out-of-office auto-reply
+	// holding the contact until they are back, or a member pausing them.
+	ConstraintLeadHold ContactSendConstraint = "lead_hold"
 )
 
 // ContactSendPreview is a read-only "what happens next" for one contact in
-// one campaign; ScheduledAt is set only when the step is due now.
+// one campaign. It is a pure read in both senses: it writes nothing, and it
+// answers the same unchanged state with the same times on every call, because
+// the drawer polls it and a figure that walked forward on every refresh read as
+// a product that could not make up its mind (issue #437).
+//
+// ScheduledAt is set only when the step is due now, and is then the campaign
+// chain's own next wakeup. NotBefore is the step's hard floor, never a paced
+// slot.
 type ContactSendPreview struct {
 	Route       *repository.ContactRoute
 	State       models.ContactNextActionState
@@ -56,13 +70,28 @@ func (s *schedulerService) PreviewContactSend(ctx context.Context, campaignID, c
 	}
 	pv := &ContactSendPreview{Route: route}
 
+	// The lead's own hold answers before anything else: "on holiday until
+	// Tuesday" is the specific fact, and the drawer offers "resume now" next to
+	// it. It outranks the condition window a held lead may also be sitting in.
+	if route.Hold != nil {
+		pv.State = models.NextActionPaused
+		pv.NotBefore = route.Hold.Until
+		pv.Constraint = ConstraintLeadHold
+		return pv, nil
+	}
 	if route.WaitUntil != nil {
 		pv.State = models.NextActionWaiting
 		pv.NotBefore = route.WaitUntil
 		pv.Constraint = ConstraintConditionWindow
 		return pv, nil
 	}
-	if route.Target == nil || route.Excluded != "" {
+	if route.Target == nil {
+		return pv, nil
+	}
+	// A pre-send gate refuses this lead outright. Say so rather than leaving
+	// the state empty, which renders as a next action with no words on it.
+	if route.Excluded != "" {
+		pv.State = models.NextActionBlocked
 		return pv, nil
 	}
 	if campaign.Status != "active" {
@@ -84,22 +113,38 @@ func (s *schedulerService) PreviewContactSend(ctx context.Context, campaignID, c
 		return pv, nil
 	}
 
-	pair := &repository.ContactSequencePair{ContactID: contactID, SequenceID: *route.Target, IsNewLead: route.IsNewLead}
-	at, sendable, _, perr := s.placeCampaignSend(ctx, campaign, accounts, meta, pair, true)
+	pair := &repository.ContactSequencePair{
+		ContactID: contactID, SequenceID: *route.Target, IsNewLead: route.IsNewLead,
+		Instant: route.Instant, NotBefore: route.DueAt, AssignedSender: route.AssignedSender,
+	}
+	at, sendable, _, perr := s.placeCampaignSend(ctx, campaign, accounts, meta, pair, nil, true)
 	switch {
 	case perr == nil && sendable != nil:
 		pv.State = models.NextActionDue
-		slot := at
-		pv.ScheduledAt = &slot
+		// A due step is not waiting for a time of its own; it is waiting for the
+		// campaign's own chain to wake up and reach it. Report THAT instant,
+		// which is a stored scheduled_at and therefore the same answer on every
+		// read, rather than rolling a fresh slot for a send that is already due
+		// (issue #437). No wakeup means the chain is being re-seeded, and the
+		// honest answer is no time at all.
+		pv.ScheduledAt = s.campaignWakeup(ctx, campaignID)
 		return pv, nil
 	case errors.Is(perr, ErrCampaignDeferred):
 		pv.State = models.NextActionWaiting
+		// `at` is the step's hard floor here, not a paced slot: a preview runs
+		// placement with the spacing, jitter and distribution layers off, so the
+		// same unchanged campaign answers with the same instant every time.
 		slot := at
 		if route.DueAt != nil && route.DueAt.After(slot) {
 			slot = *route.DueAt
 		}
 		pv.NotBefore = &slot
 		pv.Constraint = s.deferralConstraint(ctx, campaign, route)
+		// The pool is not the gate here, one mailbox is: say which, rather than
+		// blaming "no mailbox can take it" while two others sit idle.
+		if errors.Is(perr, ErrSenderBusy) && pv.Constraint == ConstraintCapacity {
+			pv.Constraint = ConstraintSenderBusy
+		}
 		return pv, nil
 	case errors.Is(perr, ErrCampaignEnded):
 		pv.State = models.NextActionBlocked
@@ -118,18 +163,24 @@ func (s *schedulerService) PreviewContactSend(ctx context.Context, campaignID, c
 }
 
 // deferralConstraint picks the gate that explains a deferred placement, in
-// the order the send path applies them: the step's own wait, the campaign
-// start date, the sending window, today's new-lead cap, and otherwise the
-// mailbox pool (daily caps, spacing, health, rest).
+// the order the send path applies them: the step's own wait (or, for a first
+// step, the campaign's entry delay), the campaign start date, the sending
+// window, today's new-lead cap, and otherwise the mailbox pool (daily caps,
+// spacing, health, rest).
 func (s *schedulerService) deferralConstraint(ctx context.Context, campaign *models.Campaign, route *repository.ContactRoute) ContactSendConstraint {
 	grace := time.Now().Add(config.CampaignNotDueGraceSeconds * time.Second)
 	if route.DueAt != nil && route.DueAt.After(grace) {
+		// A first step's wait is the campaign's entry delay, not a step wait —
+		// the drawer words the two differently.
+		if route.IsNewLead {
+			return ConstraintEntryDelay
+		}
 		return ConstraintStepWait
 	}
 	if campaign.StartDate != nil && campaign.StartDate.After(grace) {
 		return ConstraintStartDate
 	}
-	if nextScheduleSlot(time.Now(), effectiveWindows(campaign), loadLocation(campaign.Timezone)).After(grace) {
+	if nextScheduleSlot(time.Now(), effectiveWindows(campaign), loadLocation(campaign.ClockTimezone())).After(grace) {
 		return ConstraintSendingWindow
 	}
 	if route.IsNewLead && campaign.MaxNewLeadsPerDay > 0 {
@@ -153,4 +204,25 @@ func projectRampLevel(c *models.Campaign, now time.Time) {
 	}
 	c.RampLevel = min(c.RampCeiling, max(c.RampLevel, c.RampStart)+c.RampIncrement)
 	c.RampLevelDate = &today
+}
+
+// campaignWakeup is when the campaign's chain next runs: the earliest pending
+// campaign task. Nil when the campaign has none, which the reconciler fixes
+// within its own interval.
+func (s *schedulerService) campaignWakeup(ctx context.Context, campaignID uuid.UUID) *time.Time {
+	tasks, err := s.campaignRepo.GetPendingCampaignTasks(ctx, campaignID)
+	if err != nil {
+		return nil
+	}
+	var next *time.Time
+	for i := range tasks {
+		at := tasks[i].ScheduledAt
+		if at == nil {
+			continue
+		}
+		if next == nil || at.Before(*next) {
+			next = at
+		}
+	}
+	return next
 }

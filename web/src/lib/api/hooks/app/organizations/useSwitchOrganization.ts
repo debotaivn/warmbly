@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import switchOrganization from "@/lib/api/client/app/organizations/switchOrganization";
+import { markOrgSynced } from "@/lib/boot";
 
 interface UseSwitchOrganizationOptions {
     // How to reconcile the query cache after the server session switch lands:
@@ -24,7 +25,9 @@ interface UseSwitchOrganizationOptions {
     //    change) to avoid re-churning OrgGate's own effect.
     //
     // `auth/*` is preserved in both modes — identity didn't change, just the
-    // active workspace.
+    // active workspace. `auth/me` is the exception: its payload carries the
+    // WORKSPACE's folder/tag/category registries, so it is refetched on every
+    // switch or the pickers keep offering the previous workspace's labels.
     mode?: "reset" | "sync";
 }
 
@@ -33,7 +36,8 @@ export default function useSwitchOrganization({ mode = "reset" }: UseSwitchOrgan
 
     return useMutation({
         mutationFn: (id: string) => switchOrganization(id),
-        onSuccess: () => {
+        onSuccess: (_data, id) => {
+            markOrgSynced(id);
             if (mode === "sync") {
                 queryClient.invalidateQueries({
                     predicate: (q) => {
@@ -41,6 +45,7 @@ export default function useSwitchOrganization({ mode = "reset" }: UseSwitchOrgan
                         return root !== "auth" && root !== "organizations";
                     },
                 });
+                void queryClient.invalidateQueries({ queryKey: ["auth", "me"] });
                 return;
             }
             queryClient.removeQueries({
@@ -49,6 +54,7 @@ export default function useSwitchOrganization({ mode = "reset" }: UseSwitchOrgan
                     return root !== "auth";
                 },
             });
+            void queryClient.invalidateQueries({ queryKey: ["auth", "me"] });
         },
     });
 }

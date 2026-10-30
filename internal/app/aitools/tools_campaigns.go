@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/pkg/generation"
@@ -26,22 +28,24 @@ func (d Deps) registerCampaignTools(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "get_campaign_stats",
-		Description: "Get send/open/click/reply stats for one campaign.",
+		Description: "Get send/open/click/reply stats for one campaign, including positive replies, interested leads and replies by classification, plus the same numbers and rates per sequence step. Give from and to together to read only the emails sent on those days (with every open, click, reply and bounce they earned, whenever it came); leave both out for the campaign's whole history.",
 		InputSchema: objectSchema(map[string]any{
 			"campaign_id": strProp("The campaign's UUID."),
+			"from":        strProp("Optional first day of the period, YYYY-MM-DD (UTC). Requires to."),
+			"to":          strProp("Optional last day of the period, YYYY-MM-DD (UTC), included. Requires from."),
 		}, "campaign_id"),
 		Risk:            generation.RiskRead,
-		RequiredOrgPerm: models.PermViewCampaigns,
-		RequiredAPIPerm: models.APIPermReadCampaigns,
+		RequiredOrgPerm: models.PermViewAnalytics,
+		RequiredAPIPerm: models.APIPermReadAnalytics,
 		Handler:         d.getCampaignStats,
 	})
 
 	r.Register(Tool{
 		Name:        "list_campaign_leads",
-		Description: "List one campaign's leads with their derived status and per-status totals. Statuses: pending (queued, nothing sent), active (mid-sequence), completed (every step sent, no reply — these are the leads that went cold and need a follow-up), replied, bounced, unsubscribed. Use THIS to find cold leads or follow-up candidates; the inbox only shows received mail.",
+		Description: "List one campaign's leads with their derived status and per-status totals. Statuses: pending (queued, nothing sent), active (mid-sequence), completed (every step sent, no reply — these are the leads that went cold and need a follow-up), replied, bounced, paused (flow held, by an out-of-office auto-reply or by hand), undeliverable (address verification refused it, so the campaign never sends to it), unsubscribed. Use THIS to find cold leads or follow-up candidates; the inbox only shows received mail.",
 		InputSchema: objectSchema(map[string]any{
 			"campaign_id": strProp("The campaign's UUID (from list_campaigns)."),
-			"status":      enumProp("Optional lead-status filter.", "pending", "active", "completed", "replied", "bounced", "unsubscribed"),
+			"status":      enumProp("Optional lead-status filter.", "pending", "active", "completed", "replied", "bounced", "paused", "undeliverable", "unsubscribed"),
 			"limit":       intProp("Max leads (1-50, default 20)."),
 		}, "campaign_id"),
 		Risk:            generation.RiskRead,
@@ -58,9 +62,27 @@ func (d Deps) registerCampaignTools(r *Registry) {
 			"action":      enumProp("start to activate/resume, stop to pause.", "start", "stop"),
 		}, "campaign_id", "action"),
 		Risk:            generation.RiskWrite,
+		AlwaysAsk:       true,
 		RequiredOrgPerm: models.PermSendCampaigns,
 		RequiredAPIPerm: models.APIPermSendCampaigns,
 		Handler:         d.setCampaignStatus,
+	})
+
+	r.Register(Tool{
+		Name:        "set_lead_hold",
+		Description: "Hold or resume ONE contact's flow inside ONE campaign. Use this, not an unsubscribe and not the suppression list, when someone should simply not be emailed for a while: a hold leaves the contact subscribed and a lead of the campaign, and the sequence picks up where it stopped. Warmbly already holds a lead by itself when the recipient answers with an out-of-office auto-reply, so a lead whose status is 'paused' for that reason needs nothing. Requires user approval.",
+		InputSchema: objectSchema(map[string]any{
+			"campaign_id": strProp("The campaign's UUID."),
+			"contact_id":  strProp("The contact's UUID. Must already be a lead of the campaign."),
+			"action":      enumProp("pause to hold the lead, resume to lift the hold now.", "pause", "resume"),
+			"until":       strProp("For pause: RFC 3339 timestamp the hold lifts at, in the future and within a year. Omit for a hold only a resume lifts."),
+			"reason":      strProp("For pause: a short note shown next to the hold."),
+		}, "campaign_id", "contact_id", "action"),
+		Risk:            generation.RiskWrite,
+		AlwaysAsk:       true,
+		RequiredOrgPerm: models.PermManageCampaigns,
+		RequiredAPIPerm: models.APIPermWriteCampaigns,
+		Handler:         d.setLeadHold,
 	})
 
 	r.Register(Tool{
@@ -70,7 +92,7 @@ func (d Deps) registerCampaignTools(r *Registry) {
 			"name":        strProp("Campaign name (required)."),
 			"description": strProp("Optional description."),
 			"steps": arrProp("Optional email steps to seed the sequence.", objectSchema(map[string]any{
-				"subject":   strProp("Email subject (may contain {{merge}} vars)."),
+				"subject":   strProp("Email subject (may contain {{merge}} vars). Follow-ups reply in the first email's thread and carry its subject, so only the first step's subject is used."),
 				"body":      strProp("Email body text (may contain {{merge}} vars)."),
 				"wait_days": intProp("Days to wait before this step (0 for the first)."),
 			}, "subject", "body")),
@@ -104,12 +126,19 @@ func (d Deps) registerCampaignTools(r *Registry) {
 			"stop_on_reply":      boolProp("Stop sequencing a lead once they reply."),
 			"open_tracking":      boolProp("Track opens."),
 			"link_tracking":      boolProp("Track link clicks."),
+			"utm_tracking":       boolProp("Tag every link with UTM parameters automatically."),
+			"utm_source":         strProp("utm_source override (empty means the default, warmbly)."),
+			"utm_medium":         strProp("utm_medium override (empty means the default, email)."),
+			"utm_campaign":       strProp("utm_campaign override (empty means the campaign name as a slug)."),
 			"text_only":          boolProp("Send plain text only."),
 			"unsubscribe_header": boolProp("Send the List-Unsubscribe header (one-click unsubscribe)."),
+			"unsubscribe_mode":   strProp("In-body opt-out: inherit (workspace default), text (reply-to-opt-out line), link (unsubscribe link), off."),
 			"ramp_enabled":       boolProp("Gradually ramp daily volume."),
 			"ramp_start":         intProp("Ramp starting volume."),
 			"ramp_increment":     intProp("Ramp daily increment."),
 			"ramp_ceiling":       intProp("Ramp ceiling."),
+			"entry_delay_minutes": intProp(
+				"Minutes to wait before a contact's FIRST email, counted from when they entered the campaign. 0 sends it as soon as the schedule allows; max 129600 (90 days)."),
 		}, "campaign_id"),
 		Risk:            generation.RiskWrite,
 		RequiredOrgPerm: models.PermManageCampaigns,
@@ -211,12 +240,18 @@ func (d Deps) updateCampaign(ctx context.Context, inv Invocation, args json.RawM
 		StopOnReply       *bool   `json:"stop_on_reply"`
 		OpenTracking      *bool   `json:"open_tracking"`
 		LinkTracking      *bool   `json:"link_tracking"`
+		UTMTracking       *bool   `json:"utm_tracking"`
+		UTMSource         *string `json:"utm_source"`
+		UTMMedium         *string `json:"utm_medium"`
+		UTMCampaign       *string `json:"utm_campaign"`
 		TextOnly          *bool   `json:"text_only"`
 		UnsubscribeHeader *bool   `json:"unsubscribe_header"`
+		UnsubscribeMode   *string `json:"unsubscribe_mode"`
 		RampEnabled       *bool   `json:"ramp_enabled"`
 		RampStart         *int    `json:"ramp_start"`
 		RampIncrement     *int    `json:"ramp_increment"`
 		RampCeiling       *int    `json:"ramp_ceiling"`
+		EntryDelayMinutes *int    `json:"entry_delay_minutes"`
 	}](args)
 	if err != nil {
 		return "", err
@@ -232,14 +267,20 @@ func (d Deps) updateCampaign(ctx context.Context, inv Invocation, args json.RawM
 		StopOnReply:       in.StopOnReply,
 		OpenTracking:      in.OpenTracking,
 		LinkTracking:      in.LinkTracking,
+		UTMTracking:       in.UTMTracking,
+		UTMSource:         in.UTMSource,
+		UTMMedium:         in.UTMMedium,
+		UTMCampaign:       in.UTMCampaign,
 		TextOnly:          in.TextOnly,
 		UnsubscribeHeader: in.UnsubscribeHeader,
+		UnsubscribeMode:   in.UnsubscribeMode,
 		RampEnabled:       in.RampEnabled,
 		RampStart:         in.RampStart,
 		RampIncrement:     in.RampIncrement,
 		RampCeiling:       in.RampCeiling,
+		EntryDelayMinutes: in.EntryDelayMinutes,
 	}
-	camp, xerr := d.Campaigns.Update(ctx, inv.UserID.String(), in.CampaignID, upd)
+	camp, xerr := d.Campaigns.Update(ctx, inv.OrgID.String(), in.CampaignID, upd)
 	if xerr != nil {
 		return "", fromErrx(xerr)
 	}
@@ -348,7 +389,7 @@ func (d Deps) getCampaignLogs(ctx context.Context, inv Invocation, args json.Raw
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	res, xerr := d.Campaigns.GetLogs(ctx, inv.UserID.String(), in.CampaignID, limit, nil)
+	res, xerr := d.Campaigns.GetLogs(ctx, inv.OrgID.String(), in.CampaignID, limit, nil)
 	if xerr != nil {
 		return "", fromErrx(xerr)
 	}
@@ -368,7 +409,7 @@ func (d Deps) listCampaigns(ctx context.Context, inv Invocation, args json.RawMe
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
-	res, xerr := d.Campaigns.Search(ctx, inv.OrgID.String(), in.Query, "", "", in.Status, fmt.Sprintf("%d", limit))
+	res, xerr := d.Campaigns.Search(ctx, inv.OrgID.String(), in.Query, "", "", in.Status, fmt.Sprintf("%d", limit), nil)
 	if xerr != nil {
 		return "", fromErrx(xerr)
 	}
@@ -382,6 +423,8 @@ func (d Deps) listCampaigns(ctx context.Context, inv Invocation, args json.RawMe
 func (d Deps) getCampaignStats(ctx context.Context, inv Invocation, args json.RawMessage) (string, error) {
 	in, err := decodeArgs[struct {
 		CampaignID string `json:"campaign_id"`
+		From       string `json:"from"`
+		To         string `json:"to"`
 	}](args)
 	if err != nil {
 		return "", err
@@ -390,25 +433,72 @@ func (d Deps) getCampaignStats(ctx context.Context, inv Invocation, args json.Ra
 	if err != nil {
 		return "", err
 	}
-	a, xerr := d.Analytics.GetCampaignAnalytics(ctx, inv.UserID, cid)
+	period, err := parseDayRangeArgs(in.From, in.To)
+	if err != nil {
+		return "", err
+	}
+	a, xerr := d.Analytics.GetCampaignAnalytics(ctx, inv.OrgID, cid, period)
 	if xerr != nil {
 		return "", fromErrx(xerr)
 	}
 	s := a.Summary
+	// Per-step rates are what answer "which touch is working"; the counts
+	// alone cannot be compared across steps that reached different numbers.
+	steps := make([]map[string]any, 0, len(a.Sequences))
+	for _, st := range a.Sequences {
+		steps = append(steps, map[string]any{
+			"step_id":             st.SequenceID.String(),
+			"name":                st.Name,
+			"position":            st.Position,
+			"emails_sent":         st.EmailsSent,
+			"opens":               st.Opens,
+			"machine_opens":       st.MachineOpens,
+			"clicks":              st.Clicks,
+			"machine_clicks":      st.MachineClicks,
+			"replies":             st.Replies,
+			"positive_replies":    st.PositiveReplies,
+			"bounces":             st.Bounces,
+			"open_rate":           st.OpenRate,
+			"click_rate":          st.ClickRate,
+			"reply_rate":          st.ReplyRate,
+			"positive_reply_rate": st.PositiveReplyRate,
+			"bounce_rate":         st.BounceRate,
+		})
+	}
 	return jsonResult(map[string]any{
-		"campaign_id":    a.CampaignID.String(),
-		"name":           a.Name,
-		"status":         a.Status,
-		"total_contacts": s.TotalContacts,
-		"emails_sent":    s.EmailsSent,
-		"unique_opens":   s.UniqueOpens,
-		"unique_clicks":  s.UniqueClicks,
-		"replies":        s.Replies,
-		"bounces":        s.Bounces,
-		"open_rate":      s.OpenRate,
-		"click_rate":     s.ClickRate,
-		"reply_rate":     s.ReplyRate,
+		"campaign_id":         a.CampaignID.String(),
+		"name":                a.Name,
+		"status":              a.Status,
+		"from":                a.DateRange.From.Format("2006-01-02"),
+		"to":                  a.DateRange.To.Format("2006-01-02"),
+		"total_contacts":      s.TotalContacts,
+		"emails_sent":         s.EmailsSent,
+		"unique_opens":        s.UniqueOpens,
+		"machine_opens":       s.MachineOpens,
+		"unique_clicks":       s.UniqueClicks,
+		"machine_clicks":      s.MachineClicks,
+		"replies":             s.Replies,
+		"positive_replies":    s.PositiveReplies,
+		"interested_leads":    s.InterestedLeads,
+		"reply_breakdown":     s.ReplyBreakdown,
+		"bounces":             s.Bounces,
+		"open_rate":           s.OpenRate,
+		"click_rate":          s.ClickRate,
+		"reply_rate":          s.ReplyRate,
+		"positive_reply_rate": s.PositiveReplyRate,
+		"bounce_rate":         s.BounceRate,
+		"steps":               steps,
 	})
+}
+
+// parseDayRangeArgs reads an optional from/to pair of whole days; both empty
+// is nil (all time).
+func parseDayRangeArgs(from, to string) (*models.DateRange, error) {
+	period, err := models.ParseDayRange(from, to)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidArgs, err.Error())
+	}
+	return period, nil
 }
 
 func (d Deps) createCampaignDraft(ctx context.Context, inv Invocation, args json.RawMessage) (string, error) {
@@ -501,8 +591,19 @@ func (d Deps) listCampaignLeads(ctx context.Context, inv Invocation, args json.R
 			row["opened"] = lp.Opened
 			row["replied"] = lp.Replied
 			row["current_step"] = lp.CurrentStep
+			if lp.Sender != "" {
+				// The mailbox this lead's whole sequence sends from.
+				row["sender"] = lp.Sender
+			}
 			if lp.LastActivityAt != nil {
 				row["last_activity_at"] = lp.LastActivityAt
+			}
+			if lp.Hold != nil {
+				// Why this lead is not being emailed, so the model does not
+				// "fix" a hold by unsubscribing or re-adding the contact.
+				row["hold"] = map[string]any{
+					"source": lp.Hold.Source, "until": lp.Hold.Until, "reason": lp.Hold.Reason,
+				}
 			}
 		}
 		leads = append(leads, row)
@@ -515,6 +616,7 @@ func (d Deps) listCampaignLeads(ctx context.Context, inv Invocation, args json.R
 			"completed":    counts.Completed,
 			"replied":      counts.Replied,
 			"bounced":      counts.Bounced,
+			"paused":       counts.Paused,
 			"unsubscribed": counts.Unsubscribed,
 		},
 		"leads": leads,
@@ -547,6 +649,57 @@ func (d Deps) setCampaignStatus(ctx context.Context, inv Invocation, args json.R
 		}
 		d.logAudit(ctx, inv, models.AuditActionStop, models.AuditEntityCampaign, &cid, nil)
 		return jsonResult(map[string]any{"ok": true, "campaign_id": in.CampaignID, "status": "paused"})
+	default:
+		return "", ErrInvalidArgs
+	}
+}
+
+func (d Deps) setLeadHold(ctx context.Context, inv Invocation, args json.RawMessage) (string, error) {
+	in, err := decodeArgs[struct {
+		CampaignID string `json:"campaign_id"`
+		ContactID  string `json:"contact_id"`
+		Action     string `json:"action"`
+		Until      string `json:"until"`
+		Reason     string `json:"reason"`
+	}](args)
+	if err != nil {
+		return "", err
+	}
+	cid, err := parseUUIDArg(in.CampaignID)
+	if err != nil {
+		return "", err
+	}
+	ctID, err := parseUUIDArg(in.ContactID)
+	if err != nil {
+		return "", err
+	}
+	meta := map[string]string{"campaign_id": in.CampaignID}
+	switch in.Action {
+	case "pause":
+		var until *time.Time
+		if raw := strings.TrimSpace(in.Until); raw != "" {
+			at, perr := time.Parse(time.RFC3339, raw)
+			if perr != nil {
+				return "", ErrInvalidArgs
+			}
+			until = &at
+		}
+		hold, xerr := d.Campaigns.PauseLead(ctx, inv.OrgID, cid, ctID, until, in.Reason)
+		if xerr != nil {
+			return "", fromErrx(xerr)
+		}
+		d.logAudit(ctx, inv, models.AuditActionPause, models.AuditEntityCampaignLead, &ctID, meta)
+		return jsonResult(map[string]any{
+			"ok": true, "campaign_id": in.CampaignID, "contact_id": in.ContactID, "hold": hold,
+		})
+	case "resume":
+		if xerr := d.Campaigns.ResumeLead(ctx, inv.OrgID, cid, ctID); xerr != nil {
+			return "", fromErrx(xerr)
+		}
+		d.logAudit(ctx, inv, models.AuditActionResume, models.AuditEntityCampaignLead, &ctID, meta)
+		return jsonResult(map[string]any{
+			"ok": true, "campaign_id": in.CampaignID, "contact_id": in.ContactID, "hold": nil,
+		})
 	default:
 		return "", ErrInvalidArgs
 	}

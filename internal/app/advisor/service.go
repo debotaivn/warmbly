@@ -13,6 +13,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/aitools"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/typesafe"
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
@@ -91,6 +92,11 @@ type service struct {
 	// domain-auth finding describes what actually happens on this install
 	// rather than what happens on a default one. Optional/nil-safe.
 	domainAuth DomainAuthPolicy
+
+	// The copy judge. Both optional together: without them the copy
+	// detectors that read a verdict never fire, and the regex ones still do.
+	judge      typesafe.Asker
+	judgeCache repository.CopyJudgmentRepository
 }
 
 // DomainAuthPolicy resolves whether the sending-domain authentication gate is
@@ -139,10 +145,26 @@ func WithDomainAuthPolicy(p DomainAuthPolicy) Option {
 	return func(s *service) { s.domainAuth = p }
 }
 
+// WithCopyJudge supplies the TypeSafe client and the verdict cache that let
+// the copy detectors read how a step's copy lands with its reader. A nil asker
+// leaves the option inert, so the caller can pass whatever it has.
+func WithCopyJudge(asker typesafe.Asker, cache repository.CopyJudgmentRepository) Option {
+	return func(s *service) {
+		if asker == nil || cache == nil {
+			return
+		}
+		s.judge, s.judgeCache = asker, cache
+	}
+}
+
 // maxNarrationsPerRun bounds how many completions one evaluation can spend.
 // New findings are narrated most-severe-first, so the cap only ever costs the
 // least important cards their rewrite, and the next run picks them up.
 const maxNarrationsPerRun = 12
+
+// narrationBudget bounds the completions of one run so the summary and run
+// record still land inside the caller's deadline.
+const narrationBudget = 60 * time.Second
 
 func (s *service) Evaluate(ctx context.Context, orgID uuid.UUID, trigger string) (*models.AdvisorSummary, error) {
 	settings, err := s.repo.GetSettings(ctx, orgID)
@@ -166,13 +188,20 @@ func (s *service) Evaluate(ctx context.Context, orgID uuid.UUID, trigger string)
 		return nil, err
 	}
 
+	for sec, serr := range snapshot.Failed {
+		log.Printf("advisor: org %s: %s section did not load, keeping its findings: %v", orgID, sec, serr)
+	}
+
 	snapshot.TrackingHost = s.trackingHost
 	if s.domainAuth != nil {
 		snapshot.DomainAuthEnforced, snapshot.DomainAuthGrace = s.domainAuth.DomainAuth(ctx)
 	}
+	unjudged := s.judgeCopy(ctx, snapshot)
 	findings := Detect(snapshot, settings)
 
-	keep := make([]string, 0, len(findings))
+	// A step the judge did not reach this run is not a step whose copy got
+	// better; its judgment findings stay open until it is read again.
+	keep := keepUnjudged(unjudged)
 	stored := make([]*models.AdvisorFinding, 0, len(findings))
 	newCount := 0
 	for _, f := range findings {
@@ -188,8 +217,9 @@ func (s *service) Evaluate(ctx context.Context, orgID uuid.UUID, trigger string)
 		stored = append(stored, row)
 	}
 
-	// Anything the detectors did not produce this pass is no longer true.
-	closed, err := s.repo.ResolveMissing(ctx, orgID, keep)
+	// Anything the detectors did not produce this pass is no longer true,
+	// except what a detector held for a section that did not load.
+	closed, err := s.repo.ResolveMissing(ctx, orgID, keep, heldDetectors(snapshot, settings))
 	if err != nil {
 		log.Printf("advisor: resolve missing for org %s: %v", orgID, err)
 	}
@@ -198,7 +228,9 @@ func (s *service) Evaluate(ctx context.Context, orgID uuid.UUID, trigger string)
 	// rather than reporting problems that no longer exist.
 	fixed := s.autopilot(ctx, orgID, settings, stored)
 
-	narrated := s.narrateBatch(ctx, orgID, stored)
+	nctx, cancelNarrate := context.WithTimeout(ctx, narrationBudget)
+	narrated := s.narrateBatch(nctx, orgID, stored)
+	cancelNarrate()
 
 	summary, err := s.repo.Summary(ctx, orgID)
 	if err != nil {
@@ -207,10 +239,8 @@ func (s *service) Evaluate(ctx context.Context, orgID uuid.UUID, trigger string)
 	}
 	s.finishRun(ctx, runID, newCount, summary.Total, closed, narrated, "")
 
-	// One audit entry per run, only when something actually changed. The spine
-	// turns this into a live refresh of every teammate's advisor strips and
-	// nav badges without a bespoke realtime event.
-	if (newCount > 0 || closed > 0 || fixed > 0) && s.audit != nil {
+	// Publish after edits so every client receives the completed review, including updated wording.
+	if (newCount > 0 || closed > 0 || fixed > 0 || narrated > 0 || trigger == "change") && s.audit != nil {
 		s.audit.LogAction(ctx, orgID, uuid.Nil, models.AuditActionUpdate, models.AuditEntityAdvisorFinding, nil, "", "",
 			nil, map[string]string{
 				"new":       fmt.Sprint(newCount),
@@ -282,7 +312,7 @@ func (s *service) narrateBatch(ctx context.Context, orgID uuid.UUID, findings []
 	// Detect, so the cap spends the budget on what matters.
 	count := 0
 	for _, f := range findings {
-		if count >= maxNarrationsPerRun {
+		if count >= maxNarrationsPerRun || ctx.Err() != nil {
 			break
 		}
 		if f.Narrated {

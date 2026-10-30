@@ -1,7 +1,8 @@
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Request as HttpRequest, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
 use chrono::Utc;
@@ -12,11 +13,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::abuse::{is_prefetch, is_scanner, RateLimiter};
+use crate::asndb::AsnDb;
 use crate::config::Config;
 use crate::events::TrackingEvent;
 use crate::hits::{ForwardedHit, HitForwarder, HitPayload, Outcome};
 use crate::links::{LinkResolver, Resolution};
 use crate::producer::Producer;
+use crate::redirects::{normalize_host, Lookup, RedirectResolver};
+use crate::scanners::{AsnSources, Request, ScannerNetworks};
+use crate::unsubscribe::{
+    accept_language, body_content_type, invalid_token, valid_token, UnsubscribeProxy,
+};
 
 // 1x1 transparent GIF (43 bytes)
 const TRANSPARENT_GIF: &[u8] = &[
@@ -28,6 +35,21 @@ const TRANSPARENT_GIF: &[u8] = &[
 /// Cache key format: {event_type}:{task_id}:{ip_hash}
 /// Prevents duplicate events from the same IP within a time window
 type DedupeCache = Cache<String, ()>;
+
+/// Claims `key`, reporting whether somebody already had it.
+///
+/// One coalesced operation, not a check followed by an insert. Scanners fetch a
+/// message's pixel and every link in parallel, so several requests carrying one
+/// key are genuinely concurrent, and under check-then-insert every one of them
+/// saw a miss and every one published.
+///
+/// `or_insert_with` is what gives the guarantee, and `or_insert` is not: only
+/// the closure form runs once per key under a lock and tells the losers their
+/// value was already there. An eager value races exactly like the code this
+/// replaced.
+async fn claim(cache: &DedupeCache, key: String) -> bool {
+    !cache.entry(key).or_insert_with(async {}).await.is_fresh()
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -43,13 +65,31 @@ pub struct AppState {
     pub hits: Arc<HitForwarder>,
     /// Tighter per-source budget for page views than for pixels
     pub hit_rate_limiter: Arc<RateLimiter>,
+    /// Opt-out pages get a budget of their own rather than sharing the pixel
+    /// and click one. A single NAT or mail gateway can spend that shared
+    /// counter on tracking alone, and the recipient behind it who then opens
+    /// the unsubscribe link would be refused: the one request that must never
+    /// be turned away. Same size, separate bucket; a source loading opt-out
+    /// pages this fast is probing, not opting out.
+    pub unsubscribe_rate_limiter: Arc<RateLimiter>,
+    /// Known automated-scanner sources. A match labels the event and nothing
+    /// else: the pixel is still served and the click still redirected.
+    pub scanners: Arc<ScannerNetworks>,
     /// Proxies whose forwarded-IP header is believed, and which header
     pub trusted_proxies: Arc<Vec<ipnet::IpNet>>,
     pub client_ip_header: Arc<String>,
+    /// Key for the source-address token (see `hash_ip`)
+    pub ip_hash_key: Arc<String>,
+    /// Recipient opt-out, proxied to the backend that owns the pages
+    pub unsubscribe: Arc<UnsubscribeProxy>,
+    /// Verified sending-domain redirects (backend internal API + layered caches)
+    pub redirects: Arc<RedirectResolver>,
 }
 
 impl AppState {
-    pub fn new(producer: Producer, config: &Config) -> Self {
+    /// `asn_db` is resolved in main rather than here, because reading it may
+    /// mean a download and this is not an async function.
+    pub fn new(producer: Producer, config: &Config, asn_db: Option<AsnDb>) -> Self {
         // Create cache with:
         // - Max 100k entries
         // - TTL of 1 hour per entry
@@ -73,12 +113,33 @@ impl AppState {
                 config.internal_api_token.clone(),
             )),
             hit_rate_limiter: Arc::new(RateLimiter::new(config.pagehit_rate_limit_per_min)),
+            unsubscribe_rate_limiter: Arc::new(RateLimiter::new(config.rate_limit_per_min)),
+            scanners: Arc::new(ScannerNetworks::new(
+                config.scanner_builtins,
+                &config.scanner_networks,
+                &config.scanner_click_networks,
+                AsnSources {
+                    header: Some(config.scanner_asn_header.clone()),
+                    // An unset TRACKING_TRUSTED_PROXIES means no peer is ever
+                    // trusted, so a named header is never read. The catalogue
+                    // has to know that or it reports itself as able to match
+                    // ASNs when it cannot.
+                    trusted_proxies: !config.trusted_proxies.is_empty(),
+                    db: asn_db,
+                },
+            )),
             trusted_proxies: Arc::new(config.trusted_proxies.clone()),
             client_ip_header: Arc::new(config.client_ip_header.clone()),
+            ip_hash_key: Arc::new(config.ip_hash_key.clone()),
+            unsubscribe: Arc::new(UnsubscribeProxy::new(config.backend_internal_url.clone())),
+            redirects: Arc::new(RedirectResolver::new(
+                config.backend_internal_url.clone(),
+                config.internal_api_token.clone(),
+            )),
         }
     }
 
-    /// Check if this event was already processed (returns true if duplicate)
+    /// Whether this event was already processed, claiming it when it was not.
     async fn is_duplicate(
         &self,
         event_type: &str,
@@ -91,15 +152,7 @@ impl AppState {
             task_id,
             ip_hash.as_deref().unwrap_or("unknown")
         );
-
-        // Check if exists, if not insert
-        if self.dedupe_cache.contains_key(&key) {
-            return true;
-        }
-
-        // Insert into cache
-        self.dedupe_cache.insert(key, ()).await;
-        false
+        claim(&self.dedupe_cache, key).await
     }
 }
 
@@ -124,13 +177,16 @@ pub async fn track_open(
         return pixel_response();
     }
 
-    // Extract IP hash for deduplication + rate limiting
-    let ip_hash = Some(hash_ip(&client_ip(
+    let trusted = peer_is_trusted(peer, &state.trusted_proxies);
+    // The address is hashed for deduplication + rate limiting; only its
+    // network travels with the event, for the location lookup downstream.
+    let ip = client_ip(
         peer,
         &headers,
         &state.trusted_proxies,
         &state.client_ip_header,
-    )));
+    );
+    let ip_hash = Some(hash_ip(&state.ip_hash_key, &ip));
 
     // Anti-flood: over-budget sources still get the pixel (real mail clients
     // must never see a broken image), but nothing is published.
@@ -156,6 +212,15 @@ pub async fn track_open(
         return pixel_response();
     }
 
+    // A mail-filtering network fetching the pixel is delivery evidence, not a
+    // read. The event is published and labelled rather than dropped, so the
+    // consumer can record it as a machine open.
+    let matched = state
+        .scanners
+        .classify(&ip, &headers, trusted, Request::Open);
+    let scanner_probable = matched.as_ref().is_some_and(|m| m.probable);
+    let scanner = matched.map(|m| m.label.to_string());
+
     // Publish event asynchronously (fire and forget)
     let producer = state.producer.clone();
     tokio::spawn(async move {
@@ -164,14 +229,107 @@ pub async fn track_open(
                 event_type: "EMAIL_OPENED".to_string(),
                 task_id,
                 original_url: None,
+                link_id: None,
                 timestamp: Utc::now().to_rfc3339(),
                 user_agent,
                 ip_hash,
+                client_ip: Some(anonymize_ip(&ip)).filter(|n| !n.is_empty()),
+                scanner,
+                scanner_probable,
             })
             .await;
     });
 
     pixel_response()
+}
+
+/// Answers a request on a sending domain a workspace pointed here with its
+/// redirect, before any tracking, unsubscribe or form route can answer under
+/// that domain. Any other host continues to the routes.
+pub async fn redirect_first(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: HttpRequest,
+    next: Next,
+) -> Response {
+    if req.uri().path() != "/health" {
+        if let Some(host) = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .and_then(normalize_host)
+        {
+            let ip = client_ip(
+                peer,
+                req.headers(),
+                &state.trusted_proxies,
+                &state.client_ip_header,
+            );
+            let source = hash_ip(&state.ip_hash_key, &ip);
+            match state.redirects.lookup(&host, &source, false).await {
+                Lookup::Found(target) => return redirect_to(target),
+                Lookup::Unavailable => {
+                    // Unknown whether this host redirects, so a miss is an outage, not a 404.
+                    let res = next.run(req).await;
+                    if res.status() == StatusCode::NOT_FOUND {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [
+                                (header::RETRY_AFTER, "30"),
+                                (header::HeaderName::from_static(SERVICE_HEADER), "tracking"),
+                            ],
+                            "Temporarily unavailable",
+                        )
+                            .into_response();
+                    }
+                    return res;
+                }
+                Lookup::NotFound => {}
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// Marks this service's own answers, so the redirect check can tell them from a proxy's.
+pub const SERVICE_HEADER: &str = "x-warmbly-service";
+
+/// The host a 404 was looked up under: a rewritten Host header, or a redirect not picked up yet.
+pub const HOST_HEADER: &str = "x-warmbly-host";
+
+/// A request no route matched: a redirect domain was already answered by
+/// redirect_first, so what is left is unknown.
+pub async fn not_found(headers: HeaderMap) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(normalize_host)
+        .unwrap_or_default();
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (SERVICE_HEADER, "tracking".to_string()),
+            (HOST_HEADER, host),
+        ],
+        "Not found",
+    )
+        .into_response()
+}
+
+fn redirect_to(target: String) -> Response {
+    // A redirect a workspace can change or remove must not be cached for long.
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, target),
+            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
+            (
+                header::HeaderName::from_static(SERVICE_HEADER),
+                "tracking".to_string(),
+            ),
+        ],
+    )
+        .into_response()
 }
 
 /// Click tracking redirect handler
@@ -191,19 +349,28 @@ pub async fn track_click(
         return (StatusCode::NOT_FOUND, "Unknown link").into_response();
     }
 
-    // Anti-flood: cap total request rate per source
-    let ip_hash = Some(hash_ip(&client_ip(
+    let trusted = peer_is_trusted(peer, &state.trusted_proxies);
+    // Anti-flood: cap total request rate per source. Only the address's
+    // network rides along, for the location lookup downstream.
+    let ip = client_ip(
         peer,
         &headers,
         &state.trusted_proxies,
         &state.client_ip_header,
-    )));
+    );
+    let ip_hash = Some(hash_ip(&state.ip_hash_key, &ip));
     let source = ip_hash.clone().unwrap_or_else(|| "unknown".to_string());
     if !state.rate_limiter.allow(&source).await {
         return (StatusCode::TOO_MANY_REQUESTS, "Slow down").into_response();
     }
 
-    let link = match state.links.resolve(&link_id, &source).await {
+    // The backend answers a custom host only for its own workspace's tickets.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(normalize_host)
+        .unwrap_or_default();
+    let link = match state.links.resolve_on(&link_id, &source, &host).await {
         Resolution::Found(link) => link,
         Resolution::NotFound => {
             return (StatusCode::NOT_FOUND, "Unknown link").into_response();
@@ -227,15 +394,27 @@ pub async fn track_click(
         return Redirect::temporary(&link.destination).into_response();
     }
 
-    // When the workspace registered the destination's host for website
-    // tracking, the ticket rides along so the snippet can tie the browser to
-    // the recipient. The ticket is opaque and per-recipient: it names no
-    // destination and no secret, only "the click the backend already knows".
-    let target = if link.identify {
-        with_identify_param(&link.destination, &link_id)
-    } else {
-        link.destination.clone()
-    };
+    // Safe Links and its peers redirect the browser to the destination rather
+    // than fetching it, so a person's click always reaches us from the
+    // person's own address. A ticket walked from a mail-filtering network is
+    // a scan: it is still redirected, and labelled so it never counts.
+    let matched = state
+        .scanners
+        .classify(&ip, &headers, trusted, Request::Click);
+    let scanner_probable = matched.as_ref().is_some_and(|m| m.probable);
+    let scanner = matched.map(|m| m.label.to_string());
+
+    // A probable source loses the identification ticket too. The edge does not
+    // know when the send was dispatched, so it cannot tell the delivery-time
+    // scan from the isolated human click the way the consumer can, and filing
+    // a scanner's page load against the recipient is the worse of the two
+    // mistakes available here.
+    let target = redirect_target(
+        &link.destination,
+        &link_id,
+        link.identify,
+        scanner.as_deref(),
+    );
 
     // Dedupe repeat clicks of the same ticket from the same source
     if state.is_duplicate("CLICK", &link_id, &ip_hash).await {
@@ -245,20 +424,135 @@ pub async fn track_click(
     // Publish event asynchronously (fire and forget)
     let producer = state.producer.clone();
     let destination = link.destination.clone();
+    let ticket = link_id.clone();
     tokio::spawn(async move {
         producer
             .publish(TrackingEvent {
                 event_type: "EMAIL_CLICKED".to_string(),
                 task_id: link.task_id,
                 original_url: Some(destination),
+                link_id: Some(ticket),
                 timestamp: Utc::now().to_rfc3339(),
                 user_agent,
                 ip_hash,
+                client_ip: Some(anonymize_ip(&ip)).filter(|n| !n.is_empty()),
+                scanner,
+                scanner_probable,
             })
             .await;
     });
 
     Redirect::temporary(&target).into_response()
+}
+
+/// Recipient opt-out, served here because a workspace's verified tracking
+/// domain is the host its campaign mail carries. The backend owns the pages
+/// and the suppression; these three only shape-check the token, spend the
+/// source's budget and hand the request on.
+///
+/// GET /unsubscribe/{token}
+pub async fn unsubscribe_page(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !valid_token(&token) {
+        return invalid_token(&headers);
+    }
+    if let Some(limited) = spend_unsubscribe_budget(&state, peer, &headers).await {
+        return limited;
+    }
+    state
+        .unsubscribe
+        .get(&token, accept_language(&headers))
+        .await
+}
+
+/// POST /unsubscribe/{token} — the confirm button, or a provider's RFC 8058
+/// one-click. Never rate limited: a provider POSTing an opt-out is the one
+/// request that must not be refused, and a refusal here is a spam complaint.
+pub async fn unsubscribe_submit(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !valid_token(&token) {
+        return invalid_token(&headers);
+    }
+    let content_type = body_content_type(&headers);
+    state
+        .unsubscribe
+        .post(&token, body, content_type, accept_language(&headers))
+        .await
+}
+
+/// POST /unsubscribe/{token}/resubscribe — the "unsubscribed by mistake" button.
+pub async fn unsubscribe_undo(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !valid_token(&token) {
+        return invalid_token(&headers);
+    }
+    if let Some(limited) = spend_unsubscribe_budget(&state, peer, &headers).await {
+        return limited;
+    }
+    let content_type = body_content_type(&headers);
+    state
+        .unsubscribe
+        .resubscribe(&token, body, content_type, accept_language(&headers))
+        .await
+}
+
+/// Charges one request against the source's opt-out budget, returning the
+/// refusal when it is spent. A recipient opts out once, so this budget is
+/// never reached by real traffic; it exists to cap token spraying, and it is
+/// deliberately not the counter that pixels and clicks spend.
+async fn spend_unsubscribe_budget(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let ip = client_ip(
+        peer,
+        headers,
+        &state.trusted_proxies,
+        &state.client_ip_header,
+    );
+    let source = hash_ip(&state.ip_hash_key, &ip);
+    if state.unsubscribe_rate_limiter.allow(&source).await {
+        return None;
+    }
+    Some((StatusCode::TOO_MANY_REQUESTS, "Slow down").into_response())
+}
+
+/// Where a click is sent. When the workspace registered the destination's host
+/// for website tracking, the identification ticket rides along so the snippet
+/// can tie the browser to the recipient; it is opaque and per-recipient,
+/// naming no destination and no secret, only "the click the backend already
+/// knows".
+///
+/// A recognised scanner is sent to the bare destination, the same as one
+/// caught by its user agent: the ticket reaches the page's snippet, which
+/// posts it to the hit endpoint, and the backend files that page view against
+/// the recipient. A gateway walking the link would show up as the person
+/// browsing the site.
+fn redirect_target(
+    destination: &str,
+    ticket: &str,
+    identify: bool,
+    scanner: Option<&str>,
+) -> String {
+    if identify && scanner.is_none() {
+        with_identify_param(destination, ticket)
+    } else {
+        destination.to_string()
+    }
 }
 
 /// Query parameter the click redirect appends and the snippet strips.
@@ -317,7 +611,7 @@ pub async fn track_page_hit(
         &state.trusted_proxies,
         &state.client_ip_header,
     );
-    let source = hash_ip(&ip);
+    let source = hash_ip(&state.ip_hash_key, &ip);
 
     // Anti-flood: page views have their own, tighter budget on top of the
     // shared one, and the shared one counts too so a flood here also
@@ -443,11 +737,14 @@ fn client_ip(
     header: &str,
 ) -> String {
     let peer_ip = peer.ip();
-    if !trusted.iter().any(|net| net.contains(&peer_ip)) {
+    if !peer_is_trusted(peer, trusted) {
         return peer_ip.to_string();
     }
+    // A repeated header is read from its last line, the one the nearest proxy wrote.
     let raw = headers
-        .get(header)
+        .get_all(header)
+        .iter()
+        .next_back()
         .and_then(|h| h.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty());
@@ -464,17 +761,192 @@ fn client_ip(
     }
 }
 
-fn hash_ip(ip: &str) -> String {
-    // Hash the IP for privacy
+/// Whether the socket peer is one of the proxies the operator named. Every
+/// header that can change how a request is treated, the client address and the
+/// source ASN, is read only when this is true.
+fn peer_is_trusted(peer: SocketAddr, trusted: &[ipnet::IpNet]) -> bool {
+    let peer_ip = peer.ip();
+    trusted.iter().any(|net| net.contains(&peer_ip))
+}
+
+/// The network an address belongs to, for the location lookup downstream:
+/// the last IPv4 octet zeroed, an IPv6 address cut to its first 48 bits.
+/// City-level resolution survives; a single host is no longer named, so the
+/// bus can retain the event without retaining the address.
+fn anonymize_ip(ip: &str) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0", o[0], o[1], o[2])
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            std::net::Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0).to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// A stable, keyed token for a source address: the same source gets the same
+/// token (dedupe, rate limits, the burst rule), and nobody holding the token
+/// can enumerate IPv4 space to get the address back, because the key is
+/// secret. The key goes in first so the digest is not one of a public value.
+fn hash_ip(key: &str, ip: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    hasher.update([0u8]);
     hasher.update(ip.as_bytes());
     let result = hasher.finalize();
-    format!("{:x}", result)[..16].to_string() // Take first 16 chars
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(16);
+    for byte in &result[..8] {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    token
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn baseline_hash_ip(key: &str, ip: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(ip.as_bytes());
+        format!("{:x}", hasher.finalize())[..16].to_string()
+    }
+
+    #[test]
+    fn source_tokens_match_the_existing_digest_prefix_exactly() {
+        for key in [
+            String::new(),
+            "key".into(),
+            "nul\0key".into(),
+            "k".repeat(1024),
+        ] {
+            for ip in [
+                "",
+                "127.0.0.1",
+                "2001:db8::1",
+                "unknown",
+                "::ffff:192.0.2.1",
+            ] {
+                assert_eq!(hash_ip(&key, ip), baseline_hash_ip(&key, ip));
+            }
+            for i in 0..1024 {
+                let ip = format!("10.{}.{}.{}", i / 256, i % 256, i % 255);
+                let token = hash_ip(&key, &ip);
+                assert_eq!(token, baseline_hash_ip(&key, &ip));
+                assert_eq!(token.len(), 16);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic source-token benchmark; run with --ignored --nocapture"]
+    fn benchmark_source_tokens() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let sources: Vec<String> = (0..1024)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("192.0.2.{}", i % 255)
+                } else {
+                    format!("2001:db8::{i:x}")
+                }
+            })
+            .collect();
+        let key = "synthetic-internal-api-token-of-32";
+        for source in &sources {
+            assert_eq!(hash_ip(key, source), baseline_hash_ip(key, source));
+        }
+        const ITERATIONS: usize = 500_000;
+        type SourceHasher = fn(&str, &str) -> String;
+        for round in 0..4 {
+            let functions: [(&str, SourceHasher); 2] = if round % 2 == 0 {
+                [("BASE", baseline_hash_ip), ("optimized", hash_ip)]
+            } else {
+                [("optimized", hash_ip), ("BASE", baseline_hash_ip)]
+            };
+            for (name, hash) in functions {
+                let started = Instant::now();
+                for i in 0..ITERATIONS {
+                    black_box(hash(black_box(key), black_box(&sources[i % sources.len()])));
+                }
+                println!("source_token round={round} implementation={name} iterations={ITERATIONS} elapsed_us={}", started.elapsed().as_micros());
+            }
+        }
+    }
+
+    // A scanner walks a message's links in parallel, so several requests
+    // carrying one key genuinely arrive at once. Under check-then-insert every
+    // one of them saw a miss and every one published. Racing real threads on a
+    // barrier is the only way to reach that window, so this runs many keys to
+    // make hitting it reliable rather than lucky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exactly_one_racing_claim_wins_each_key() {
+        const KEYS: usize = 200;
+        const RACERS: usize = 8;
+        let cache: Arc<DedupeCache> = Arc::new(Cache::builder().max_capacity(10_000).build());
+
+        for key in 0..KEYS {
+            let gate = Arc::new(tokio::sync::Barrier::new(RACERS));
+            let mut racing = Vec::with_capacity(RACERS);
+            for _ in 0..RACERS {
+                let (cache, gate) = (cache.clone(), gate.clone());
+                let key = format!("CLICK:task-{key}:source");
+                racing.push(tokio::spawn(async move {
+                    gate.wait().await;
+                    claim(&cache, key).await
+                }));
+            }
+            let mut fresh = 0;
+            for task in racing {
+                if !task.await.expect("claim must not panic") {
+                    fresh += 1;
+                }
+            }
+            assert_eq!(fresh, 1, "exactly one caller may publish key {key}");
+        }
+
+        // Sequentially, the same key is a duplicate and a different one is not.
+        assert!(claim(&cache, "CLICK:task-0:source".to_string()).await);
+        assert!(!claim(&cache, "OPEN:task-0:source".to_string()).await);
+    }
+
+    // The ticket identifies the recipient to the destination's own analytics.
+    // Handing it to a security gateway files the gateway's fetch as that
+    // person's visit, which is the same reason the user-agent path above
+    // redirects scanners to the bare destination.
+    #[test]
+    fn a_scanner_is_never_handed_the_identification_ticket() {
+        assert_eq!(
+            redirect_target("https://x.com/p", "abc", true, None),
+            "https://x.com/p?wbly_t=abc"
+        );
+        assert_eq!(
+            redirect_target(
+                "https://x.com/p",
+                "abc",
+                true,
+                Some("microsoft-365-protection")
+            ),
+            "https://x.com/p"
+        );
+        // A destination the workspace never registered carries no ticket
+        // either way, and the redirect itself always happens.
+        assert_eq!(
+            redirect_target("https://x.com/p", "abc", false, None),
+            "https://x.com/p"
+        );
+        assert_eq!(
+            redirect_target("https://x.com/p", "abc", false, Some("scanner")),
+            "https://x.com/p"
+        );
+    }
 
     #[test]
     fn identify_param_keeps_query_and_fragment() {
@@ -524,6 +996,13 @@ mod tests {
             "198.51.100.7"
         );
         assert_eq!(client_ip(peer, &h, &trusted, "cf-connecting-ip"), "8.8.8.8");
+        // A repeated header line is read from the one the proxy added last.
+        let mut h = hdr(&[("x-forwarded-for", "1.1.1.1")]);
+        h.append("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        assert_eq!(
+            client_ip(peer, &h, &trusted, "x-forwarded-for"),
+            "198.51.100.7"
+        );
         // Garbage or a missing header falls back to the proxy itself.
         let h = hdr(&[("x-forwarded-for", "not an ip")]);
         assert_eq!(client_ip(peer, &h, &trusted, "x-forwarded-for"), "10.1.2.3");
@@ -531,6 +1010,23 @@ mod tests {
             client_ip(peer, &hdr(&[]), &trusted, "x-forwarded-for"),
             "10.1.2.3"
         );
+    }
+
+    #[test]
+    fn hash_ip_is_keyed_and_stable() {
+        assert_eq!(hash_ip("k", "203.0.113.9"), hash_ip("k", "203.0.113.9"));
+        assert_ne!(hash_ip("k", "203.0.113.9"), hash_ip("other", "203.0.113.9"));
+        assert_eq!(hash_ip("k", "203.0.113.9").len(), 16);
+    }
+
+    #[test]
+    fn anonymize_ip_keeps_only_the_network() {
+        assert_eq!(anonymize_ip("203.0.113.9"), "203.0.113.0");
+        assert_eq!(
+            anonymize_ip("2001:db8:abcd:1234:5678::1"),
+            "2001:db8:abcd::"
+        );
+        assert_eq!(anonymize_ip("not an ip"), "");
     }
 
     #[test]

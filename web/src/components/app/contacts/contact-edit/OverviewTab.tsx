@@ -2,9 +2,12 @@
 //
 // Composition:
 //   - Suppression card (only when suppressed)
+//   - CRM card (HubSpot or Pipedrive mode): owner, lifecycle stage or label, lead status
+//   - Salesforce record (only when a Salesforce connection exists)
 //   - Engagement: six flat stat tiles with a thin ratio bar where
 //     a ratio over Sent makes sense
 //   - Latest activity rail
+//   - How they read: the clients and devices a person's opens came from
 //   - Profile rows for the fields not already in the panel header
 
 import {
@@ -16,12 +19,24 @@ import {
     MousePointerClickIcon,
     ReplyIcon,
 } from "lucide-react";
+import toast from "react-hot-toast/headless";
 import type ContactDetail from "@/lib/api/models/app/contacts/ContactDetail";
 import type Contact from "@/lib/api/models/app/contacts/Contact";
+import { useConfirm } from "@/hooks/context/confirm";
+import { useWriteGuard } from "@/hooks/usePermission";
+import { useRemoveSuppression } from "@/lib/api/hooks/app/suppressions/useSuppressions";
+import { SOURCE_LABEL } from "@/lib/api/models/app/suppressions/Suppression";
+import type { AppError } from "@/lib/api/client/normalizeError";
+import buildError from "@/lib/helper/buildError";
 import { fmtAbsolute, fmtRelative } from "./format";
 import { sourceLabel } from "./ActivityTab";
 import { ContactSegmentsSection } from "./ContactSegmentsSection";
 import VerificationCard from "./VerificationCard";
+import OriginBadge from "@/components/app/engagement/OriginBadge";
+import { labelInk } from "@/lib/utils";
+import CrmContactCard from "@/components/app/crm/CrmContactCard";
+import useCrmProvider from "@/hooks/useCrmProvider";
+import SalesforceContactCard from "@/components/app/integrations/SalesforceContactCard";
 
 export default function OverviewTab({
     contact,
@@ -35,6 +50,27 @@ export default function OverviewTab({
     const eng = detail?.engagement;
     const supp = detail?.suppression;
     const sent = eng?.total_sent ?? 0;
+    const confirm = useConfirm();
+    const write = useWriteGuard("MANAGE_CONTACTS");
+    const removeSuppression = useRemoveSuppression();
+    const { isExternal } = useCrmProvider();
+
+    function askLift() {
+        if (!supp) return;
+        const own = supp.source === "unsubscribe" || supp.source === "complaint" || supp.source === "bounce";
+        const what = supp.kind === "domain" ? `the whole @${supp.value} domain` : contact.email;
+        const text = own
+            ? `${contact.email} ${SOURCE_LABEL[supp.source]?.toLowerCase() ?? "was suppressed"} on their own. Removing the entry lets campaigns email ${what} again, and that is recorded in the audit log. Continue?`
+            : `Remove ${what} from the suppression list? Campaigns can email them again.`;
+        confirm.show(text, async () => {
+            try {
+                await removeSuppression.mutateAsync(supp.id);
+                toast.success("Removed from the suppression list");
+            } catch (err) {
+                toast.error(buildError(err as AppError));
+            }
+        });
+    }
 
     return (
         <div className="space-y-5">
@@ -43,18 +79,30 @@ export default function OverviewTab({
                     <BanIcon className="w-3.5 h-3.5 text-red-600 mt-px shrink-0" />
                     <div className="min-w-0 flex-1">
                         <div className="text-[12px] font-medium text-red-900 leading-tight">
-                            Suppressed ({supp.source})
+                            {SOURCE_LABEL[supp.source] ?? "Suppressed"}
+                            {supp.kind === "domain" ? ` · whole @${supp.value} domain` : ""}
                         </div>
                         <div className="text-[11px] text-red-700/90 mt-0.5">
                             {supp.reason || "No reason given"} · since{" "}
                             {fmtAbsolute(supp.created_at)}
                         </div>
                     </div>
+                    <button
+                        type="button"
+                        onClick={(e) => write.guard(askLift)(e)}
+                        disabled={removeSuppression.isPending}
+                        className="shrink-0 h-6 px-2 rounded-md border border-red-200 bg-white text-[11px] font-medium text-red-700 hover:bg-red-50 transition-colors disabled:opacity-50"
+                    >
+                        Remove
+                    </button>
                 </div>
             )}
 
+            {isExternal && <CrmContactCard contactId={contact.id} density="drawer" showProperties={false} />}
+            <SalesforceContactCard contactId={contact.id} />
+
             <Section title="Deliverability">
-                <VerificationCard detail={detail?.verification} loading={detailLoading} />
+                <VerificationCard contactId={contact.id} detail={detail?.verification} loading={detailLoading} />
             </Section>
 
             <Section title="Engagement">
@@ -144,6 +192,27 @@ export default function OverviewTab({
                 </div>
             </Section>
 
+            {(eng?.reads_on?.length ?? 0) > 0 && (
+                <Section title="How they read">
+                    <div className="rounded-md border border-slate-200 bg-white overflow-hidden">
+                        {eng!.reads_on!.map((r, i) => (
+                            <div
+                                key={i}
+                                className="flex items-center gap-2 px-3 py-1.5 border-b last:border-b-0 border-slate-100"
+                            >
+                                <OriginBadge origin={r} className="text-[11.5px] text-slate-700 flex-1" />
+                                <div
+                                    className="text-[11.5px] tabular-nums text-slate-500 shrink-0"
+                                    title={fmtAbsolute(r.last_opened_at)}
+                                >
+                                    {r.opens === 1 ? "1 open" : `${r.opens} opens`} · {fmtRelative(r.last_opened_at)}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </Section>
+            )}
+
             <Section title="Profile">
                 <div className="rounded-md border border-slate-200 bg-white overflow-hidden">
                     <ProfileRow
@@ -152,7 +221,7 @@ export default function OverviewTab({
                     />
                     <ProfileRow label="Phone" value={contact.phone || "—"} />
                     <ProfileRow
-                        label="Categories"
+                        label="Labels"
                         value={
                             contact.categories.length > 0 ? (
                                 <span className="flex flex-wrap gap-1 justify-end">
@@ -162,7 +231,7 @@ export default function OverviewTab({
                                             className="inline-flex h-4 items-center px-1.5 rounded text-[10.5px] font-medium"
                                             style={{
                                                 backgroundColor: `${c.color}1a`,
-                                                color: c.color,
+                                                color: labelInk(c.color),
                                             }}
                                         >
                                             {c.title}
@@ -306,7 +375,7 @@ function LatestRow({
     icon,
 }: {
     label: string;
-    ts?: string | null;
+    ts?: Date | string | null;
     icon: React.ReactNode;
 }) {
     return (

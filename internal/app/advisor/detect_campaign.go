@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/google/uuid"
+
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/repository"
 )
@@ -16,66 +18,77 @@ func campaignDetectors() []Detector {
 			Key:      "campaign_no_followups",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "A cold campaign with a single email and no follow-up steps. Most replies to cold outreach arrive on a follow-up rather than the first send, so a one-step campaign gives up most of its own results.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectNoFollowUps,
 		},
 		{
 			Key:      "campaign_reply_rate_low",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "A campaign's reply rate at volume. A very low reply rate on a large sample means the offer, the audience, or the copy is wrong, and sending more of it will cost sender reputation without producing results.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectReplyRateLow,
 		},
 		{
 			Key:      "campaign_step_dropoff",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "One sequence step performing far worse than the campaign's best step. Because every step reaches the same audience, a step that underperforms the others by a wide margin is a copy problem isolated to that message.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectStepDropoff,
 		},
 		{
 			Key:      "campaign_unsubscribe_header_off",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "Whether a campaign sends the List-Unsubscribe header. Google's bulk sender rules require one-click unsubscribe on marketing mail, and an easy unsubscribe is what stops an uninterested recipient reaching for the spam button instead.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectUnsubscribeHeaderOff,
 		},
 		{
 			Key:      "campaign_capacity_shortfall",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "A campaign whose daily limit exceeds what its attached mailboxes can safely send. The campaign will silently deliver less than configured, or push mailboxes past their caps.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectCapacityShortfall,
 		},
 		{
 			Key:      "campaign_no_senders",
 			Category: models.AdvisorCategoryCampaign,
-			About:    "A running campaign with no active mailbox resolving for it, usually after a tag was renamed or a mailbox disconnected. The campaign is live and sending nothing.",
+			About:    "A running campaign with no active mailbox resolving for it. Its sender_selection says how it picks mailboxes: by tag (no active mailbox carries its tags), picked by hand (those mailboxes were disconnected), or every active mailbox (the workspace has none active). The campaign is live and sending nothing.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectNoSenders,
 		},
 		{
 			Key:      "campaign_followup_spacing",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "The gap between follow-up steps. Too close reads as pestering and drives unsubscribes and complaints; too far apart and the recipient no longer remembers the first email.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns, repository.AdvisorSectionSteps},
 			Run:      detectFollowUpSpacing,
 		},
 		{
 			Key:      "campaign_list_exhaustion",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "A running campaign about to run out of leads. Campaigns do not announce that they have finished their list; they just stop producing results.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectListExhaustion,
 		},
 		{
 			Key:      "campaign_no_ab_test",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "A high-volume campaign running a single variant. At this volume an A/B test costs nothing and is the only way to know whether the copy is the constraint.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectNoABTest,
 		},
 		{
 			Key:      "campaign_narrow_window",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "A sending window too short to fit the campaign's daily volume at safe pacing. The campaign either underdelivers or compresses its sends into a burst.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionCampaigns},
 			Run:      detectNarrowWindow,
 		},
 		{
 			Key:      "campaign_duplicate_enrollment",
 			Category: models.AdvisorCategoryCampaign,
 			About:    "Contacts enrolled in more than one running campaign at the same time. To the recipient this is two unrelated strangers pitching in the same week, which is how a sender earns a complaint rather than a reply.",
+			Reads:    []repository.AdvisorSection{repository.AdvisorSectionOrg},
 			Run:      detectDuplicateEnrollment,
 		},
 	}
@@ -219,7 +232,7 @@ func detectStepDropoff(s *repository.AdvisorSnapshot) []Finding {
 
 			label := st.Name
 			if label == "" {
-				label = fmt.Sprintf("Step %d", st.Position+1)
+				label = fmt.Sprintf("Step %d", st.Position)
 			}
 			out = append(out, Finding{
 				Key:         "campaign_step_dropoff",
@@ -241,7 +254,7 @@ func detectStepDropoff(s *repository.AdvisorSnapshot) []Finding {
 				Evidence: map[string]any{
 					"campaign":                names[cid],
 					"step":                    label,
-					"step_position":           st.Position + 1,
+					"step_position":           st.Position,
 					"step_sends":              st.Sent,
 					"step_reply_rate_percent": band(r),
 					"best_step_rate_percent":  band(best),
@@ -350,6 +363,7 @@ func detectNoSenders(s *repository.AdvisorSnapshot) []Finding {
 		if camp.SenderCount > 0 {
 			continue
 		}
+		sel := noSenderCopyFor(camp)
 
 		out = append(out, Finding{
 			Key:         "campaign_no_senders",
@@ -362,40 +376,101 @@ func detectNoSenders(s *repository.AdvisorSnapshot) []Finding {
 			EntityLabel: camp.Name,
 			Impact:      90,
 			Title:       fmt.Sprintf("%s is running but has no mailbox to send from", camp.Name),
-			Detail: fmt.Sprintf(
-				"%s is active, but no connected active mailbox resolves for it, so it is sending nothing at all. This usually happens after a tag is renamed or the mailbox it depended on was disconnected.",
-				camp.Name),
-			Remedy: "Attach a mailbox to the campaign, or fix the tag it selects senders by. Nothing else in the campaign matters until this is resolved.",
-			Steps: []string{
-				"Open the campaign's sender settings.",
-				"If it selects senders by tag, check that the tag still exists and still has mailboxes on it. A renamed tag is the usual cause.",
-				"If it names mailboxes directly, check they are still connected and active. A disconnected mailbox drops out of the pool silently.",
-				"Attach at least one healthy mailbox and save.",
-				"Sending resumes on the next scheduling pass. Nothing queued was lost.",
-			},
+			Detail:      fmt.Sprintf("%s is active, but %s, so it is sending nothing at all.", camp.Name, sel.cause),
+			Remedy:      sel.remedy + " Nothing else in the campaign matters until this is resolved.",
+			Steps: append(sel.steps,
+				"Sending resumes on the next scheduling pass. Nothing queued was lost."),
 			Evidence: map[string]any{
-				"campaign":        camp.Name,
-				"sender_strategy": camp.SenderStrategy,
-				"sender_count":    0,
-				"leads_remaining": camp.LeadsRemaining,
+				"campaign":             camp.Name,
+				"sender_selection":     sel.selection,
+				"picked_mailbox_count": camp.PickedSenders,
+				"tag_count":            camp.SenderTags,
+				"sender_count":         0,
+				"leads_remaining":      camp.LeadsRemaining,
 			},
 		})
 	}
 	return out
 }
 
+// noSenderCopy is the no-senders finding's wording for how a campaign picks
+// its mailboxes, so the advice never points at tags a campaign does not use.
+type noSenderCopy struct {
+	selection string
+	cause     string
+	remedy    string
+	steps     []string
+}
+
+func noSenderCopyFor(camp repository.AdvisorCampaign) noSenderCopy {
+	switch {
+	case camp.PickedSenders == 0 && camp.SenderTags == 0 && camp.SenderStrategy != repository.CampaignSenderStrategyExplicit:
+		return noSenderCopy{
+			selection: "every active mailbox",
+			cause:     "it sends from every active mailbox in the workspace and none is active right now",
+			remedy:    "Reconnect a disconnected mailbox or connect a new one.",
+			steps: []string{
+				"Open Mailboxes and look for ones that are disconnected or need re-authentication.",
+				"Reconnect one, or connect a new mailbox.",
+			},
+		}
+	case camp.SenderTags == 0:
+		return noSenderCopy{
+			selection: "picked by hand",
+			cause:     "none of the mailboxes picked for it is connected and active",
+			remedy:    "Pick at least one active mailbox in the campaign's sending accounts, or reconnect the ones it uses.",
+			steps: []string{
+				"Open the campaign's sending accounts.",
+				"Pick at least one connected, active mailbox, or reconnect the ones already picked.",
+				"Save.",
+			},
+		}
+	case camp.PickedSenders == 0:
+		return noSenderCopy{
+			selection: "by tag",
+			cause:     "no active mailbox carries any of its tags",
+			remedy:    "Put one of the campaign's tags on an active mailbox, or change the tags the campaign selects.",
+			steps: []string{
+				"Open the campaign's sending accounts and note its tags.",
+				"Check that an active mailbox still carries one of them. A renamed tag is a common cause.",
+				"Tag a mailbox, or change the campaign's tags, and save.",
+			},
+		}
+	default:
+		return noSenderCopy{
+			selection: "picked by hand and by tag",
+			cause:     "none of its picked mailboxes is active and no active mailbox carries its tags",
+			remedy:    "Pick an active mailbox, or tag one with a tag the campaign selects.",
+			steps: []string{
+				"Open the campaign's sending accounts.",
+				"Pick a connected, active mailbox, or tag one with a tag the campaign selects.",
+				"Save.",
+			},
+		}
+	}
+}
+
 func detectFollowUpSpacing(s *repository.AdvisorSnapshot) []Finding {
 	names := map[string]string{}
 	statuses := map[string]string{}
+	firstEmail := map[uuid.UUID]int{}
 	for _, camp := range s.Campaigns {
 		names[camp.ID.String()] = camp.Name
 		statuses[camp.ID.String()] = camp.Status
 	}
+	for _, st := range s.Steps {
+		if st.Kind != "email" {
+			continue
+		}
+		if position, ok := firstEmail[st.CampaignID]; !ok || st.Position < position {
+			firstEmail[st.CampaignID] = st.Position
+		}
+	}
 
 	out := []Finding{}
 	for _, st := range s.Steps {
-		// Position 0 is the first email; its wait is a start delay, not spacing.
-		if st.Kind != "email" || st.Position == 0 {
+		// The first email's wait is a start delay, not follow-up spacing.
+		if st.Kind != "email" || st.Position == firstEmail[st.CampaignID] {
 			continue
 		}
 		if statuses[st.CampaignID.String()] == "draft" {
@@ -407,7 +482,7 @@ func detectFollowUpSpacing(s *repository.AdvisorSnapshot) []Finding {
 
 		label := st.Name
 		if label == "" {
-			label = fmt.Sprintf("Step %d", st.Position+1)
+			label = fmt.Sprintf("Step %d", st.Position)
 		}
 
 		var detail, remedy string
@@ -446,7 +521,7 @@ func detectFollowUpSpacing(s *repository.AdvisorSnapshot) []Finding {
 				"step":          label,
 				"wait_days":     st.WaitAfter,
 				"recommended":   want,
-				"step_position": st.Position + 1,
+				"step_position": st.Position,
 			},
 			Action: withUndo(toolAction("update_campaign_step",
 				fmt.Sprintf("Wait %d days instead", want),

@@ -2,12 +2,14 @@ package warmup
 
 import (
 	"context"
+	"math"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/warmbly/warmbly/internal/app/warmupramp"
 	"github.com/warmbly/warmbly/internal/infrastructure/db"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/repository"
@@ -19,16 +21,14 @@ import (
 //	WARMBLY_TEST_DB=postgres://warmbly:warmbly@localhost:15432/warmbly_dev?sslmode=disable \
 //	  go test ./internal/app/warmup/ -run Live -v
 //
-// Issue #195: the invalid-token band never fired. GetParticipantHealth compared
-// the driver's not-found error with `err == sql.ErrNoRows`, but the pool is pgx,
-// whose ErrNoRows is a proxy error that wraps sql.ErrNoRows rather than being
-// it. The comparison was therefore always false and "this account is not in
-// this pool" surfaced as a hard error. evaluateAndPersistAnyPool probes
-// "premium" first, so for every free-pool account the very first probe failed
-// and the account's own pool was never reached: no evaluation, ever.
-//
-// The pool probe is pure SQL and the whole failure lives in the driver
-// boundary, so it only reproduces against a real database.
+// Issue #195: health evaluation never ran for a free-pool account.
+// GetParticipantHealth compared the driver's not-found error with
+// `err == sql.ErrNoRows`, but the pool is pgx, whose ErrNoRows wraps
+// sql.ErrNoRows rather than being it, so "not in this pool" surfaced as a hard
+// error and the account's own pool was never reached. The probe is pure SQL and
+// the failure lives in the driver boundary, so it only reproduces live. The
+// floor test proves health_signals_from with spam placements, a band that
+// still exists.
 
 func liveWarmupRepo(t *testing.T) (repository.WarmupRepository, *db.DB) {
 	t.Helper()
@@ -41,6 +41,7 @@ func liveWarmupRepo(t *testing.T) (repository.WarmupRepository, *db.DB) {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() { handle.Pool.Close() })
+	requireSchemaVersion(t, handle.Pool, 156)
 	return repository.NewWarmupRepository(handle.Pool), handle
 }
 
@@ -53,17 +54,12 @@ type freePoolAccount struct {
 
 func newFreePoolAccount(t *testing.T, handle *db.DB) *freePoolAccount {
 	t.Helper()
-	ctx := context.Background()
 	pool := handle.Pool
 
+	requireSeededPools(t, pool)
 	f := &freePoolAccount{user: uuid.New(), org: uuid.New(), account: uuid.New()}
 
-	exec := func(sql string, args ...any) {
-		t.Helper()
-		if _, err := pool.Exec(ctx, sql, args...); err != nil {
-			t.Fatalf("fixture %q: %v", sql[:min(60, len(sql))], err)
-		}
-	}
+	exec := func(sql string, args ...any) { t.Helper(); execSQL(t, pool, sql, args...) }
 
 	exec(`INSERT INTO users (id, email, first_name, last_name) VALUES ($1, $2, 'Health', 'Live')`,
 		f.user, "wh-"+f.user.String()[:8]+"@test.local")
@@ -75,8 +71,7 @@ func newFreePoolAccount(t *testing.T, handle *db.DB) *freePoolAccount {
 		f.account, f.user, f.org, "wh-"+f.account.String()[:8]+"@test.local")
 
 	// Free pool only. No premium row, which is the whole point.
-	exec(`INSERT INTO warmup_pool_participants (pool_id, email_account_id)
-	      SELECT id, $1 FROM warmup_pools WHERE pool_type = 'free'`, f.account)
+	exec(`INSERT INTO warmup_pool_participants (pool_id, email_account_id) VALUES ($1, $2)`, models.WarmupPoolFreeID, f.account)
 
 	t.Cleanup(func() {
 		c := context.Background()
@@ -84,7 +79,6 @@ func newFreePoolAccount(t *testing.T, handle *db.DB) *freePoolAccount {
 			sql string
 			arg any
 		}{
-			{`DELETE FROM warmup_invalid_token_attempts WHERE email_account_id = $1`, f.account},
 			{`DELETE FROM warmup_pool_participants WHERE email_account_id = $1`, f.account},
 			{`DELETE FROM email_accounts WHERE id = $1`, f.account},
 			{`DELETE FROM organizations WHERE id = $1`, f.org},
@@ -97,6 +91,16 @@ func newFreePoolAccount(t *testing.T, handle *db.DB) *freePoolAccount {
 	})
 
 	return f
+}
+
+// insertSpamReports files n reports of one kind against the mailbox, stamped
+// offset ago. Rows cascade away with the mailbox.
+func insertSpamReports(t *testing.T, handle *db.DB, account uuid.UUID, kind, offset string, n int) {
+	t.Helper()
+	execSQL(t, handle.Pool, `
+		INSERT INTO warmup_spam_reports (reporter_account_id, reported_account_id, message_id, report_type, created_at)
+		SELECT $1, $1, gen_random_uuid()::text, $2, NOW() - $3::interval
+		FROM generate_series(1, $4)`, account, kind, offset, n)
 }
 
 // The driver-boundary bug itself: "not in this pool" is not an error.
@@ -118,42 +122,6 @@ func TestLiveGetParticipantHealthReportsAbsenceNotFailure(t *testing.T) {
 	}
 	if health == nil {
 		t.Fatal("expected the free participant row")
-	}
-}
-
-// What the absence-as-error bug cost: the band that is supposed to act on
-// invalid tokens never ran for any free-pool account.
-func TestLiveInvalidTokenBandFiresForAFreePoolAccount(t *testing.T) {
-	repo, handle := liveWarmupRepo(t)
-	f := newFreePoolAccount(t, handle)
-	svc := NewService(repo)
-	ctx := context.Background()
-
-	for i := 0; i < invalidTokenBlockThreshold; i++ {
-		if _, err := svc.ApplyInvalidTokenAttempt(ctx, f.account, uuid.NewString(), 0); err != nil {
-			t.Fatalf("attempt %d: %v", i+1, err)
-		}
-	}
-
-	attempts, err := repo.CountRecentInvalidAttempts(ctx, f.account, time.Now().Add(-24*time.Hour))
-	if err != nil {
-		t.Fatalf("count attempts: %v", err)
-	}
-	if attempts != invalidTokenBlockThreshold {
-		t.Fatalf("recorded %d attempts, want %d (a second recording means the caller's degraded path ran)",
-			attempts, invalidTokenBlockThreshold)
-	}
-
-	health, err := repo.GetParticipantHealth(ctx, f.account, "free")
-	if err != nil {
-		t.Fatalf("read back: %v", err)
-	}
-	if health.LastHealthEvaluatedAt == nil {
-		t.Fatal("last_health_evaluated_at is still null: the evaluation never ran")
-	}
-	if health.HealthState != models.WarmupHealthBlocked {
-		t.Fatalf("health_state is %q after %d invalid attempts, want %q",
-			health.HealthState, attempts, models.WarmupHealthBlocked)
 	}
 }
 
@@ -189,45 +157,111 @@ func TestLiveSweepEvaluatesAFreePoolAccount(t *testing.T) {
 func TestLiveHealthSignalsBeforeTheFloorAreNotCounted(t *testing.T) {
 	repo, handle := liveWarmupRepo(t)
 	f := newFreePoolAccount(t, handle)
+	partner := newFreePoolAccount(t, handle)
+	execSQL(t, handle.Pool, `UPDATE email_accounts SET provider = 'gmail' WHERE id = $1`, partner.account)
 	svc := NewService(repo)
 	ctx := context.Background()
-
-	// Well over the block threshold, but all of it predates the floor.
-	for i := 0; i < invalidTokenBlockThreshold*4; i++ {
-		if _, err := handle.Pool.Exec(ctx,
-			`INSERT INTO warmup_invalid_token_attempts (email_account_id, attempted_token, created_at)
-			 VALUES ($1, $2, NOW() - INTERVAL '2 hours')`,
-			f.account, uuid.NewString()); err != nil {
-			t.Fatalf("backdated attempt: %v", err)
-		}
-	}
-	if _, err := handle.Pool.Exec(ctx,
-		`UPDATE warmup_pool_participants SET health_signals_from = NOW() - INTERVAL '1 hour'
-		 WHERE email_account_id = $1`, f.account); err != nil {
-		t.Fatalf("set floor: %v", err)
-	}
+	// A full sample of deliveries, every one junked; the floor is applied to
+	// the receipts' timestamps.
+	deliverWarmup(t, handle, f.account, partner.account, "2 hours", minSpamPlacementSample, true)
+	execSQL(t, handle.Pool, `UPDATE warmup_pool_participants SET health_signals_from = NOW() - INTERVAL '1 hour'
+	      WHERE email_account_id = $1`, f.account)
 
 	health, err := svc.(*service).evaluateAndPersistAnyPool(ctx, f.account)
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
 	if health.HealthState != models.WarmupHealthHealthy {
-		t.Fatalf("health_state is %q; attempts from before the floor were counted against the mailbox",
+		t.Fatalf("health_state is %q; placements from before the floor were counted against the mailbox",
 			health.HealthState)
 	}
 
-	// The same volume of attempts after the floor does block it.
-	for i := 0; i < invalidTokenBlockThreshold; i++ {
-		if _, err := svc.ApplyInvalidTokenAttempt(ctx, f.account, uuid.NewString(), 0); err != nil {
-			t.Fatalf("attempt %d: %v", i+1, err)
-		}
-	}
+	// The same placements after the floor slow the mailbox down, and no more.
+	deliverWarmup(t, handle, f.account, partner.account, "0 seconds", minSpamPlacementSample, true)
 	health, err = svc.(*service).evaluateAndPersistAnyPool(ctx, f.account)
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
-	if health.HealthState != models.WarmupHealthBlocked {
-		t.Fatalf("health_state is %q after %d attempts past the floor, want %q",
-			health.HealthState, invalidTokenBlockThreshold, models.WarmupHealthBlocked)
+	if health.HealthState != models.WarmupHealthThrottled {
+		t.Fatalf("health_state is %q after %d placements past the floor, want %q",
+			health.HealthState, minSpamPlacementSample, models.WarmupHealthThrottled)
+	}
+}
+
+// deliverWarmup files n verified receipts of sender's warmup mail at recipient,
+// stamped offset ago, each also a spam placement when junked. Rows cascade
+// away with the mailboxes.
+func deliverWarmup(t *testing.T, handle *db.DB, sender, recipient uuid.UUID, offset string, n int, junked bool) []string {
+	t.Helper()
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = "<" + uuid.NewString() + "@test.local>"
+	}
+	execSQL(t, handle.Pool, `
+		INSERT INTO warmup_received (email_account_id, internal_id, message_id, sender_account_id, created_at)
+		SELECT $1, gen_random_uuid(), m, $2, NOW() - $3::interval FROM unnest($4::text[]) AS m`,
+		recipient, sender, offset, ids)
+	if junked {
+		execSQL(t, handle.Pool, `
+			INSERT INTO warmup_spam_reports (reporter_account_id, reported_account_id, message_id, report_type, created_at)
+			SELECT $1, $2, m, 'spam_placement', NOW() - $3::interval FROM unnest($4::text[]) AS m`,
+			recipient, sender, offset, ids)
+	}
+	return ids
+}
+
+func TestLiveHealthPlacementRecoveryUsesTheDisplayedUTCWindow(t *testing.T) {
+	repo, handle := liveWarmupRepo(t)
+	f, partner := newFreePoolAccount(t, handle), newFreePoolAccount(t, handle)
+	now := time.Date(2026, 10, 16, 4, 30, 0, 0, time.UTC)
+	start := models.WarmupPlacementWindowStart(now)
+	execSQL(t, handle.Pool, `UPDATE email_accounts SET provider = 'gmail' WHERE id = $1`, partner.account)
+	execSQL(t, handle.Pool, `UPDATE warmup_pool_participants SET health_state = 'throttled',
+		last_health_reason = $2, blocked_until = $3, health_signals_from = $4 WHERE email_account_id = $1`,
+		f.account, placementReasonMarker, now.Add(72*time.Hour), start.Add(-48*time.Hour))
+	for _, batch := range []struct {
+		at          time.Time
+		inbox, spam int
+	}{
+		{start.Add(-time.Microsecond), 5, 4},
+		{start, 28, 2},
+	} {
+		execSQL(t, handle.Pool, `INSERT INTO warmup_received
+			(email_account_id, internal_id, message_id, sender_account_id, created_at, first_landing)
+			SELECT $1, gen_random_uuid(), gen_random_uuid()::text, $2, $3,
+			CASE WHEN n <= $4 THEN 'inbox' ELSE 'spam' END FROM generate_series(1, $5) n`,
+			partner.account, f.account, batch.at, batch.inbox, batch.inbox+batch.spam)
+	}
+	old, err := repo.HealthMetricCounts(t.Context(), f.account, now.Add(-7*24*time.Hour), now.Add(-7*24*time.Hour), now.Add(-30*24*time.Hour))
+	if err != nil || old.Placement.MajorDelivered != 39 || old.Placement.MajorSpam != 6 {
+		t.Fatalf("old rolling sample = %+v, err = %v", old.Placement, err)
+	}
+	snapshot, err := repository.NewAdvisorRepository(handle).LoadSnapshot(t.Context(), f.org, now)
+	if err != nil || len(snapshot.Mailboxes) != 1 {
+		t.Fatalf("advisor snapshot = %+v, err = %v", snapshot, err)
+	}
+	if p := snapshot.Mailboxes[0].WarmupPlacement; p.MajorDelivered != 30 || p.MajorSpam != 2 {
+		t.Fatalf("advisor did not use the displayed placement window: %+v", p)
+	}
+	svc := NewService(repo).(*service)
+	svc.now = func() time.Time { return now }
+	health, xerr := svc.evaluateAndPersistAnyPool(t.Context(), f.account)
+	if xerr != nil {
+		t.Fatal(xerr)
+	}
+	if health.HealthState != models.WarmupHealthHealthy || health.BlockedUntil != nil || warmupramp.HealthVolumeMultiplier(health.HealthState) != 1 {
+		t.Fatalf("recovered mailbox kept a future throttle: %+v", health)
+	}
+	if math.Abs(health.LastHealthScore-100.0*2/30) > 0.001 {
+		t.Fatalf("health did not use the displayed 30-delivery sample: %+v", health)
+	}
+	// The placement boundary must not erase complaints or tampering from the preceding rolling week.
+	execSQL(t, handle.Pool, `INSERT INTO warmup_tampering_events(email_account_id, message_id, kind, created_at)
+		VALUES ($1, gen_random_uuid()::text, 'deletion', $2)`, f.account, start.Add(-time.Microsecond))
+	execSQL(t, handle.Pool, `INSERT INTO warmup_spam_reports(reporter_account_id, reported_account_id, message_id, report_type, created_at)
+		VALUES ($1, $2, gen_random_uuid()::text, 'user_complaint', $3)`, partner.account, f.account, start.Add(-time.Microsecond))
+	m, err := svc.loadMetrics(t.Context(), f.account, health)
+	if err != nil || m.PlacementSample != 30 || m.DeletionsLast7d != 1 || m.UserComplaintsLast7d != 1 {
+		t.Fatalf("separate safety windows = %+v, err = %v", m, err)
 	}
 }

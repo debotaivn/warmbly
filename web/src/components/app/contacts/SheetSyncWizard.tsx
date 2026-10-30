@@ -10,7 +10,8 @@
 //      EXISTING integration OAuth popup (provider "google_sheets").
 //   2. sheet   — paste a Sheet ID, fetch its tabs, pick a tab.
 //   3. map     — preview first rows + map columns (reused MapStep).
-//   4. options — dedup strategy, optional target campaign, optional categories.
+//   4. options — dedup strategy, optional target campaign, optional categories,
+//      optional target segments.
 //   5. save    — POST /lead-sync/sources, then optionally Sync now → result.
 
 import React from "react";
@@ -27,9 +28,10 @@ import {
     SheetIcon,
     XIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 
-import { MapStep, ResultStep } from "./ImportWizard";
+import MapStep from "./import/MapStep";
+import ResultStep from "./import/ResultStep";
 import { DEDUP_OPTIONS, announceResult, describeError, mappingProblem } from "./importShared";
 import CategoryPicker from "./CategoryPicker";
 import { Label, TextInput } from "@/components/ui/field";
@@ -45,8 +47,9 @@ import {
     useFinishIntegrationOAuth,
     useStartIntegrationOAuth,
 } from "@/lib/api/hooks/app/integrations/useIntegrationOAuth";
-import { openOAuthPopup } from "@/lib/integrations/oauthPopup";
-import useCampaigns from "@/lib/api/hooks/app/campaigns/useCampaigns";
+import { authorizeInPopup } from "@/lib/integrations/oauthPopup";
+import CampaignPicker from "@/components/app/campaigns/CampaignPicker";
+import { SegmentMultiPicker } from "@/components/app/segments/SegmentPickers";
 import useGoogleConnection from "@/lib/api/hooks/app/leadsync/useGoogleConnection";
 import {
     useGetSpreadsheet,
@@ -72,13 +75,16 @@ interface Props {
     // When set, the source is pre-targeted to this campaign and the campaign
     // picker is hidden — used by the per-campaign "Connect a Google Sheet".
     lockedCampaign?: { id: string; name: string };
+    // When set (a segment's member list), every synced row is pinned into this
+    // segment on each run, the same way the file importer's target works.
+    lockedSegment?: { id: string; name: string; color?: string };
     // Notified after a source is saved so callers can refresh their list.
     onSaved?: (source: LeadSyncSource) => void;
 }
 
 const STEP_ORDER: Step[] = ["connect", "sheet", "map", "options", "result"];
 
-export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved }: Props) {
+export default function SheetSyncWizard({ open, onClose, lockedCampaign, lockedSegment, onSaved }: Props) {
     const connection = useGoogleConnection();
     const connectionId = connection.data?.connection?.id ?? null;
     const connected = !!connection.data?.connected && !!connectionId;
@@ -94,6 +100,7 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved
     const [campaignId, setCampaignId] = React.useState<string | null>(lockedCampaign?.id ?? null);
     const [campaignName, setCampaignName] = React.useState<string>(lockedCampaign?.name ?? "");
     const [categoryIds, setCategoryIds] = React.useState<string[]>([]);
+    const [segmentIds, setSegmentIds] = React.useState<string[]>([]);
     const [label, setLabel] = React.useState("");
     const [result, setResult] = React.useState<ImportResult | null>(null);
     const [busy, setBusy] = React.useState(false);
@@ -118,6 +125,7 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved
         setCampaignId(lockedCampaign?.id ?? null);
         setCampaignName(lockedCampaign?.name ?? "");
         setCategoryIds([]);
+        setSegmentIds([]);
         setLabel("");
         setResult(null);
         setBusy(false);
@@ -135,11 +143,9 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved
     async function runConnect() {
         setBusy(true);
         try {
-            const { url } = await startOAuth.mutateAsync({
-                provider: "google_sheets",
-                label: "Google Sheets",
-            });
-            const { code, state } = await openOAuthPopup(url);
+            const { code, state } = await authorizeInPopup(
+                async () => (await startOAuth.mutateAsync({ provider: "google_sheets", label: "Google Sheets" })).url,
+            );
             await finishOAuth.mutateAsync({ code, state });
             await connection.refetch();
             await queryClient.invalidateQueries({ queryKey: ["lead-sync", "google", "connection"] });
@@ -203,6 +209,12 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved
     // field name is rejected by the API, so catch it on the mapping screen.
     const mapProblem = mappingProblem(mapping);
 
+    // The segment the wizard was opened inside always travels with the source.
+    const targetSegmentIds = React.useMemo(
+        () => (lockedSegment ? [lockedSegment.id, ...segmentIds.filter((id) => id !== lockedSegment.id)] : segmentIds),
+        [lockedSegment, segmentIds],
+    );
+
     async function save(runSync: boolean) {
         if (!connectionId || !meta) return;
         setBusy(true);
@@ -217,6 +229,7 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved
                 dedup,
                 target_campaign_id: campaignId ?? undefined,
                 category_ids: categoryIds,
+                segment_ids: targetSegmentIds,
                 subscribed_default: true,
                 label: label.trim() || meta.title,
             });
@@ -311,6 +324,7 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved
                             )}
                             {step === "map" && preview && (
                                 <MapStep
+                                    importId={`sheet:${connectionId}:${sheetId}:${tabTitle}`}
                                     preview={preview}
                                     mapping={mapping}
                                     setMapping={setMapping}
@@ -333,6 +347,9 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, onSaved
                                     lockedCampaign={lockedCampaign}
                                     categoryIds={categoryIds}
                                     setCategoryIds={setCategoryIds}
+                                    segmentIds={segmentIds}
+                                    setSegmentIds={setSegmentIds}
+                                    lockedSegment={lockedSegment}
                                 />
                             )}
                             {step === "result" && result && (
@@ -575,6 +592,9 @@ function OptionsStep({
     lockedCampaign,
     categoryIds,
     setCategoryIds,
+    segmentIds,
+    setSegmentIds,
+    lockedSegment,
 }: {
     dedup: ImportDedupStrategy;
     setDedup: (v: ImportDedupStrategy) => void;
@@ -586,6 +606,9 @@ function OptionsStep({
     lockedCampaign?: { id: string; name: string };
     categoryIds: string[];
     setCategoryIds: (v: string[]) => void;
+    segmentIds: string[];
+    setSegmentIds: (v: string[]) => void;
+    lockedSegment?: { id: string; name: string; color?: string };
 }) {
     return (
         <div className="space-y-5">
@@ -665,64 +688,37 @@ function OptionsStep({
 
             <section>
                 <h2 className="text-[10px] uppercase tracking-[0.14em] font-semibold text-slate-500 mb-2">
-                    Apply categories
+                    Apply labels
                 </h2>
                 <p className="text-[11px] text-slate-400 leading-tight mb-2">
-                    Every synced contact gets these categories. Skip to leave them untagged.
+                    Every synced contact gets these labels. Skip to leave them unlabeled.
                 </p>
                 <CategoryPicker value={categoryIds} onChange={setCategoryIds} />
             </section>
-        </div>
-    );
-}
 
-// CampaignPicker — house-theme PopoverMenu campaign selector backed by the
-// existing campaigns list query. Single-select with an explicit "None".
-function CampaignPicker({
-    campaignId,
-    campaignName,
-    onChange,
-}: {
-    campaignId: string | null;
-    campaignName: string;
-    onChange: (id: string | null, name: string) => void;
-}) {
-    const [query, setQuery] = React.useState("");
-    const campaigns = useCampaigns({ query, folder: "" });
-    const label = campaignId ? campaignName || "Selected campaign" : "No campaign";
-
-    return (
-        <PopoverMenu align="start">
-            <PopoverMenuTrigger asChild>
-                <SelectButton label={label} className="w-full" />
-            </PopoverMenuTrigger>
-            <PopoverMenuContent minWidth={280}>
-                <div className="px-2 py-1.5 border-b border-slate-200">
-                    <input
-                        value={query}
-                        onChange={(e) => setQuery(e.target.value)}
-                        placeholder="Search campaigns…"
-                        className="w-full h-5 bg-transparent text-[12px] text-slate-900 placeholder:text-slate-400 outline-none"
-                    />
-                </div>
-                <PopoverMenuItem selected={!campaignId} onSelect={() => onChange(null, "")}>
-                    No campaign
-                </PopoverMenuItem>
-                {campaigns.campaigns.map((c) => (
-                    <PopoverMenuItem
-                        key={c.id}
-                        selected={c.id === campaignId}
-                        onSelect={() => onChange(c.id, c.name)}
-                    >
-                        {c.name}
-                    </PopoverMenuItem>
-                ))}
-                {campaigns.campaigns.length === 0 && (
-                    <div className="px-3 py-2 text-[11.5px] text-slate-400 text-center">
-                        {campaigns.isPending ? "Loading…" : "No campaigns found."}
+            <section>
+                <h2 className="text-[10px] uppercase tracking-[0.14em] font-semibold text-slate-500 mb-2">
+                    Add to segments
+                </h2>
+                <p className="text-[11px] text-slate-400 leading-tight mb-2">
+                    {lockedSegment
+                        ? "Every synced contact is pinned into this segment on each run, whether or not it matches the segment's conditions. Add more below."
+                        : "Every synced contact is pinned into these segments on each run. A segment linked to a campaign enrols them there automatically."}
+                </p>
+                {lockedSegment && (
+                    <div className="mb-2 flex items-center gap-1.5 rounded-md border border-sky-200 bg-sky-50/60 px-2 h-7">
+                        <span
+                            className="size-2 rounded-full shrink-0"
+                            style={{ backgroundColor: lockedSegment.color ?? "#0284c7" }}
+                        />
+                        <span className="text-[12px] font-medium text-sky-900 truncate">{lockedSegment.name}</span>
+                        <span className="ml-auto text-[10px] uppercase tracking-[0.14em] text-sky-700 shrink-0">
+                            Always
+                        </span>
                     </div>
                 )}
-            </PopoverMenuContent>
-        </PopoverMenu>
+                <SegmentMultiPicker value={segmentIds} onChange={setSegmentIds} exclude={lockedSegment?.id} />
+            </section>
+        </div>
     );
 }

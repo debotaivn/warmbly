@@ -1,19 +1,22 @@
 package scheduler
 
 import (
+	"hash/fnv"
 	"math"
 	"math/rand"
 	"sort"
-	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/app/behavior"
+	"github.com/warmbly/warmbly/internal/bitmask"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/mailhost"
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
-// findNextValidDay finds the next valid day based on campaign days bitmask
-// Bit 0 = Sunday, Bit 1 = Monday, ..., Bit 6 = Saturday
+// findNextValidDay finds the next day the Monday-first days mask allows.
 func findNextValidDay(from time.Time, daysBitmask uint8, tz *time.Location) time.Time {
 	if daysBitmask == 0 {
 		// If no days specified, allow all days
@@ -24,11 +27,10 @@ func findNextValidDay(from time.Time, daysBitmask uint8, tz *time.Location) time
 
 	// Try up to 7 days
 	for i := 0; i < 7; i++ {
-		dayOfWeek := int(candidate.Weekday())
-		if (daysBitmask & (1 << dayOfWeek)) != 0 {
+		if bitmask.HasWeekday(daysBitmask, candidate.Weekday()) {
 			return candidate
 		}
-		candidate = candidate.Add(24 * time.Hour)
+		candidate = candidate.AddDate(0, 0, 1)
 	}
 
 	// If no valid day found in 7 days, just return the input
@@ -56,8 +58,7 @@ func ensureTimeWindow(t time.Time, startTime, endTime string, tz *time.Location)
 
 	if minutesOfDay > end {
 		// Too late, move to tomorrow's start time
-		next := tLocal.Add(24 * time.Hour)
-		return time.Date(next.Year(), next.Month(), next.Day(),
+		return time.Date(tLocal.Year(), tLocal.Month(), tLocal.Day()+1,
 			start/60, start%60, 0, 0, tz)
 	}
 
@@ -97,39 +98,85 @@ func effectiveWindows(c *models.Campaign) models.ScheduleWindows {
 // empty schedule means "unconstrained" and returns from unchanged. When from is
 // already inside a window its exact instant is preserved (so jitter/min-wait
 // adjustments survive); otherwise it advances to the next interval's start.
+//
+// Days are walked by calendar date, so a 23- or 25-hour day is stepped like any
+// other, and a search that finds no window never answers "now".
 func nextScheduleSlot(from time.Time, sw models.ScheduleWindows, tz *time.Location) time.Time {
 	if sw.IsEmpty() {
 		return from
 	}
-	cur := from.In(tz)
+	local := from.In(tz)
+	y, m, d := local.Date()
+	nowMin := local.Hour()*60 + local.Minute()
 	for i := 0; i < 8; i++ {
-		y, m, d := cur.Date()
-		nowMin := cur.Hour()*60 + cur.Minute()
+		// Noon exists on every date, so it names the day even where midnight does not.
+		day := time.Date(y, m, d+i, 12, 0, 0, 0, tz)
+		dy, dm, dd := day.Date()
 
-		ivs := append([]models.TimeInterval(nil), sw[int(cur.Weekday())]...)
+		ivs := append([]models.TimeInterval(nil), sw[int(day.Weekday())]...)
 		sort.Slice(ivs, func(a, b int) bool { return ivs[a].Start < ivs[b].Start })
 
 		for _, iv := range ivs {
-			if nowMin < iv.Start {
-				return time.Date(y, m, d, iv.Start/60, iv.Start%60, 0, 0, tz)
+			if i == 0 && nowMin >= iv.End {
+				continue
 			}
-			if nowMin < iv.End {
-				if i == 0 {
-					return from // already inside a window — keep the exact instant
-				}
-				return cur
+			if i == 0 && nowMin >= iv.Start {
+				return from // already inside a window — keep the exact instant
 			}
+			at, ok := wallClockAt(dy, dm, dd, iv.Start, tz)
+			if ok && at.Before(from) {
+				// from is in the repeated hour after the clocks went back: take the second pass.
+				_, before := at.Zone()
+				_, end := at.ZoneBounds()
+				_, after := end.Zone()
+				at = at.Add(time.Duration(before-after) * time.Second)
+			}
+			if !ok || at.Before(from) || at.In(tz).Hour()*60+at.In(tz).Minute() >= iv.End {
+				continue // the whole interval falls in time the clocks skipped
+			}
+			return at
 		}
-		// No interval left today — jump to the start of the next day.
-		cur = time.Date(y, m, d, 0, 0, 0, 0, tz).Add(24 * time.Hour)
 	}
-	return from
+	log.Warn().Str("tz", tz.String()).Time("from", from).Msg("scheduler: no sending window within 8 days of a non-empty schedule")
+	return from.AddDate(0, 0, 8)
+}
+
+// wallClockAt is the first instant on the local date y-m-d whose wall clock
+// reads minute or later; when the clocks skip over minute, that is the instant
+// they resume. ok is false when no such instant is left on that date.
+func wallClockAt(y int, m time.Month, d, minute int, tz *time.Location) (time.Time, bool) {
+	t := time.Date(y, m, d, minute/60, minute%60, 0, 0, tz)
+	ly, lm, ld := t.In(tz).Date()
+	got := time.Date(ly, lm, ld, t.In(tz).Hour(), t.In(tz).Minute(), 0, 0, time.UTC)
+	want := time.Date(y, m, d, minute/60, minute%60, 0, 0, time.UTC)
+	switch start, end := t.ZoneBounds(); {
+	case got.After(want): // resolved past the gap: the gap ends where this zone begins
+		t = start
+	case got.Before(want): // resolved before the gap: it ends where this zone ends
+		t = end
+	}
+	if ty, tm, td := t.In(tz).Date(); ty != y || tm != m || td != d {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // ensureBusinessHours ensures time is within business hours (8am-8pm)
 func ensureBusinessHours(t time.Time, timezone string) time.Time {
 	loc := loadLocation(timezone)
 	return ensureTimeWindow(t, "08:00", "20:00", loc)
+}
+
+// businessHoursReopen is when the 8am-8pm band next opens for an instant
+// that sits outside it: 8am the same local day before the band, 8am the next
+// local day after it.
+func businessHoursReopen(t time.Time, loc *time.Location) time.Time {
+	local := t.In(loc)
+	open := time.Date(local.Year(), local.Month(), local.Day(), 8, 0, 0, 0, loc)
+	if local.Hour() >= 20 {
+		open = open.AddDate(0, 0, 1)
+	}
+	return open
 }
 
 // calculateHoursRemainingUntil calculates hours remaining until a specific end time
@@ -155,35 +202,35 @@ func calculateFirstSlotTomorrowAt(timezone, startTime string) time.Time {
 	if startMinutes == 0 {
 		startMinutes = 8 * 60 // fallback to 8am
 	}
-	tomorrow := now.Add(24 * time.Hour)
-	firstSlot := time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(),
+	firstSlot := time.Date(now.Year(), now.Month(), now.Day()+1,
 		startMinutes/60, startMinutes%60, 0, 0, loc)
 	jitter := randomJitter(0, 60)
 	return finalSlot(firstSlot.Add(time.Minute * time.Duration(jitter)))
 }
 
-// humanizeSeconds randomises the sub-minute component of a scheduled time. All
-// jitter above is minute-granular and every time.Date construction lands on
-// second :00, so without this the whole platform sends at second zero — a
-// fleet-wide fingerprint in Received headers. Applied as the last step of the
-// schedulers.
-//
-// It truncates DOWN to the minute before re-randomising, so on its own it can
-// move a slot up to 59 seconds EARLIER. Callers that are producing a real
-// scheduled_at must therefore use finalSlot, which clamps afterwards; this
-// helper deliberately stays a pure formatter.
+// humanizeSeconds moves a slot sitting on second :00 (every time.Date build and
+// minute-granular jitter) 1-59s later, so the fleet never sends at second zero.
+// A slot already off :00 keeps its exact time and the pacing that produced it.
 func humanizeSeconds(t time.Time) time.Time {
-	return t.Truncate(time.Minute).Add(time.Duration(rand.Intn(60)) * time.Second)
+	if t.Second() != 0 {
+		return t
+	}
+	return t.Add(time.Duration(1+rand.Intn(59)) * time.Second)
 }
 
-// finalSlot is the last thing a scheduler does to a candidate: randomise its
-// sub-minute component, then guarantee the result is still in the future.
-//
-// Both halves matter. Without the randomisation the whole fleet sends at second
-// :00, which is a fingerprint in Received headers. Without the clamp, that same
-// randomisation — plus the symmetric jitter each scheduler applies — can land a
-// near-term send in the past, where it fires immediately with none of the
-// spacing it was placed with, or gets cancelled outright by the overdue sweep.
+// poolSendInterval is a campaign chain's gap to its next send: the window left
+// over the pool's budget left, varied 0.55-1.45x by draw so sends come in bursts
+// and lulls. The floor is the pool's spacing (one mailbox gap over the pool
+// size), never the chosen mailbox's, whose own gap STEP 10 enforces.
+func poolSendInterval(remainingMinutes, remainingEmails, gapSeconds, poolSize int, draw float64) time.Duration {
+	perSend := float64(remainingMinutes) / float64(max(1, remainingEmails))
+	interval := time.Duration(perSend * (0.55 + draw*0.9) * float64(time.Minute))
+	floor := time.Second * time.Duration(gapSeconds) / time.Duration(max(1, poolSize))
+	return max(interval, floor)
+}
+
+// finalSlot is the last thing a scheduler does to a candidate: take it off
+// second :00, then clamp a slot the jitter left in the past to the near future.
 func finalSlot(t time.Time) time.Time {
 	return notBefore(humanizeSeconds(t))
 }
@@ -301,10 +348,13 @@ type AccountCandidate struct {
 	// Behavior is the mailbox's resolved sending-behaviour profile for this
 	// pass. Zero value (Enabled false) means the mailbox has not opted in.
 	Behavior behavior.Resolved
-	// BehaviorOpenAt is the earliest instant the mailbox's rolled workday and
-	// hourly ceiling allow, computed while filtering candidates. nil when
-	// behaviour is off for this mailbox.
-	BehaviorOpenAt *time.Time
+	// OpenAt is the earliest instant the mailbox's own calendar allows: its
+	// rolled workday and hourly ceiling under a behaviour profile, otherwise
+	// the reopening of its 8am-8pm band, and it is only set for a mailbox the
+	// pass decided to wait for rather than drop. OpenLoc is the timezone that
+	// instant's DAY is counted in. Both nil when the mailbox can send now.
+	OpenAt  *time.Time
+	OpenLoc *time.Location
 }
 
 // remainingSendMinutes returns how much sending time is left in the day the
@@ -351,10 +401,10 @@ func remainingSendMinutes(c *AccountCandidate, at time.Time, sw models.ScheduleW
 // have between them on the day `at` falls on — the denominator the even-
 // distribution step paces the day across.
 //
-// Only mailboxes actually landing on that day are counted. A behaviour-profiled
-// mailbox whose today is spent has already been walked to a later day by
-// placeWithinBehavior, and counting tomorrow's allowance as if it were available
-// now would pace the campaign faster than the mailboxes that can send today can
+// Only mailboxes actually landing on that day are counted. A mailbox whose
+// today is spent (or whose hours have closed) has already been walked to a
+// later day, and counting tomorrow's allowance as if it were available now
+// would pace the campaign faster than the mailboxes that can send today can
 // keep up with. A mailbox that opened BEFORE `at` is available whatever day it
 // opened on, which is what keeps the count right when the whole pass has been
 // pushed to tomorrow because every mailbox was at capacity today.
@@ -365,8 +415,8 @@ func poolRemainingOn(pool []AccountCandidate, at time.Time) int {
 		if c.RemainingToday <= 0 {
 			continue
 		}
-		if c.Behavior.Enabled && c.BehaviorOpenAt != nil &&
-			c.BehaviorOpenAt.After(at) && !sameLocalDay(*c.BehaviorOpenAt, at, c.Behavior.Loc) {
+		if c.OpenAt != nil && c.OpenLoc != nil &&
+			c.OpenAt.After(at) && !sameLocalDay(*c.OpenAt, at, c.OpenLoc) {
 			continue
 		}
 		total += c.RemainingToday
@@ -394,24 +444,29 @@ func campaignRampCeiling(enabled bool, start, increment, ceiling, level int) int
 	return v
 }
 
-// providerForEmailDomain maps a recipient email address to a coarse ESP bucket
-// for provider matching. Pure string work — never dials MX. Unknown/other
-// domains return "" so matching never blocks the first contact.
-func providerForEmailDomain(email string) string {
-	at := strings.LastIndex(email, "@")
-	if at < 0 || at == len(email)-1 {
-		return ""
+// senderESP is a mailbox's family for ESP matching: its email_provider, or
+// for an smtp_imap mailbox on Google or Microsoft (an app-password import)
+// that host's family.
+func senderESP(acct models.Email) string {
+	if acct.Provider == "smtp_imap" {
+		if esp := mailhost.ESPFamily(mailhost.Host(acct.MailHost)); esp == "gmail" || esp == "outlook" {
+			return esp
+		}
 	}
-	domain := strings.ToLower(strings.TrimSpace(email[at+1:]))
-	switch domain {
-	case "gmail.com", "googlemail.com":
-		return "gmail"
-	case "outlook.com", "hotmail.com", "live.com", "msn.com", "office365.com", "microsoft.com":
-		return "outlook"
+	return acct.Provider
+}
+
+// recipientESP is the provider family ESP matching compares against a
+// mailbox's email_provider: "gmail", "outlook", or "" for anything else,
+// which matches every mailbox. A contact the provider sweep has not reached
+// yet is read from its domain alone.
+func recipientESP(c *models.Contact) string {
+	esp := c.ESPProvider
+	if c.MailHost == "" && esp == "" {
+		esp = mailhost.ESPFamily(mailhost.KnownDomain(c.Email))
 	}
-	// Subdomain / suffix heuristics for hosted Google/Microsoft mail.
-	if strings.HasSuffix(domain, ".onmicrosoft.com") {
-		return "outlook"
+	if esp == "gmail" || esp == "outlook" {
+		return esp
 	}
 	return ""
 }
@@ -472,38 +527,38 @@ func effectiveWeight(c AccountCandidate) float64 {
 
 // selectAccountLeastRecentlyUsed picks the viable candidate (Weight>0) whose
 // sender last_sent_at is oldest; a nil last_sent_at (never used) sorts first.
-// Ties broken by account id for determinism.
-func selectAccountLeastRecentlyUsed(candidates []AccountCandidate) *AccountCandidate {
+// Ties go to tieRank under the campaign's salt.
+func selectAccountLeastRecentlyUsed(candidates []AccountCandidate, salt uuid.UUID) *AccountCandidate {
 	var best *AccountCandidate
 	for i := range candidates {
 		if candidates[i].Weight <= 0 {
 			continue
 		}
-		if best == nil || lruLess(&candidates[i], best) {
+		if best == nil || lruLess(&candidates[i], best, salt) {
 			best = &candidates[i]
 		}
 	}
 	return best
 }
 
-func lruLess(a, b *AccountCandidate) bool {
+func lruLess(a, b *AccountCandidate, salt uuid.UUID) bool {
 	switch {
 	case a.SenderLastSentAt == nil && b.SenderLastSentAt == nil:
-		return a.Account.ID.String() < b.Account.ID.String()
+		return tieRank(salt, a.Account.ID) < tieRank(salt, b.Account.ID)
 	case a.SenderLastSentAt == nil:
 		return true
 	case b.SenderLastSentAt == nil:
 		return false
 	case a.SenderLastSentAt.Equal(*b.SenderLastSentAt):
-		return a.Account.ID.String() < b.Account.ID.String()
+		return tieRank(salt, a.Account.ID) < tieRank(salt, b.Account.ID)
 	default:
 		return a.SenderLastSentAt.Before(*b.SenderLastSentAt)
 	}
 }
 
 // selectAccountRoundRobin picks the viable candidate (Weight>0) with the lowest
-// rotation_position; ties broken by account id for determinism.
-func selectAccountRoundRobin(candidates []AccountCandidate) *AccountCandidate {
+// rotation_position; ties go to tieRank under the campaign's salt.
+func selectAccountRoundRobin(candidates []AccountCandidate, salt uuid.UUID) *AccountCandidate {
 	var best *AccountCandidate
 	for i := range candidates {
 		if candidates[i].Weight <= 0 {
@@ -512,11 +567,20 @@ func selectAccountRoundRobin(candidates []AccountCandidate) *AccountCandidate {
 		if best == nil ||
 			candidates[i].RotationPosition < best.RotationPosition ||
 			(candidates[i].RotationPosition == best.RotationPosition &&
-				candidates[i].Account.ID.String() < best.Account.ID.String()) {
+				tieRank(salt, candidates[i].Account.ID) < tieRank(salt, best.Account.ID)) {
 			best = &candidates[i]
 		}
 	}
 	return best
+}
+
+// tieRank orders tied mailboxes per campaign: stable for one campaign, but
+// different campaigns sharing a pool do not all reach for the same mailbox.
+func tieRank(salt, id uuid.UUID) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(salt[:])
+	_, _ = h.Write(id[:])
+	return h.Sum64()
 }
 
 // needsRotationFallback reports whether a rotation mode depends on per-sender
@@ -528,13 +592,14 @@ func needsRotationFallback(rotationMode string) bool {
 
 // selectAccountByRotationMode dispatches to the chosen rotation strategy. For
 // explicit-strategy campaigns rotationMode is one of weighted / round_robin /
-// least_recently_used; anything else falls back to weighted.
-func selectAccountByRotationMode(rotationMode string, candidates []AccountCandidate) *AccountCandidate {
+// least_recently_used; anything else falls back to weighted. salt is the
+// campaign id, which decides ties.
+func selectAccountByRotationMode(rotationMode string, candidates []AccountCandidate, salt uuid.UUID) *AccountCandidate {
 	switch rotationMode {
 	case "round_robin":
-		return selectAccountRoundRobin(candidates)
+		return selectAccountRoundRobin(candidates, salt)
 	case "least_recently_used":
-		return selectAccountLeastRecentlyUsed(candidates)
+		return selectAccountLeastRecentlyUsed(candidates, salt)
 	default:
 		return selectAccountWeighted(candidates)
 	}

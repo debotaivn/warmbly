@@ -1,15 +1,25 @@
 ---
 title: warmblyctl
-description: The CLI for a Warmbly instance. The operator commands for accounts, health and recovery, and the API commands that let scripts and AI agents drive campaigns, contacts, mailboxes and the inbox with an API key.
+description: Local operator recovery, remotely approved administrator diagnostics, and public API-key commands for a Warmbly instance.
 ---
 
-`warmblyctl` is the CLI for a Warmbly instance, and it has two halves with two trust models.
+<Callout type="info" title="There are two CLIs. This is the administrator's one.">
+`warmblyctl` is for running an instance: accounts, health, recovery, backups. Local operator commands use the database inside the backend container. Remote administrator commands use a separately approved MFA session from your own machine, without database credentials.
+
+If you want to use the product from your terminal (campaigns, contacts, mailboxes, the inbox), you want [`warmbly`](/api/cli/): a signed-in, multi-host client you install on your own machine, with `warmbly auth login` instead of an exported key.
+</Callout>
+
+`warmblyctl` is the CLI for a Warmbly instance, with three deliberately separate trust models.
 
 The operator commands answer two questions: what state is this install in, and how do I get back in. They read and write the database directly, so they keep working when the sign-in page does not. Their authorization is container or host access, the same trust model as Sentry's `createuser`, Gitea's `admin user create` and authentik's `ak changepassword`, and it is the right one when the identity system is the thing that is broken.
 
 The [API commands](#the-api-commands) drive a running instance over its public REST API with an API key, so they work from any machine against any instance you hold a key for, the hosted service included. They exist so scripts and AI agents can operate the product itself: campaigns, contacts, mailboxes, the inbox, settings. Everything they can do is bounded by the key's scopes.
 
+The [remote administrator commands](#remote-administrator-commands) use an independent signed-in session approved on the existing administrator website. They require live platform permissions, session MFA, and the server's existing fresh-auth and audit guards. Platform administrator access does not imply organization membership, select a workspace, or issue an API key. These commands never fall back to local database authority or `WARMBLY_API_KEY`.
+
 The CLI never serves HTTP. The API commands are a client of the already-gated public API, which adds no new surface to your instance.
+
+Those API commands predate the [`warmbly` CLI](/api/cli/) and still work exactly as documented below. For day-to-day product work prefer `warmbly`: it signs in for you, holds a credential per host, prints tables rather than raw JSON, and runs on your laptop rather than inside a container.
 
 ## Running it
 
@@ -22,7 +32,7 @@ kubectl exec -it deploy/warmbly-backend -- warmblyctl status
 warmblyctl status                                          # bare binary
 ```
 
-Every example on this page shows the compose form. Substitute the prefix you need.
+Local operator examples use the compose form. Remote administrator examples run the binary on your own machine.
 
 For a compose install, `make cli` is the same thing with less typing. Flags go through `ARGS`, because make reads a bare `--email` as one of its own options:
 
@@ -49,16 +59,166 @@ A command that would set a password refuses on a non-TTY unless you passed `--pa
 
 | Variable | Needed by | If it is missing |
 |---|---|---|
-| `PRIMARY_DB` | every command except `hash-password` | The command stops and tells you to run it inside the backend container |
+| `PRIMARY_DB` | local database operator commands except `hash-password` | The command stops and tells you to run it inside the backend container |
 | `REDIS` | `setup-link` always, `reset-password` to mint a link | `setup-link` fails. Everything else degrades to a warning and continues |
 | `AUTH_SECRET` | `reset-password` when it mints a link | The link cannot be signed with the key the backend verifies, so it is refused |
 | `APP_URL` | every printed link and sign-in hint | Links are built against `https://app.warmbly.com`, which is the hosted service and not your instance |
 | `KMS_PROVIDER` and its key | `org export`, `org import` | The command stops: a workspace's sealed values cannot be opened, so an archive would be useless |
 | `CREDENTIALS_ENCRYPTION_KEY` | `org export`, `org import` | A warning, and mailbox credentials are neither read nor written. Everything else still moves |
+| `CREDENTIALS_ENCRYPTION_KEY`, `KMS_LOCAL_MASTER_KEY` | `backup`, `restore` | `backup` warns and leaves them out of the bundle. `restore` refuses when this host's differ from the bundle's |
+| `BLOB_FS_ROOT` | `backup`, `restore` | Defaults to `/data/blobs`, which is where the compose stack mounts it |
 | `WARMBLY_API_KEY` | every API command | The command stops and explains where a key comes from |
 | `WARMBLY_API_URL` | every API command | Falls back to the instance's own `API_PUBLIC_URL`, then the hosted service |
 
-Inside the backend container all of these are already set, except the API key, which is yours. Outside it, export what the command needs, and match `AUTH_SECRET` to the backend's exactly.
+`backup` and `restore` also need `pg_dump` and `psql`, which the backend image ships for exactly this reason. Inside the backend container all of these are already set, except the API key, which is yours. Outside it, export what the command needs, and match `AUTH_SECRET` to the backend's exactly.
+
+Remote administrator commands require none of those instance secrets. They do not read `API_PUBLIC_URL`, `WARMBLY_API_URL` or `WARMBLY_API_KEY` to choose an instance or authenticate. Their only configuration-directory dependency is the operating system's user configuration location (`XDG_CONFIG_HOME` on Linux when set).
+
+## Remote administrator commands
+
+### Installing on another machine
+
+The backend image still includes `warmblyctl` for local emergency recovery. To use the remote commands from a laptop or separate VM, compile just this binary from a trusted source checkout with the repository's Go toolchain, then install it on your path:
+
+```bash
+go build -o ./warmblyctl ./cmd/warmblyctl
+install -m 0755 ./warmblyctl "$HOME/.local/bin/warmblyctl"
+```
+
+Create `$HOME/.local/bin` first if it does not exist. This is not the [`warmbly` installer](/api/cli/); that installer provides the separate public product CLI. Remote credential storage currently supports Linux, macOS and BSD on filesystems with verifiable POSIX ownership, modes and file locking. Windows and other unsupported platforms refuse remote storage rather than saving unprotected credentials.
+
+Deploy the backend device-login routes and the administrator website's `/device` consent page first. An older backend can refuse the new routes without affecting any existing local operator or API-key commands. No database migration or `PRIMARY_DB` access is required by the remote client.
+
+### Login, identity and logout
+
+```bash
+warmblyctl login --url https://api.example.com --server laptop --client-name 'work laptop'
+warmblyctl whoami --server laptop
+warmblyctl logout --server laptop
+```
+
+`--url` is the backend origin, not the administrator frontend URL. It must be a bare HTTPS origin without credentials, path, query or fragment. HTTP is allowed only for loopback development. Redirects are refused, including same-origin redirects; point directly at the backend's canonical origin. There is no insecure TLS flag or environment-selected default server.
+
+Login prints the selected backend, requester, lookup code and `/device` verification path to **stderr**. Open your configured administrator website's `/device` page on any machine, sign in through the unchanged OAuth, passkey or password flow with MFA, enter the lookup code, and explicitly approve the named requester and instance. The administrator website may be on a different frontend origin; the CLI never sends a credential there. Merely viewing the request does not approve it.
+
+The client compares the returned instance identity with the selected backend, waits the supplied poll interval, and stores only the resulting ordinary session token pair. The private device secret stays in process memory and is never printed, saved, placed in a URL or given to a browser. The CLI opens no browser and serves no HTTP. Approval expires after five minutes; a lost claim response requires a new login, not a replay. If the source session's original authentication proof ages out, perform a fresh browser authentication and begin a new request. There is no password or MFA-bypass option in the remote client.
+
+`whoami` reads `/v1/auth/me` and prints the safely projected identity UUID, live admin permissions and MFA state. Arbitrary display names, addresses and free text are redacted. Login success prints session expiry timestamps, never token values.
+
+Every remote request requires `--url` or a registered `--server`. A URL-only login uses the `default` profile *for that exact origin*; it never sets a global default. Named profiles are bound to the origin registered by `login --server NAME --url URL`. A conflicting URL is rejected; use another profile name for another instance or administrator session. Logging out leaves that non-secret server mapping intact.
+
+Refresh happens before expiry or after one rejected read. Rotated credentials are atomically saved before use and local processes serialize refresh with a file lock. A failed or ambiguous refresh discards only the affected profile because the previous refresh token may already have been consumed. Reads retry at most once; writes are never automatically repeated. Permission, MFA and fresh-auth denials do not trigger refresh. Refresh is not fresh authentication: for `reauth_required`, log out and start a new explicitly browser-approved login, or use a new named profile.
+
+Normal logout revokes the independent CLI session and removes its local credential only after confirmed success. A transport failure leaves the credential available for a later explicit attempt. An authentication rejection forgets it. `logout --local-only` is explicit local forgetting, not revocation; its JSON says `revoked:false` and the server session remains valid until separately revoked or expired.
+
+Revoke **all** sessions for this user on this backend only deliberately:
+
+```bash
+warmblyctl logout --server laptop --all --write \
+  --confirm 'POST /v1/auth/logout-all'
+```
+
+The server's existing logout-all behavior applies, including trusted-device forgetting. Matching local profiles for the same user and instance are removed; other instances and users are untouched. After device issuance, revoking the approving browser alone does not revoke the independently issued CLI session. Use normal session management or revoke-all.
+
+### Private credential files
+
+No supported OS keychain library is already used by this binary, so the fallback is an atomic `0600` credential file inside an owner-only `0700` directory. On Linux the location is `$XDG_CONFIG_HOME/warmblyctl/credentials.json`, or `$HOME/.config/warmblyctl/credentials.json`; on macOS it is under the user's `Library/Application Support/warmblyctl`. Tokens are plaintext secrets protected by filesystem ownership and modes, not encrypted by an application key.
+
+The client checks owner identity, regular-file type, exact permissions, and hard links. It refuses unsafe existing storage instead of silently fixing modes. Writes use a private temporary file, sync, atomic rename and directory sync. A pinned directory handle bounds file access. The owner-only lock file protects rotating refresh tokens from concurrent processes. Passwords are never accepted in remote argv or saved configuration. Do not copy this directory into a repository, diagnostic archive or another user's account.
+
+Existing configuration ancestors, including a symlinked home or config directory, resolve once to their canonical path before creating or opening storage. Every canonical ancestor must be owned by root or the effective user and refuse group/other writes, except a sticky directory such as `/tmp`. The final pinned credential directory must still be owned by the effective user with exactly `0700`; final-directory, lock-file and credential-file symlinks remain forbidden. Credential files require exactly `0600` and a single hard link. An untrusted target or dangling ancestor fails closed without creating credential storage.
+
+### Read-only operational helpers
+
+```bash
+warmblyctl admin --help
+warmblyctl admin workers list --server laptop
+warmblyctl admin workers stats --id <worker-uuid> --server laptop
+warmblyctl admin fleet nodes --server laptop
+warmblyctl admin fleet capacity --server laptop
+warmblyctl admin fleet decisions --server laptop
+warmblyctl admin logs --node-id <worker-uuid> --level warn --limit 100 --server laptop
+warmblyctl admin broker --node-id <worker-uuid> --server laptop
+warmblyctl admin mailbox list --q example.com --server laptop
+warmblyctl admin sync list --state stalled --server laptop
+warmblyctl admin sends in-flight --server laptop
+warmblyctl admin recovery dead-letters --status pending --server laptop
+warmblyctl admin recovery failures --server laptop
+warmblyctl admin recovery webhooks --server laptop
+warmblyctl admin jobs list --server laptop
+warmblyctl admin health monitoring --server laptop
+```
+
+Run `--help` after a helper for its typed UUID, time, enum and limit filters. Logs also accept `--after`, `--before` (inclusive RFC3339) and `--mailbox-id`. Lists with pagination accept the exact `next_cursor` returned by that endpoint, not page numbers. Helpers reject invalid filters before accessing credentials. Additional existing filters are available through the catalog request command below.
+
+Keep AI diagnosis read-only: inspect availability, coverage, observation timestamps, dropped events, recent evidence and scope before concluding there is an outage. Empty or unavailable evidence is not proof of health. Node logs are the backend's allowlisted partial event history, not raw journals or provider conversations. Existing workers without an enrollment-bound log credential need an upgrade and authenticated re-enrollment. Rerun the existing join script with the same configuration directory and options; it reads the existing node UUID and preserves local overrides, without deleting the fleet node, moving mailboxes or manually copying secrets. The service restarts. Upgrade alone cannot securely exchange a fleet-wide broker credential for a node-owned identity. Until capture is received, evidence stays unavailable; there is no historical backfill. See [the upgrade procedure](/development/data-control/#upgrade-order-and-coverage).
+
+Broker observations keep `commands` (this worker) separate from `results` (shared result consumer). Lag is committed-offset distance, not delivery success, throughput or proof that a particular worker is broken. Missing permissions, commits or dependencies remain explicitly unavailable. No command resets offsets.
+
+In-flight send rows retain `has_message_id` and age information but omit bodies, headers and free-form failure text. Do not infer that an unknown outcome was never sent from an empty log or a missing message ID. These commands cannot clear uncertain-send holds, disable mailboxes or silently resend.
+
+### Explicit recovery actions
+
+Every admin mutation requires the named action **and** `--write` **and** an exact `--confirm 'METHOD /admin/concrete-target-path'`, excluding query parameters. This is an operator safeguard, not a replacement for server permissions, MFA, fresh authentication or audit logs. There is no generic `--yes` or automatic retry of a write. Transport errors mean the action may have reached the server; inspect state before another attempt.
+
+Provider-throttle recovery and backfill restart use their existing server workflows, not unknown-send clearing:
+
+```bash
+warmblyctl admin recovery clear-throttle --id <mailbox-uuid> --server laptop \
+  --write --confirm 'POST /admin/sync/<mailbox-uuid>/clear-throttle'
+warmblyctl admin recovery restart-backfill --id <mailbox-uuid> --server laptop \
+  --write --confirm 'POST /admin/sync/<mailbox-uuid>/restart-backfill'
+```
+
+Substitute the same real canonical UUID in both places. Clearing a provider throttle can resume provider work; restarting backfill resets the existing sync backfill state. Neither action establishes sending authority.
+
+Dead-letter replay is never part of diagnosis. Only non-sending campaign wakeup passes can be replayed; send-capable dead letters remain pending until their outcome is independently reconciled through normal recovery. Inspect the task, mailbox, provider receipts and uncertain-send protections first. Replay additionally requires a separate risk acknowledgement:
+
+```bash
+warmblyctl admin recovery replay --id <dead-letter-uuid> --server laptop \
+  --write --acknowledge-send-risk \
+  --confirm 'POST /admin/tasks/dead-letters/<dead-letter-uuid>/replay'
+```
+
+Acknowledging risk does not prove the message was not delivered or override server recovery guards. Never replay an uncertain send solely because a CLI diagnostic has no evidence. Webhook lease recovery is separately available as `admin recovery reclaim-webhooks`, with exact confirmation for `POST /admin/webhooks/reclaim`.
+
+### Cataloged admin API requests
+
+```bash
+warmblyctl admin catalog
+warmblyctl admin api GET /admin/users --server laptop --query limit=25
+warmblyctl admin api GET /admin/instance/settings --server laptop
+warmblyctl admin api PUT /admin/workers/<worker-uuid>/tags --server laptop \
+  --data @worker-tags.json --write \
+  --confirm 'PUT /admin/workers/<worker-uuid>/tags'
+```
+
+The offline, deterministically sorted catalog lists every registered admin method and path template, permission names, fresh-auth requirement, read/write classification, replay-risk gate and unavailable reason. Replace parameter templates with canonical UUIDs, or bounded single-segment words for the few non-UUID parameters. The request command matches only that compiled inventory; it does not accept arbitrary URLs, `/v1` routes, traversal, encoded paths or made-up endpoints. Server guards remain authoritative even if the CLI catalog is older than the server.
+
+Supply `--query key=value` separately for each bounded filter. Mutating JSON input is a single object from `--data @file` or `--data -` for stdin, limited to 1 MiB, without duplicate keys or excessive nesting. Inline JSON is intentionally refused so passwords cannot enter argv. Input, headers and request bodies are not echoed. Responses must be JSON within 8 MiB; there is no raw-output or secret-reveal flag.
+
+Some catalog entries are discoverable but deliberately unavailable: browser device-consent endpoints, fleet join-token and tester credential issuance, binary export downloads and multipart imports, and arbitrary background-job execution. Use the existing browser or transfer/operator tools for those workflows. Unsupported entries fail before network or credential access, even with confirmation.
+
+### JSON, redaction and exit codes
+
+Remote success is one deterministic JSON value on stdout. Progress, approval codes, help and machine-readable errors are on stderr. Object keys are sorted by the JSON encoder; backend list ordering is preserved. Redaction projects only allowlisted diagnostic fields, canonical UUIDs, timestamps, typed enums, known broker scope names, validated cursors, numbers and booleans. Unknown fields are omitted and counted in `_redacted_fields`; arbitrary strings become `[REDACTED]`, including addresses and display names. No provider tokens, passwords, body, header, payload or free-form error subtree is exposed. The existing local emergency and public API commands keep their own documented output behavior unchanged.
+
+Monitoring preserves the compiled source and metric IDs, count units, severity, schema version and bounded coverage reasons so an AI client can identify each observation without free-form labels. New or unrecognized identifiers still fail closed; update the CLI when the backend adds a monitoring metric. Titles, notes, mailbox addresses and provider error text remain redacted.
+
+Errors preserve safe server `code`, HTTP `status` and `request_id`, but never raw backend messages, response bodies, response headers or transport errors. A numeric `retry_after_seconds` can accompany rate limiting.
+
+| Exit | Meaning |
+|---|---|
+| `0` | Successful command or help |
+| `2` | Invalid arguments, malformed input, invalid server selection or rejected HTTP 400 |
+| `3` | Permission, MFA, fresh-auth or device approval denied |
+| `4` | Login needed, expired/rejected session or invalid device identity |
+| `5` | Transport, service, unsafe storage or invalid response failure |
+| `6` | Rate limited |
+| `7` | Cancelled operation |
+| `8` | Missing write confirmation, missing replay-risk acknowledgement or unavailable catalog action |
+
+The [shared authentication reference](/api/authentication/) remains the backend contract. These CLI additions change neither admin permission bits nor organization API scopes.
 
 ## The operator commands
 
@@ -73,6 +233,17 @@ Inside the backend container all of these are already set, except the API key, w
 | [`user revoke-admin`](#user-revoke-admin) | Takes platform admin away from an account |
 | [`user disable-2fa`](#user-disable-2fa) | Clears an account's authenticator enrolment |
 | [`hash-password`](#hash-password) | Prints an argon2 hash for unattended provisioning |
+| [`fleet join-token`](#fleet) | Issues the token a machine needs to join the fleet |
+| [`fleet list`](#fleet) | Every worker and consumer: role, version, liveness and usage |
+| [`fleet version`](#fleet) | Shows or sets the version every node should run |
+| [`fleet channel`](#fleet) | Follows stable or dev releases, or holds the fleet |
+| [`fleet pin`](#fleet) | Holds one node at a version, to canary or hold it back |
+| [`fleet remove`](#fleet) | Forgets a node; its mailboxes re-place themselves |
+| [`backup`](#backup) | Writes the whole instance to one restorable bundle |
+| [`restore`](#restore) | Restores a bundle onto this instance, replacing everything on it |
+| [`keys status`](#keys) | Counts stored secrets by the key that opens them, and shows open grace windows |
+| [`keys reseal`](#keys) | Rewrites secrets a read key opens under the primary key |
+| [`keys generate`](#keys) | Prints fresh values for the instance-wide keys and tokens |
 | [`org list`](#org-list) | Lists the workspaces on this instance with their id, owner, and size |
 | [`org export`](#org-export) | Writes a whole workspace to a portable archive file |
 | [`org import`](#org-import) | Applies an archive to a workspace on this instance |
@@ -242,7 +413,7 @@ docker compose -p warmbly exec backend warmblyctl user grant-admin --email you@e
 
 The role replaces the account's existing mask rather than adding to it, and re-granting the role it already holds is reported as no change. The permissions are read from the session, so the account has to sign out and back in before the panel reflects the grant.
 
-The account must already exist. `make grant-admin EMAIL=... ROLE=...` wraps this for a compose install.
+The account must already exist. `make grant-admin EMAIL=... ROLE=...` wraps this for a compose install. The admin panel now offers the same under **Accounts > Admins**, by preset or per bit, so this command is no longer the only way to add a second admin.
 
 ## user revoke-admin
 
@@ -282,6 +453,95 @@ It prompts when a terminal is attached and reads the pipe when one is not, so th
 An argon2 PHC string contains `$` characters. Docker Compose reads those as interpolation, so a bare hash in `.env` silently loses part of itself. Wrap it in single quotes there, and double every `$` if you paste it into `docker-compose.yml` directly.
 </Callout>
 
+## backup
+
+```bash
+docker compose -p warmbly exec backend warmblyctl backup --out /data/blobs/warmbly.tar.gz
+docker compose -p warmbly cp backend:/data/blobs/warmbly.tar.gz ./warmbly.tar.gz \
+  && docker compose -p warmbly exec -T backend rm -f /data/blobs/warmbly.tar.gz
+```
+
+`/data/blobs` is the one path the container and the host both see, so it is the hand-off. Move the bundle out and delete it: `backup` excludes its own output from the archive, but a bundle left behind is swept into the next one. The delete is chained with `&&` so a failed copy cannot take the only copy with it.
+
+Writes one bundle holding the three things that only restore together: a `pg_dump` of the database, the blob root (message bodies, attachments, avatars), and the encryption keys.
+
+That combination is the whole reason this is a command rather than a documented list of steps. A dump alone restores an instance whose every mailbox credential decrypts to nothing, because the ciphertext is in the database and the key that opens it is in `.env`. The blob root alone restores bodies nothing points at.
+
+| Flag | Does |
+|---|---|
+| `--out` | Where to write it. Defaults to `warmbly-backup-<timestamp>.tar.gz` in the working directory |
+| `--no-keys` | Leaves the encryption keys out. The bundle is then not restorable on its own |
+| `--no-blobs` | Database only |
+| `--force` | Overwrite an existing output file |
+
+The bundle is written 0600 and holds every mailbox credential on the instance plus the keys that open them. Treat the file as you would the instance itself: encrypted at rest, off the host, and not in a shared drive.
+
+Blobs travel only on the filesystem provider. An instance storing them in S3 keeps them in the bucket, and the bundle says so rather than pretending to be complete.
+
+<Callout title="Schedule it">
+[`install.sh --wizard`](/development/install/) writes a `backup.sh` and a systemd timer that runs exactly this, keeps the last N bundles and can copy each one off the host.
+</Callout>
+
+## restore
+
+```bash
+docker compose -p warmbly exec backend warmblyctl restore --file /data/blobs/warmbly.tar.gz
+docker compose -p warmbly restart
+```
+
+Empties the schema and replays the bundle into it, so it replaces every organization, user, campaign and mailbox currently on the instance. It prints what the bundle holds and asks you to type `restore` before it does; `--yes` skips that for scripts.
+
+Before anything is written it compares the bundle's `CREDENTIALS_ENCRYPTION_KEY` and `KMS_LOCAL_MASTER_KEY` against this host's, and refuses to continue when they differ, printing the two lines to put in `.env` first. That check is the point of the command: without it a restore looks like it worked, and every mailbox fails to authenticate days later with no error that names the cause.
+
+| Flag | Does |
+|---|---|
+| `--file` | The bundle. Required |
+| `--yes` | Skip the typed confirmation |
+| `--no-blobs` | Restore the database only, leaving the blob root alone |
+| `--force` | Restore even though the keys differ. Accepts losing every stored mailbox credential |
+
+Blobs are unpacked over the blob root additively: files the bundle knows about are overwritten, anything else is left alone.
+
+Once the dump has loaded, the restore runs `ANALYZE`, because a dump carries no planner statistics. If that step fails the restore still completes and prints a warning; run `ANALYZE` in `psql` yourself afterwards.
+
+[Data control](/development/data-control/#moving-an-instance) walks the whole move to a new host.
+
+## keys
+
+```bash
+docker compose -p warmbly exec backend warmblyctl keys status
+docker compose -p warmbly exec backend warmblyctl keys reseal
+docker compose -p warmbly exec backend warmblyctl keys reseal --apply
+docker compose -p warmbly exec backend warmblyctl keys generate CREDENTIALS_ENCRYPTION_KEY
+```
+
+The tooling for [rotating instance keys](/development/configuration/#rotate-instance-keys). It reads `CREDENTIALS_ENCRYPTION_KEY` with `CREDENTIALS_ENCRYPTION_READ_KEYS`, and `TWOFA_SECRET` with `TWOFA_READ_SECRETS`, exactly as the backend does, so run it where the backend runs.
+
+`keys status` reads every column sealed under an instance-wide key (mailbox SMTP and IMAP credentials, OAuth tokens, webhook signing secrets, the Warmbly Cloud link, pending mailbox erasures and TOTP enrolments) and counts each value as one of:
+
+| State | Means |
+|---|---|
+| primary | Opens under the primary key. Nothing to do |
+| read key | Opens only under a read key. `keys reseal --apply` moves it to the primary |
+| workspace | Sealed under its workspace key, as mailbox credentials are with `MAILBOX_CREDENTIALS_SEALING=organization`. An instance key rotation does not touch it |
+| unsealed | Stored outside the sealed format, such as a legacy OAuth token or a `whsec_` webhook secret. The backend seals it on its next write |
+| unreadable | Sealed, but opens under no configured key. Left untouched by every command here |
+
+It also lists any `INTERNAL_API_PREVIOUS_UNTIL`, `NODE_BROKER_PREVIOUS_UNTIL` and `UNSUBSCRIBE_SIGNING_READ_UNTIL` window and whether it is still open.
+
+`keys reseal` is a dry run unless you pass `--apply`. With it, every value a read key opens is rewritten under the primary, one row at a time and only if the row still holds the value that was read, so a credential the backend changes meanwhile is never overwritten. It is safe to stop and run again: a later run picks up where values remain, and a run with nothing left to do writes nothing. Values the primary already opens, workspace-sealed values, unsealed values and unreadable values are never written.
+
+| Flag | Does |
+|---|---|
+| `--apply` | Write the resealed values. Without it, `reseal` reports what it would do |
+| `--batch` | Rows read per query, 1 to 10000. Defaults to 500 |
+| `--json` | Print the report as JSON (also on `keys status`) |
+| `--require-primary` | On `keys status`, also exit non-zero while any value opens only under a read key, which is the check that a read key can be retired |
+
+Both exit non-zero when any value is unreadable. Restore the key that sealed it as a read key before retiring anything; an unreadable mailbox credential is a mailbox that can no longer sign in.
+
+`keys generate` prints `NAME=value` lines for `CREDENTIALS_ENCRYPTION_KEY`, `AUTH_SECRET`, `TWOFA_SECRET`, `UNSUBSCRIBE_SIGNING_SECRET`, `DOMAIN_PROOF_SECRET`, `INTERNAL_API_TOKEN`, `NODE_BROKER_TOKEN` and `SECRET_KEY_BASE`, or only the names you pass. It changes nothing; where each value goes, and in what order, is the rotation procedure.
+
 ## org list
 
 ```bash
@@ -297,7 +557,7 @@ docker compose -p warmbly exec backend warmblyctl org export \
   --org you@example.com --out /tmp/workspace.warmbly.zip
 ```
 
-Writes one workspace to a single archive file: the organization, its members and roles, mailboxes, campaigns, sequences, contacts, suppression, CRM, inbox history, and the send state that stops a migrated mailbox from sending twice its daily volume on the day it moves. It is the same archive the dashboard produces under **Settings > Data**, so either side of a migration can use either tool.
+Writes one workspace to a single archive file: the organization, its members and roles, mailboxes, campaigns, sequences, contacts, suppression, CRM, inbox history, and the send state that stops a migrated mailbox from sending twice its daily volume on the day it moves. It is the same archive the dashboard produces under **Settings > Data**, so either side of a migration can use either tool. The admin panel now offers the same for any organization under **Instance > Transfers**.
 
 | Flag | Does |
 |---|---|
@@ -340,9 +600,11 @@ Applies an archive to a workspace on this instance. It always prints what the ar
 | `--passphrase-stdin` | Reads that passphrase from stdin |
 | `--dry-run` | Prints the report and writes nothing |
 
-Run it with `--dry-run` first. The report is the same preflight the dashboard shows, and it costs nothing.
+Run it with `--dry-run` first. The report is the same preflight the dashboard shows, and it costs nothing. The admin panel offers the same import, preflight included, under **Instance > Transfers**.
 
 The whole import runs in one transaction: if any part fails, nothing lands and the workspace is untouched. Members are matched to accounts on this instance by email address, and anyone without one has their rows reassigned to the workspace owner, named in the report before you commit. An archive carries no password material, so it can never create an account here.
+
+`org export` and `org import` are the per-workspace tool and [`backup`](#backup) is the instance-level one. They are not interchangeable: a bundle cannot be applied to one workspace, and a workspace archive cannot restore an instance.
 
 Billing history, plan overrides, worker placement, mailbox sync checkpoints and warmup pool membership are exported for the record but never applied: each belongs to the instance rather than to the workspace. [Export and import](/guides/workspace-export-import/) has the full table.
 
@@ -405,7 +667,7 @@ Paths are relative to `/v1`. `--data` takes a JSON literal, `-` for stdin, or `@
 
 ### For AI agents
 
-The repository ships skills under `skills/` (`warmbly-api` for the product, `warmbly-ops` for instance administration) that teach a coding agent these commands, the conventions above, and the sending-safety rules. Install them the way your agent expects, for example `cp -r skills/warmbly-api ~/.claude/skills/` for Claude Code, or point the agent at the `SKILL.md` directly. An agent given a scoped key and those skills can operate a workspace end to end without touching the database.
+The repository ships skills under `skills/` (`warmbly-cli` for the [`warmbly` CLI](/api/cli/), `warmbly-api` for the same product surface through `warmblyctl`, `warmbly-ops` for instance administration, `warmbly-install` for standing an instance up and moving it) that teach a coding agent these commands, the conventions above, and the sending-safety rules. Install them the way your agent expects, for example `cp -r skills/warmbly-api ~/.claude/skills/` for Claude Code, or point the agent at the `SKILL.md` directly. An agent given a scoped key and those skills can operate a workspace end to end without touching the database.
 
 ## When Redis is down
 
@@ -442,3 +704,81 @@ Every one of these runs `warmblyctl` inside the backend container of a compose i
 - [Export and import](/guides/workspace-export-import/) for what an archive contains and what deliberately does not travel
 - [Configuration reference](/development/configuration/) for every variable named here
 - [API authentication](/api/authentication/) and [permissions](/api/permissions/) for the keys and scopes the API commands run on
+
+## fleet
+
+Manages the machines running Warmbly. Every process on a machine you own is a node: a `worker` sends and syncs mail, a `consumer` processes events. Both enrol with a token, heartbeat, and pull the version the control plane tells them to run.
+
+Adding a machine is two commands:
+
+```bash
+warmblyctl fleet join-token
+```
+
+Then on the machine itself:
+
+```bash
+curl -fsSL https://<your-instance>/join.sh | sh -s -- \
+  --url https://<your-instance> --token <token> --role worker
+```
+
+The token is shown once. It joins any number of machines until it expires: seven days by default, or what `--ttl` sets, up to `720h`. Issuing another revokes the previous one; machines that already joined are unaffected. A machine presenting an expired token is refused, so issue a fresh one.
+
+```bash
+warmblyctl fleet list
+```
+
+```
+ROLE      NAME      STATE  VERSION           REGION      MEM    SEEN     ID
+worker    box-1     live   v1.4.2            eu-central  128MB  12s ago  de434ce4-...
+consumer  events-1  live   v1.0.0 -> v1.4.2  -           96MB   30s ago  2b334317-...
+```
+
+`STATE` is `live`, `unreachable` (enrolled but silent) or `stopped`. A version shown as `a -> b` has not picked up the target yet. `--role worker` narrows it; `--json` is machine-readable.
+
+Moving the fleet:
+
+```bash
+warmblyctl fleet version              # what the fleet should be on
+warmblyctl fleet version v1.4.2       # move everything to a tag
+warmblyctl fleet channel stable       # follow releases again
+warmblyctl fleet pin <node-id> v1.4.1 # hold or canary one machine
+warmblyctl fleet pin <node-id>        # clear that pin
+```
+
+Setting a tag also pins the channel, so a release landing later does not undo a deliberate rollback.
+
+`fleet version` moves every node at once. A rollout moves them in stages instead, and stops on the first sign of trouble:
+
+```bash
+warmblyctl fleet rollout start v1.4.3 --canary 1 --waves 50,100 --bake 30m
+warmblyctl fleet rollout status
+warmblyctl fleet rollout advance       # admit the next stage now, skipping the bake
+warmblyctl fleet rollout halt --reason "watching sync errors"
+warmblyctl fleet rollout abort         # forget the rollout, fleet stays on the old tag
+```
+
+A rollout admits the canary nodes alone, workers before consumers, and admits each wave only after every admitted node has reported the target and stayed up on it for the bake. Waves are cumulative percentages of the live, unpinned nodes. The backend checks the rollout every 30 seconds and halts it when an admitted node stops heartbeating, rolls itself back on the host, misses the target within `--deadline` (15 minutes by default) or keeps restarting. A halted rollout admits nobody else and sends the admitted nodes back to the version they came from. Until it finishes, the fleet target stays at that old version, so a backend that predates rollouts holds every node where it is. Pinned nodes are left out.
+
+| Flag | Does |
+|---|---|
+| `--canary` | Nodes admitted first, alone. Defaults to `1` |
+| `--waves` | Comma-separated cumulative percentages admitted after the canary. Defaults to `100` |
+| `--bake` | Healthy time on the target before the next stage. Defaults to `30m` |
+| `--deadline` | Time an admitted node has to report the target. Defaults to `15m` |
+| `--digests` | `image=sha256:...` pairs (`worker`, `worker-kafka`, `consumer`, `consumer-kafka`). A node then pulls that exact image rather than the tag |
+| `--json` | Machine-readable output, on every rollout command |
+
+The host updater checks each update itself too. A node restarted onto a new version that does not stay up for two minutes is put back on the image it ran, and reports the failure so the same version is not tried again.
+
+```bash
+warmblyctl fleet env-status
+```
+
+Lists every live node as `current` (it applied the env the control plane renders now), `stale` or `manual` (it does not [refresh its env](/development/configuration/#keeping-a-nodes-env-current)), and exits non-zero until every node is current. Run it where the backend runs, so it renders from the same configuration. A key rotation that reaches the fleet waits on it.
+
+```bash
+warmblyctl fleet remove <node-id>
+```
+
+Forgets a node. Any mailboxes it carried are re-placed within a few minutes. It does not stop the process: a machine still running re-joins on its next heartbeat, so stop the service there too.

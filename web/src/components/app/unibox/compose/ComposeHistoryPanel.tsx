@@ -5,7 +5,9 @@
 // of the inbox.
 
 import React from "react";
-import { useNavigate } from "react-router-dom";
+import useBrowseState from "@/hooks/useBrowseState";
+import { inboxHistoryTabSchema, inboxSearchSchema } from "@/lib/browse-inbox";
+import { useNavigate } from "@tanstack/react-router";
 import {
     ArrowUpRightIcon,
     HistoryIcon,
@@ -17,6 +19,7 @@ import type { UniboxListRow } from "@/lib/api/client/app/unibox/searchIncoming";
 import { SearchInput } from "@/components/ui/field";
 import { useAppStore } from "@/stores";
 import { cn } from "@/lib/utils";
+import { bareEmail } from "@/lib/helper/emailAddress";
 
 type HistoryTab = "all" | "sent";
 
@@ -29,13 +32,7 @@ interface ComposeHistoryPanelProps {
     affinityLine?: string;
 }
 
-function bareEmail(s: string): string {
-    const m = s.match(/<([^>]+)>/);
-    if (m) return m[1].trim();
-    return s.trim();
-}
-
-function formatWhen(iso: string): string {
+function formatWhen(iso: string | Date): string {
     const d = new Date(iso);
     const now = new Date();
     const sameYear = d.getFullYear() === now.getFullYear();
@@ -56,17 +53,21 @@ export default function ComposeHistoryPanel({
 }: ComposeHistoryPanelProps) {
     const navigate = useNavigate();
     const accounts = useAppStore((s) => s.emails);
-    const [tab, setTab] = React.useState<HistoryTab>("all");
-    const [search, setSearch] = React.useState("");
+    const identity = encodeURIComponent(bareEmail(address).trim().toLowerCase());
+    const [tab, setTab] = useBrowseState<HistoryTab>(`unibox.history.${identity}.tab`, "all", inboxHistoryTabSchema);
+    const [search, setSearch] = useBrowseState(`unibox.history.${identity}.search`, "", inboxSearchSchema);
 
     const q = useUniboxSearch(
         {
             address,
             direction: tab === "sent" ? "sent" : undefined,
             query: search.trim() || undefined,
-            // History is reference material: include snoozed threads too.
+            // History is reference material: include snoozed and filed
+            // threads too.
             snoozed: "any",
+            includeArchived: true,
         },
+        `history:${address}:${tab}`,
         !!address,
     );
 
@@ -142,7 +143,10 @@ export default function ComposeHistoryPanel({
                             key={row.id}
                             type="button"
                             onClick={() =>
-                                navigate(`/app/unibox/all/${encodeURIComponent(row.thread_id || row.id)}`)
+                                navigate({
+                                    to: "/app/unibox/{-$scope}/{-$threadId}",
+                                    params: { scope: "all", threadId: row.thread_id || row.id },
+                                })
                             }
                             className="w-full px-3 py-2 flex items-start gap-2 text-left border-b border-slate-50 hover:bg-slate-50 transition-colors group"
                         >

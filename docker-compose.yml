@@ -35,6 +35,19 @@
 #
 # To run on Kafka + S3 instead, set the provider vars above and rebuild the Go
 # images with --build-arg GO_TAGS=kafka (tracking: --build-arg CARGO_FEATURES=kafka).
+#
+# EVERY APP SERVICE CARRIES BOTH image: AND build:, so this one file serves both
+# installs. `docker compose pull && docker compose up -d` runs the published
+# release images and compiles nothing; `docker compose up --build` still builds
+# from this checkout. Pin a release with WARMBLY_TAG=v1.4.2 in .env, or point
+# WARMBLY_IMAGE_PREFIX at your own registry.
+#
+# EVERY STORE'S VOLUME SOURCE IS A VARIABLE. Compose reads a source starting
+# with / or . as a bind mount and anything else as a named volume, so
+# WARMBLY_PG_DATA=/mnt/ssd/warmbly/postgres puts the database on a path you can
+# rsync and snapshot, while the default keeps the named volume. The full set is
+# WARMBLY_PG_DATA, WARMBLY_REDIS_DATA, WARMBLY_NATS_DATA, WARMBLY_BLOBS,
+# WARMBLY_WORKER_STATE and WARMBLY_UPDATER_STATE.
 
 # Everything below is overridable from a single .env next to this file. The
 # defaults are the no-cloud stack, so an empty .env still boots; set only what
@@ -61,6 +74,7 @@ x-selfhost-env: &selfhost-env
   KMS_LOCAL_MASTER_KEY: ${KMS_LOCAL_MASTER_KEY:-Xr0JA7gqF2POy29a7MRByyqddivTNt8WOyKsOXklazk=}
   KMS_AWS_KEY_ID: ${KMS_AWS_KEY_ID:-}
   CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  CREDENTIALS_ENCRYPTION_READ_KEYS: ${CREDENTIALS_ENCRYPTION_READ_KEYS:-}
 
   # Blob storage. s3 also needs BLOB_BUCKET + the AWS_* values below.
   BLOB_PROVIDER: ${BLOB_PROVIDER:-filesystem}
@@ -179,7 +193,21 @@ x-selfhost-env: &selfhost-env
   PRIMARY_DB: ${PRIMARY_DB:-postgres://warmbly:warmbly@postgres:5432/warmbly_dev?sslmode=disable}
   REDIS: ${REDIS:-redis://redis:6379}
   AUTH_SECRET: ${AUTH_SECRET:-local-dev-auth-secret-minimum-32-characters-long}
+  TWOFA_SECRET: ${TWOFA_SECRET:-}
+  TWOFA_READ_SECRETS: ${TWOFA_READ_SECRETS:-}
+  UNSUBSCRIBE_SIGNING_SECRET: ${UNSUBSCRIBE_SIGNING_SECRET:-}
+  UNSUBSCRIBE_SIGNING_READ_SECRETS: ${UNSUBSCRIBE_SIGNING_READ_SECRETS:-}
+  UNSUBSCRIBE_SIGNING_READ_UNTIL: ${UNSUBSCRIBE_SIGNING_READ_UNTIL:-}
+  DOMAIN_PROOF_SECRET: ${DOMAIN_PROOF_SECRET:-}
   INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local-dev-internal-token}
+  INTERNAL_API_PREVIOUS_TOKENS: ${INTERNAL_API_PREVIOUS_TOKENS:-}
+  INTERNAL_API_PREVIOUS_UNTIL: ${INTERNAL_API_PREVIOUS_UNTIL:-}
+  # The broker routes (open a data key, sign a blob operation, mint a managed
+  # mailbox's access token). Optional; empty falls back to the token above, and
+  # every service that needs it reads it from here so the two never disagree.
+  NODE_BROKER_TOKEN: ${NODE_BROKER_TOKEN:-}
+  NODE_BROKER_PREVIOUS_TOKENS: ${NODE_BROKER_PREVIOUS_TOKENS:-}
+  NODE_BROKER_PREVIOUS_UNTIL: ${NODE_BROKER_PREVIOUS_UNTIL:-}
 
   # AI assistant. Omit AI_PROVIDER to run with AI off (endpoints return 503).
   AI_PROVIDER: ${AI_PROVIDER:-}
@@ -189,9 +217,22 @@ x-selfhost-env: &selfhost-env
   AI_MODEL_PAID: ${AI_MODEL_PAID:-}
   AI_BASE_URL: ${AI_BASE_URL:-}
   AI_FREE: ${AI_FREE:-}
+
+  # Pre-send verification. The HELO name must be a public FQDN for this host,
+  # or the probe is skipped and every address stays unknown.
+  EMAIL_VERIFY_HELO_HOST: ${EMAIL_VERIFY_HELO_HOST:-}
+  EMAIL_VERIFY_MAIL_FROM: ${EMAIL_VERIFY_MAIL_FROM:-}
+  EMAIL_VERIFY_MILLIONVERIFIER_API_KEY: ${EMAIL_VERIFY_MILLIONVERIFIER_API_KEY:-}
+
   SEARCH_PROVIDER: ${SEARCH_PROVIDER:-}
   SEARCH_API_URL: ${SEARCH_API_URL:-}
   SEARCH_API_KEY: ${SEARCH_API_KEY:-}
+
+  # Slack app. The OAuth pair lets workspaces connect for notifications; the
+  # signing secret turns on the assistant, the inbox and buttons.
+  SLACK_OAUTH_CLIENT_ID: ${SLACK_OAUTH_CLIENT_ID:-}
+  SLACK_OAUTH_CLIENT_SECRET: ${SLACK_OAUTH_CLIENT_SECRET:-}
+  SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
 
   # Mobile push. Partial config disables push with a warning, never a crash.
   APNS_KEY: ${APNS_KEY:-}
@@ -201,6 +242,16 @@ x-selfhost-env: &selfhost-env
   NOTIFICATION_PUSH_WINDOW: ${NOTIFICATION_PUSH_WINDOW:-}
   NOTIFICATION_EMAIL_DAILY_CAP: ${NOTIFICATION_EMAIL_DAILY_CAP:-}
 
+  # Error tracking and server-side product analytics, one key for both. Unset
+  # (the default, and what every self-host has) means no client is built and
+  # nothing is ever sent. POSTHOG_ERROR_TRACKING=false keeps the key for
+  # analytics and reports no exceptions, which is what an instance already
+  # reporting to Sentry wants.
+  POSTHOG_KEY: ${POSTHOG_KEY:-}
+  POSTHOG_HOST: ${POSTHOG_HOST:-}
+  POSTHOG_ERROR_TRACKING: ${POSTHOG_ERROR_TRACKING:-}
+
+  # The other error-tracking backend. Either, both or neither.
   SENTRY_DSN: ${SENTRY_DSN:-}
 
 services:
@@ -216,7 +267,7 @@ services:
       POSTGRES_DB: warmbly_dev
     ports: ["15432:5432"]
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${WARMBLY_PG_DATA:-postgres_data}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U warmbly"]
       interval: 5s
@@ -228,7 +279,7 @@ services:
     image: redis:7-alpine
     ports: ["16379:6379"]
     volumes:
-      - redis_data:/data
+      - ${WARMBLY_REDIS_DATA:-redis_data}:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -242,7 +293,7 @@ services:
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports: ["4222:4222", "8222:8222"]
     volumes:
-      - nats_data:/data
+      - ${WARMBLY_NATS_DATA:-nats_data}:/data
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
       interval: 5s
@@ -295,9 +346,16 @@ services:
 
   backend:
     restart: unless-stopped
+    # Time for a connect or send in flight to finish before a stop kills it.
+    stop_grace_period: 60s
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/backend:${WARMBLY_TAG:-prod}
     build:
       context: .
       dockerfile: deploy/docker/backend.Dockerfile
+      args:
+        VERSION: ${WARMBLY_BUILD_VERSION:-}
+        COMMIT: ${WARMBLY_BUILD_COMMIT:-}
+        BUILT_AT: ${WARMBLY_BUILD_TIME:-}
     ports: ["8080:8080"]
     environment:
       <<: *selfhost-env
@@ -317,12 +375,24 @@ services:
       # every notification and digest email in this stack.
       TRACKING_DOMAIN: ${TRACKING_DOMAIN:-${PUBLIC_HOST:-localhost}:3000}
       GEODB_PATH: ${GEODB_PATH:-/app/data/GeoLite2-City.mmdb}
+      GEODB_URL: ${GEODB_URL:-}
+      # Automatic inbox tagging. Optional and off: the backend only serves the
+      # review page from it, the consumer does the classifying. Both halves are
+      # required, so an instance that sets neither never reaches the network.
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      INBOX_TAGGING_ENABLED: ${INBOX_TAGGING_ENABLED:-false}
       # Gmail mailbox OAuth (leave unset to connect only SMTP/IMAP + Outlook
       # mailboxes). See the self-hosting docs for the Google Cloud setup.
       BOX_GOOGLE_CLIENT_ID: ${BOX_GOOGLE_CLIENT_ID:-}
       BOX_GOOGLE_CLIENT_SECRET: ${BOX_GOOGLE_CLIENT_SECRET:-}
+      BOX_GOOGLE_OAUTH_CONNECT: ${BOX_GOOGLE_OAUTH_CONNECT:-}
       BOX_OUTLOOK_CLIENT_ID: ${BOX_OUTLOOK_CLIENT_ID:-}
       BOX_OUTLOOK_CLIENT_SECRET: ${BOX_OUTLOOK_CLIENT_SECRET:-}
+      # Whole Google Workspace domains: the service account key, inline or as a
+      # path (mount the file read-only). Unset hides that connect method.
+      GOOGLE_WORKSPACE_DELEGATION_KEY: ${GOOGLE_WORKSPACE_DELEGATION_KEY:-}
+      GOOGLE_WORKSPACE_DELEGATION_KEY_FILE: ${GOOGLE_WORKSPACE_DELEGATION_KEY_FILE:-}
+      MAILHOST_ISPDB: ${MAILHOST_ISPDB:-false}
       # Sign in with Google / Apple. Separate from the BOX_* mailbox clients
       # above; email+password and passkeys work without any of these.
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
@@ -340,8 +410,21 @@ services:
       WEBAUTHN_RP_ORIGINS: ${WEBAUTHN_RP_ORIGINS:-}
       # Worker image the orchestrator installs on remote machines.
       WORKER_IMAGE: ${WORKER_IMAGE:-}
+      # Update indicator: polls GitHub Releases and shows a newer version in the
+      # admin panel's top bar. Applying it goes through the updater service
+      # below. The address is always set because a profile cannot be tested
+      # here; with the profile off the host does not resolve and the backend
+      # reports the updater as not running (report-only), never as broken.
+      # UPDATER_URL=none in .env turns the button off explicitly.
+      UPDATE_CHECK_ENABLED: ${UPDATE_CHECK_ENABLED:-true}
+      UPDATE_CHECK_INTERVAL: ${UPDATE_CHECK_INTERVAL:-30m}
+      UPDATE_CHANNEL: ${UPDATE_CHANNEL:-stable}
+      RELEASES_GITHUB_REPO: ${RELEASES_GITHUB_REPO:-warmbly/warmbly}
+      RELEASES_GITHUB_TOKEN: ${RELEASES_GITHUB_TOKEN:-}
+      UPDATER_URL: ${UPDATER_URL:-http://updater:8095}
+      UPDATER_TOKEN: ${UPDATER_TOKEN:-${INTERNAL_API_TOKEN:-local-dev-internal-token}}
     volumes:
-      - blobs:/data/blobs
+      - ${WARMBLY_BLOBS:-blobs}:/data/blobs
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -357,9 +440,14 @@ services:
   # database; the backend's internal API is its only dependency.
   forms:
     restart: unless-stopped
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/forms:${WARMBLY_TAG:-prod}
     build:
       context: .
       dockerfile: deploy/docker/forms.Dockerfile
+      args:
+        VERSION: ${WARMBLY_BUILD_VERSION:-}
+        COMMIT: ${WARMBLY_BUILD_COMMIT:-}
+        BUILT_AT: ${WARMBLY_BUILD_TIME:-}
     ports: ["${FORMS_PORT:-8090}:8090"]
     environment:
       GIN_MODE: release
@@ -370,6 +458,19 @@ services:
       # container via host.docker.internal, mirroring the tracking service.
       BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://backend:8080}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-local-dev-internal-token}
+      APP_ENV: ${APP_ENV:-dev}
+      # Two audiences, two sets of credentials: the bare names are this Go
+      # process, and the WARMBLY_ ones are stamped into the public form page
+      # for the browser app. All unset means neither reports and no host is
+      # contacted.
+      POSTHOG_KEY: ${POSTHOG_KEY:-}
+      POSTHOG_HOST: ${POSTHOG_HOST:-}
+      POSTHOG_ERROR_TRACKING: ${POSTHOG_ERROR_TRACKING:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      WARMBLY_POSTHOG_KEY: ${WARMBLY_POSTHOG_KEY:-}
+      WARMBLY_POSTHOG_HOST: ${WARMBLY_POSTHOG_HOST:-}
+      WARMBLY_POSTHOG_ERROR_TRACKING: ${WARMBLY_POSTHOG_ERROR_TRACKING:-}
+      WARMBLY_SENTRY_DSN: ${WARMBLY_SENTRY_DSN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -383,14 +484,30 @@ services:
 
   consumer:
     restart: unless-stopped
+    # Time for a connect or send in flight to finish before a stop kills it.
+    stop_grace_period: 60s
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/consumer:${WARMBLY_TAG:-prod}
     build:
       context: .
       dockerfile: deploy/docker/consumer.Dockerfile
+      args:
+        VERSION: ${WARMBLY_BUILD_VERSION:-}
+        COMMIT: ${WARMBLY_BUILD_COMMIT:-}
+        BUILT_AT: ${WARMBLY_BUILD_TIME:-}
     environment:
       <<: *selfhost-env
       ENCRYPTED_KEYS_PROVIDER: postgres
+      # Optional, as on the backend: turns an open or click's network into a
+      # country and city on the contact's timeline.
+      GEODB_PATH: ${GEODB_PATH:-/app/data/GeoLite2-City.mmdb}
+      GEODB_URL: ${GEODB_URL:-}
+      # Automatic inbox tagging. This is where inbound mail is classified, so a
+      # key set only here still works; the backend needs it to report whether
+      # the feature is on. Off unless both are set.
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      INBOX_TAGGING_ENABLED: ${INBOX_TAGGING_ENABLED:-false}
     volumes:
-      - blobs:/data/blobs
+      - ${WARMBLY_BLOBS:-blobs}:/data/blobs
     depends_on:
       backend: { condition: service_healthy }
       nats: { condition: service_healthy }
@@ -400,13 +517,21 @@ services:
   # belong to the mail provider, so more workers = more parallelism, not more IPs.
   worker:
     restart: unless-stopped
+    # Time for a connect or send in flight to finish before a stop kills it.
+    stop_grace_period: 60s
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/worker:${WARMBLY_TAG:-prod}
     build:
       context: .
       dockerfile: deploy/docker/worker.Dockerfile
+      args:
+        VERSION: ${WARMBLY_BUILD_VERSION:-}
+        COMMIT: ${WARMBLY_BUILD_COMMIT:-}
+        BUILT_AT: ${WARMBLY_BUILD_TIME:-}
     environment:
       <<: *selfhost-env
       # Dovecot in the sandbox profile uses a self-signed cert. Set
-      # MAIL_TLS_INSECURE=false once you only connect real mailboxes.
+      # MAIL_TLS_INSECURE=false once you only connect real mailboxes; one on a
+      # self-signed server can then opt out in its own settings, pinning its key.
       MAIL_TLS_INSECURE: ${MAIL_TLS_INSECURE:-true}
       ENCRYPTED_KEYS_PROVIDER: http
       ENCRYPTED_KEYS_BACKEND_URL: ${ENCRYPTED_KEYS_BACKEND_URL:-http://backend:8080}
@@ -416,21 +541,21 @@ services:
       # so ids survive container recreates and --scale still works.
       WORKER_ID: ${WORKER_ID:-}
       WORKER_STATE_DIR: ${WORKER_STATE_DIR:-/data/state}
-      WORKER_TIER: ${WORKER_TIER:-}
-      WORKER_EGRESS_KIND: ${WORKER_EGRESS_KIND:-}
+      WARMBLY_NODE_REGION: ${WARMBLY_NODE_REGION:-}
       BOX_GOOGLE_CLIENT_ID: ${BOX_GOOGLE_CLIENT_ID:-}
       BOX_GOOGLE_CLIENT_SECRET: ${BOX_GOOGLE_CLIENT_SECRET:-}
       BOX_OUTLOOK_CLIENT_ID: ${BOX_OUTLOOK_CLIENT_ID:-}
       BOX_OUTLOOK_CLIENT_SECRET: ${BOX_OUTLOOK_CLIENT_SECRET:-}
     volumes:
-      - blobs:/data/blobs
-      - worker_state:/data/state
+      - ${WARMBLY_BLOBS:-blobs}:/data/blobs
+      - ${WARMBLY_WORKER_STATE:-worker_state}:/data/state
     depends_on:
       backend: { condition: service_healthy }
       nats: { condition: service_healthy }
 
   tracking:
     restart: unless-stopped
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/tracking:${WARMBLY_TAG:-prod}
     build:
       context: ./tracking
       dockerfile: Dockerfile
@@ -451,6 +576,22 @@ services:
       TRACKING_PAGEHIT_RATE_LIMIT_PER_MIN: ${TRACKING_PAGEHIT_RATE_LIMIT_PER_MIN:-}
       TRACKING_TRUSTED_PROXIES: ${TRACKING_TRUSTED_PROXIES:-}
       TRACKING_CLIENT_IP_HEADER: ${TRACKING_CLIENT_IP_HEADER:-}
+      TRACKING_SCANNER_BUILTINS: ${TRACKING_SCANNER_BUILTINS:-}
+      TRACKING_SCANNER_NETWORKS: ${TRACKING_SCANNER_NETWORKS:-}
+      TRACKING_SCANNER_CLICK_NETWORKS: ${TRACKING_SCANNER_CLICK_NETWORKS:-}
+      TRACKING_SCANNER_ASN_HEADER: ${TRACKING_SCANNER_ASN_HEADER:-}
+      # A GeoLite2-ASN database, which makes the catalogue's asn: entries match
+      # with no edge configuration. Left unset by default because the file has
+      # to be mounted in: point it at a path inside the container and bind the
+      # file there. Separate from GEODB_PATH, which is the City database.
+      TRACKING_SCANNER_ASN_DB: ${TRACKING_SCANNER_ASN_DB:-}
+      # Or let the service fetch that database itself, which is what a host with
+      # nothing to bind a file from needs. Held in memory, so no writable path.
+      TRACKING_SCANNER_ASN_DB_URL: ${TRACKING_SCANNER_ASN_DB_URL:-}
+      TRACKING_IP_HASH_KEY: ${TRACKING_IP_HASH_KEY:-}
+      POSTHOG_KEY: ${POSTHOG_KEY:-}
+      POSTHOG_HOST: ${POSTHOG_HOST:-}
+      POSTHOG_ERROR_TRACKING: ${POSTHOG_ERROR_TRACKING:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
       # Overridable so `make dev` (native backend) can point at
       # host.docker.internal:8080 while `docker compose up` uses the container.
@@ -463,6 +604,7 @@ services:
 
   realtime:
     restart: unless-stopped
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/realtime:${WARMBLY_TAG:-prod}
     build:
       context: .
       dockerfile: deploy/docker/realtime.Dockerfile
@@ -478,12 +620,26 @@ services:
       JWT_SECRET: ${AUTH_SECRET:-local-dev-auth-secret-minimum-32-characters-long}
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:-local-development-secret-key-base-minimum-64-characters-for-phoenix}
       PUBSUB_ENABLED: ${PUBSUB_ENABLED:-false}
-      # Behind a reverse proxy set CHECK_ORIGIN=true once PHX_HOST matches the
-      # public websocket hostname.
+      # The origins a browser connects FROM, comma separated, e.g.
+      # "https://app.example.com,https://admin.example.com". Not this service's
+      # own host: the browser's Origin on a websocket upgrade is the dashboard's.
+      # Empty leaves the check off, which is right for a LAN install where the
+      # origin is whatever host was typed; the socket still requires a
+      # short-lived ticket either way.
+      CHECK_ORIGIN_HOSTS: ${CHECK_ORIGIN_HOSTS:-}
+      # Legacy host-based form, consulted only when CHECK_ORIGIN_HOSTS is empty.
       CHECK_ORIGIN: ${CHECK_ORIGIN:-false}
+      # The environment label events are tagged with, matching every other
+      # service in this file.
+      APP_ENV: ${APP_ENV:-dev}
+      POSTHOG_KEY: ${POSTHOG_KEY:-}
+      POSTHOG_HOST: ${POSTHOG_HOST:-}
+      POSTHOG_ERROR_TRACKING: ${POSTHOG_ERROR_TRACKING:-}
     # SENTRY_DSN deliberately arrives via env_file, not the mapping above: the
     # Elixir Sentry library reads the variable itself and refuses to start on an
-    # empty string, so it has to be genuinely absent rather than "".
+    # empty string, so it has to be genuinely absent rather than "". The PostHog
+    # names above are safe in the mapping because the config reads them itself
+    # and treats a blank value as unset.
     env_file:
       - path: .env
         required: false
@@ -497,6 +653,7 @@ services:
   # use `make app` / docker-compose.dev.yml instead.
   web:
     restart: unless-stopped
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/web:${WARMBLY_TAG:-prod}
     build:
       context: ./web
       dockerfile: Dockerfile
@@ -504,15 +661,30 @@ services:
     environment:
       WARMBLY_API_URL: ${API_PUBLIC_URL:-http://${PUBLIC_HOST:-localhost}:8080}
       WARMBLY_APP_URL: ${APP_URL:-http://${PUBLIC_HOST:-localhost}:5173}
+      WARMBLY_GMAIL_OAUTH_CONNECT: ${WARMBLY_GMAIL_OAUTH_CONNECT:-false}
       # Cloudflare's always-pass test key keeps the widget satisfied while
       # captcha is off server-side. Set WARMBLY_TURNSTILE_KEY to your site key
       # when you set CAPTCHA_PROVIDER=turnstile.
       WARMBLY_TURNSTILE_KEY: ${WARMBLY_TURNSTILE_KEY:-1x00000000000000000000AA}
+      # Cookieless product analytics and browser error tracking, one key for
+      # both. Unset (the default, and what every self-host has) means the SDK
+      # chunk is never fetched and no PostHog host is contacted.
+      WARMBLY_POSTHOG_KEY: ${WARMBLY_POSTHOG_KEY:-}
+      WARMBLY_POSTHOG_HOST: ${WARMBLY_POSTHOG_HOST:-}
+      WARMBLY_POSTHOG_ERROR_TRACKING: ${WARMBLY_POSTHOG_ERROR_TRACKING:-}
+      WARMBLY_POSTHOG_SESSION_REPLAY: ${WARMBLY_POSTHOG_SESSION_REPLAY:-}
+      # The other error-tracking backend. Unset means the dashboard contacts no
+      # Sentry host. Point it at your own project to collect browser errors.
+      WARMBLY_SENTRY_DSN: ${WARMBLY_SENTRY_DSN:-}
+      # Company logos on contacts: the browser asks DuckDuckGo for a company
+      # domain's favicon. Unset is off on a self-host; "on" turns it on.
+      WARMBLY_COMPANY_LOGOS: ${WARMBLY_COMPANY_LOGOS:-}
     depends_on:
       backend: { condition: service_healthy }
 
   admin:
     restart: unless-stopped
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/admin:${WARMBLY_TAG:-prod}
     build:
       context: ./admin
       dockerfile: Dockerfile
@@ -522,16 +694,67 @@ services:
       WARMBLY_DASHBOARD_URL: ${APP_URL:-http://${PUBLIC_HOST:-localhost}:5173}
       WARMBLY_ENV_LABEL: ${ENV_LABEL:-development}
       WARMBLY_TURNSTILE_KEY: ${WARMBLY_TURNSTILE_KEY:-1x00000000000000000000AA}
+      # Unset means the panel initialises no error reporting and contacts no
+      # host at all, exactly like the dashboard above. The panel reports only
+      # exceptions: it measures nothing about an operator's session.
+      WARMBLY_POSTHOG_KEY: ${WARMBLY_POSTHOG_KEY:-}
+      WARMBLY_POSTHOG_HOST: ${WARMBLY_POSTHOG_HOST:-}
+      WARMBLY_POSTHOG_ERROR_TRACKING: ${WARMBLY_POSTHOG_ERROR_TRACKING:-}
+      WARMBLY_POSTHOG_SESSION_REPLAY: ${WARMBLY_POSTHOG_SESSION_REPLAY:-}
+      WARMBLY_SENTRY_DSN: ${WARMBLY_SENTRY_DSN:-}
     depends_on:
       backend: { condition: service_healthy }
+
+  # One-click updates from the admin panel (the version pill in the top bar).
+  # Pulls this checkout, rebuilds the images and recreates the containers when
+  # the backend asks, then waits for the backend to answer again. It holds the
+  # docker socket, which is root on this host, so it only runs under the
+  # "updater" profile: `make up` enables it, and COMPOSE_PROFILES=updater in
+  # .env does the same for a plain `docker compose up`. Leave the profile off
+  # to update by hand with `git pull && make up`.
+  updater:
+    restart: unless-stopped
+    image: ${WARMBLY_IMAGE_PREFIX:-ghcr.io/warmbly/warmbly}/updater:${WARMBLY_TAG:-prod}
+    build:
+      context: .
+      dockerfile: deploy/docker/updater.Dockerfile
+      args:
+        VERSION: ${WARMBLY_BUILD_VERSION:-}
+        COMMIT: ${WARMBLY_BUILD_COMMIT:-}
+        BUILT_AT: ${WARMBLY_BUILD_TIME:-}
+    environment:
+      UPDATER_TOKEN: ${UPDATER_TOKEN:-${INTERNAL_API_TOKEN:-local-dev-internal-token}}
+      # The checkout is mounted at its host path so the compose file's relative
+      # paths resolve identically inside and outside the container.
+      UPDATER_REPO_DIR: ${WARMBLY_REPO_DIR:-${PWD}}
+      UPDATER_COMPOSE_PROJECT: warmbly
+      UPDATER_BACKEND_HEALTH_URL: http://backend:8080/health
+      UPDATER_FETCH_INTERVAL: ${UPDATER_FETCH_INTERVAL:-30m}
+      UPDATER_PRUNE: ${UPDATER_PRUNE:-true}
+      UPDATER_ALLOW_DIRTY: ${UPDATER_ALLOW_DIRTY:-false}
+    working_dir: ${WARMBLY_REPO_DIR:-${PWD}}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${WARMBLY_REPO_DIR:-${PWD}}:${WARMBLY_REPO_DIR:-${PWD}}
+      - ${WARMBLY_UPDATER_STATE:-updater_state}:/var/lib/warmbly-updater
+    profiles: ["updater"]
 
   # ─── one-shots ────────────────────────────────────────────────────────
 
   # Optional demo seed. Run explicitly: docker compose --profile seed run --rm seed
+  # Build-only on purpose, unlike every service above. The seed is not a
+  # published image (it plants a known super-admin credential, so it must never
+  # be one `docker compose pull` away on a real host), and sharing the backend's
+  # image tag would mean `make seed-demo` retagged the image the running backend
+  # was created from.
   seed:
     build:
       context: .
       dockerfile: deploy/docker/backend.Dockerfile
+      args:
+        VERSION: ${WARMBLY_BUILD_VERSION:-}
+        COMMIT: ${WARMBLY_BUILD_COMMIT:-}
+        BUILT_AT: ${WARMBLY_BUILD_TIME:-}
     entrypoint: ["/app/seed"]
     environment:
       <<: *selfhost-env
@@ -543,9 +766,13 @@ services:
       backend: { condition: service_healthy }
     profiles: ["seed"]
 
+# Declared for the defaults. A store pointed at a host path by its
+# WARMBLY_*_DATA variable simply stops using the named volume below; an unused
+# declaration costs nothing and keeps switching back a one-line .env edit.
 volumes:
   postgres_data:
   redis_data:
   nats_data:
   blobs:
   worker_state:
+  updater_state:

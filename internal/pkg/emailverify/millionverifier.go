@@ -29,13 +29,6 @@ const (
 	millionVerifierProbeTimeout = 15
 )
 
-var (
-	// ErrMillionVerifierKey is returned when the API rejects the key.
-	ErrMillionVerifierKey = errors.New("millionverifier rejected the API key")
-	// ErrMillionVerifierCredits is returned when the account is out of credits.
-	ErrMillionVerifierCredits = errors.New("millionverifier account has no credits left")
-)
-
 // NewMillionVerifier constructs the client. baseURL is overridable for tests.
 func NewMillionVerifier(apiKey string, baseURL string) *MillionVerifier {
 	if baseURL == "" {
@@ -44,7 +37,7 @@ func NewMillionVerifier(apiKey string, baseURL string) *MillionVerifier {
 	return &MillionVerifier{
 		apiKey:  strings.TrimSpace(apiKey),
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{Timeout: millionVerifierTimeout},
+		client:  &http.Client{Timeout: millionVerifierTimeout, CheckRedirect: refuseInsecureRedirect},
 	}
 }
 
@@ -61,8 +54,11 @@ type mvSingleResponse struct {
 }
 
 type mvCreditsResponse struct {
-	Credits int    `json:"credits"`
-	Error   string `json:"error"`
+	Credits int `json:"credits"`
+	// RenewingCredits is a subscription's allowance, which real-time checks
+	// also draw on; an account living on one reports zero Credits.
+	RenewingCredits int    `json:"renewing_credits"`
+	Error           string `json:"error"`
 }
 
 // Verify implements Verifier. An API failure is never an "invalid" verdict:
@@ -84,11 +80,13 @@ func (m *MillionVerifier) Check(ctx context.Context, email string) (Result, erro
 	q.Set("timeout", fmt.Sprintf("%d", millionVerifierProbeTimeout))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.baseURL+"/api/v3/?"+q.Encode(), nil)
 	if err != nil {
+		err = withoutURL(err)
 		res.Reason = "millionverifier request failed: " + err.Error()
 		return res, err
 	}
 	resp, err := m.client.Do(req)
 	if err != nil {
+		err = withoutURL(err)
 		res.Reason = "millionverifier unreachable: " + err.Error()
 		return res, err
 	}
@@ -96,7 +94,7 @@ func (m *MillionVerifier) Check(ctx context.Context, email string) (Result, erro
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		res.Reason = "millionverifier rejected the API key"
-		return res, ErrMillionVerifierKey
+		return res, ErrProviderKey
 	}
 	if resp.StatusCode != http.StatusOK {
 		res.Reason = fmt.Sprintf("millionverifier answered HTTP %d", resp.StatusCode)
@@ -131,22 +129,33 @@ func (m *MillionVerifier) Check(ctx context.Context, email string) (Result, erro
 	return res, nil
 }
 
-// Credits returns the account's remaining credits, and validates the key.
+// ObservesBalance is true: the credits endpoint reports the balance, so an
+// exhausted account is visible without spending anything.
+func (m *MillionVerifier) ObservesBalance() bool { return true }
+
+// Account validates the key and returns the remaining credits.
+func (m *MillionVerifier) Account(ctx context.Context) (*int, error) {
+	n, err := m.Credits(ctx)
+	return &n, err
+}
+
+// Credits returns the credits a real-time check can spend (pay-as-you-go plus
+// a subscription's renewing allowance), and validates the key.
 func (m *MillionVerifier) Credits(ctx context.Context) (int, error) {
 	q := url.Values{}
 	q.Set("api", m.apiKey)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.baseURL+"/api/v3/credits?"+q.Encode(), nil)
 	if err != nil {
-		return 0, err
+		return 0, withoutURL(err)
 	}
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, withoutURL(err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return 0, ErrMillionVerifierKey
+		return 0, ErrProviderKey
 	}
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("millionverifier: http %d", resp.StatusCode)
@@ -158,7 +167,7 @@ func (m *MillionVerifier) Credits(ctx context.Context) (int, error) {
 	if out.Error != "" {
 		return 0, m.accountError(nil, out.Error)
 	}
-	return out.Credits, nil
+	return out.Credits + out.RenewingCredits, nil
 }
 
 func (m *MillionVerifier) accountError(res *Result, msg string) error {
@@ -166,14 +175,24 @@ func (m *MillionVerifier) accountError(res *Result, msg string) error {
 	var err error
 	switch {
 	case strings.Contains(lower, "api key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "unauthori"):
-		err = ErrMillionVerifierKey
+		err = ErrProviderKey
 	case strings.Contains(lower, "credit"):
-		err = ErrMillionVerifierCredits
+		err = ErrProviderCredits
 	default:
 		err = fmt.Errorf("millionverifier: %s", msg)
 	}
 	if res != nil {
 		res.Reason = "millionverifier: " + msg
+	}
+	return err
+}
+
+// withoutURL drops the request URL from a transport error, because the API key
+// travels in its query string.
+func withoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("millionverifier: %s: %w", ue.Op, ue.Err)
 	}
 	return err
 }

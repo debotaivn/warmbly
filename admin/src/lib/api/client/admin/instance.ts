@@ -58,15 +58,25 @@ export interface InstanceHealthSummary {
 }
 
 export interface InstanceHealthResult {
-    // Only non-ok checks are returned, so an empty list means all clear.
+    // Only findings are returned; absent findings do not prove check coverage.
     checks: InstanceCheck[];
     summary: InstanceHealthSummary;
+    execution_coverage?: string;
+    operational_monitoring_path?: string;
 }
 
 export function getInstanceHealth(): Promise<InstanceHealthResult> {
     return Request({
         method: "GET",
         url: "/admin/instance/health",
+        authorization: true,
+    });
+}
+
+export function deleteExpiredInvitations(): Promise<{ cleaned: boolean }> {
+    return Request({
+        method: "DELETE",
+        url: "/admin/instance/invitations/expired",
         authorization: true,
     });
 }
@@ -111,6 +121,39 @@ export interface InstanceSettings {
         daily_messages_per_mailbox: number;
         daily_messages_per_org: number;
     };
+    // How long event-level history is kept. Every window bounds personal data:
+    // opens and clicks carry a client, a device and a location, funnel events
+    // carry a visitor's path, and the audit trail carries IP addresses, user
+    // agents and change payloads. None of them affect a count or a routing
+    // decision; campaign progress keeps its own summary.
+    retention: {
+        engagement_event_days: number;
+        form_event_days: number;
+        audit_log_days: number;
+        // Warmup mail is deleted from each mailbox after this many days (a
+        // mailbox may set its own); the per-message warmup records after the
+        // second. The daily warmup statistics are never pruned.
+        warmup_mail_days: number;
+        warmup_event_days: number;
+    };
+    // How soon after a send an open or click is recorded as automated. The
+    // clock starts at dispatch to the worker, so the window also covers the
+    // provider's queue and transit to the recipient, not just reading time.
+    // Nothing is discarded: an automated event stays as delivery evidence but
+    // does not count as engagement or fire anything.
+    tracking: {
+        machine_window_open_seconds: number;
+        machine_window_click_seconds: number;
+        // The window used instead of those two when the tracking edge
+        // recognised a scanner network that also carries people's own
+        // requests, which browser isolation makes true of Proofpoint and
+        // Mimecast. Such a match cannot settle the verdict, so it widens the
+        // window rather than deciding: inside it the event is classified as
+        // the delivery-time scan, outside it as the person who read the mail
+        // later. A genuine click inside the window is classified automated
+        // too, which is the cost of the widening.
+        machine_window_probable_seconds: number;
+    };
     // The sending-domain authentication gate. A mailbox whose domain has been
     // failing SPF or DMARC for longer than the grace window stops sending cold
     // mail and warmup mail until the records are fixed.
@@ -118,6 +161,91 @@ export interface InstanceSettings {
         enforce_domain_auth: boolean;
         auth_grace_hours: number;
     };
+    // Inbox placement tests. The monthly allowances count tests on the
+    // instance and cloud panels only, and a self-hosted instance does not
+    // meter at all. Zero or negative on write resolves to the default, except
+    // credits_per_test, where zero turns paid tests off.
+    placement: {
+        tests_per_month_trial: number;
+        tests_per_month_paid: number;
+        seeds_per_test: number;
+        spacing_seconds: number;
+        /** Credits a test past the monthly allowance costs; 0 turns paid tests off. */
+        credits_per_test: number;
+        /** Most senders one placement batch may hold. */
+        batch_senders_max: number;
+        /** A workspace's batch senders sending probes at the same time. */
+        batch_sender_concurrency: number;
+        /** Batch senders sending at once across every workspace. */
+        batch_instance_concurrency: number;
+        /** Senders one batch starts per minute. */
+        batch_starts_per_minute: number;
+    };
+    // Operator notification channels. Targets and secrets are redacted on
+    // read: a chat webhook URL is a bearer credential, so the server returns a
+    // recognisable preview and treats the preview (or an empty string) as
+    // "keep what is stored" on write.
+    // Optional so a client that does not manage channels (the instance
+    // settings page) can PUT without them; an absent section keeps the
+    // stored channels untouched.
+    notifications?: {
+        channels: NotifyChannel[];
+    };
+}
+
+export type NotifyChannelType = "discord" | "slack" | "webhook" | "email";
+
+export interface NotifyChannel {
+    id: string;
+    name: string;
+    type: NotifyChannelType;
+    /** Webhook URL, or the address for an email channel. Redacted on read. */
+    target: string;
+    /** HMAC secret for the generic webhook transport. Redacted on read. */
+    secret?: string;
+    /** Subscribed event keys. Empty means every event. */
+    events: string[];
+    enabled: boolean;
+}
+
+export type NotifySeverity = "info" | "warning" | "urgent";
+
+export interface NotifyEventDef {
+    key: string;
+    label: string;
+    description: string;
+    group: string;
+    severity: NotifySeverity;
+    self_host_relevant: boolean;
+}
+
+export interface NotifyEventsResult {
+    events: NotifyEventDef[];
+    self_hosted: boolean;
+}
+
+export function getNotificationEvents(): Promise<NotifyEventsResult> {
+    return Request({
+        method: "GET",
+        url: "/admin/instance/notifications/events",
+        authorization: true,
+    });
+}
+
+/** Send a test alert. Pass `id` for a saved channel, or the unsaved fields. */
+export function testNotificationChannel(body: {
+    id?: string;
+    type?: NotifyChannelType;
+    name?: string;
+    target?: string;
+    secret?: string;
+}): Promise<{ delivered: boolean }> {
+    return Request({
+        method: "POST",
+        url: "/admin/instance/notifications/test",
+        data: body,
+        authorization: true,
+    });
 }
 
 export function getInstanceSettings(): Promise<InstanceSettings> {

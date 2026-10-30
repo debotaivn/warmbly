@@ -3,6 +3,7 @@ package wmail
 import (
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/models"
 )
@@ -16,10 +17,12 @@ const syncStateHeartbeat = 10 * time.Minute
 // of the tick; the consumer persists it and the loader hands it back on the
 // next assignment.
 type syncTracker struct {
-	state    models.SyncState
-	dirty    bool
-	lastSent time.Time
-	emit     func(models.SyncState) error
+	transportGeneration uuid.UUID
+	state               models.SyncState
+	dirty               bool
+	lastSent            time.Time
+	emit                func(models.SyncState) error
+	tickComplete        bool
 }
 
 func newSyncTracker(seed *models.SyncState, emit func(models.SyncState) error) *syncTracker {
@@ -27,6 +30,8 @@ func newSyncTracker(seed *models.SyncState, emit func(models.SyncState) error) *
 	if seed != nil {
 		t.state = *seed
 	}
+	// A loaded checkpoint is not a completed pass in this worker incarnation.
+	t.state.TransportGeneration = uuid.Nil
 	if t.state.BackfillStatus == "" {
 		t.state.BackfillStatus = models.SyncBackfillPending
 	}
@@ -69,11 +74,28 @@ func (t *syncTracker) setDeferred(n int) {
 	}
 }
 
+// setFoldersSkipped records what the folder listing could not follow. Both
+// are conditions the user can fix, so they are relayed every pass and clear
+// themselves rather than leaving a warning nobody can withdraw.
+func (t *syncTracker) setFoldersSkipped(cap, conflict int) {
+	if t.state.FoldersSkippedCap != cap || t.state.FoldersSkippedConflict != conflict {
+		t.state.FoldersSkippedCap = cap
+		t.state.FoldersSkippedConflict = conflict
+		t.dirty = true
+	}
+}
+
 // touch stamps the tick and relays the state when it changed or the
 // heartbeat is due.
 func (t *syncTracker) touch(now time.Time) {
 	stamp := now
 	t.state.LastSyncedAt = &stamp
+	t.state.TransportGeneration = t.transportGeneration
+	t.flush(now)
+}
+
+// flush publishes safe progress without implying a successful provider check.
+func (t *syncTracker) flush(now time.Time) {
 	if !t.dirty && now.Sub(t.lastSent) < syncStateHeartbeat {
 		return
 	}
@@ -113,5 +135,32 @@ func (t *syncTracker) folder(key string) models.SyncFolderCursor {
 
 func (t *syncTracker) setFolder(key string, c models.SyncFolderCursor) {
 	t.state.BackfillCursor.Folders[key] = c
+	t.dirty = true
+}
+
+// clearFolder forgets a folder's backfill floor.
+//
+// It has to go when the folder does. A name is reusable, so a floor left
+// behind is inherited by whatever is created under that name next: a "done"
+// cursor skips the new folder's history entirely, and a UID floor skips
+// everything below it. Neither shows up as an error, because the messages are
+// not new mail either; they are simply never imported.
+func (t *syncTracker) clearFolder(name string) {
+	if _, ok := t.state.BackfillCursor.Folders[name]; !ok {
+		return
+	}
+	delete(t.state.BackfillCursor.Folders, name)
+	t.dirty = true
+}
+
+// renameFolder moves a folder's backfill floor to its new name, so a rename
+// costs nothing rather than restarting the folder's import from the top.
+func (t *syncTracker) renameFolder(from, to string) {
+	cur, ok := t.state.BackfillCursor.Folders[from]
+	if !ok {
+		return
+	}
+	delete(t.state.BackfillCursor.Folders, from)
+	t.state.BackfillCursor.Folders[to] = cur
 	t.dirty = true
 }

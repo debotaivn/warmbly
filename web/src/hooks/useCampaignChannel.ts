@@ -1,11 +1,14 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useChannel, useChannelEvent } from './context/socket';
+import { originSummary, type EngagementKind } from '@/lib/engagementOrigin';
 
 // Task progress event payload
 export interface TaskProgressPayload {
     campaign_id: string;
     task_id: string;
-    status: 'pending' | 'active' | 'completed' | 'failed';
+    // scheduled: the campaign's chain woke up and may send nothing. active: a
+    // send is in flight, and the contact fields are always set.
+    status: 'scheduled' | 'pending' | 'active' | 'completed' | 'failed';
     contact_id: string;
     contact_email: string;
     contact_name: string;
@@ -14,6 +17,9 @@ export interface TaskProgressPayload {
     step_index: number;
     progress: number;
     total_contacts: number;
+    // processed_count and progress are in emails (contacts × steps), which
+    // total_emails is the size of.
+    total_emails: number;
     processed_count: number;
     timestamp: string;
 }
@@ -33,6 +39,39 @@ export interface ActivityItem {
     contactName?: string;
     message: string;
     timestamp: Date;
+}
+
+// Open/click payload (pubsub.TrackingEventPayload): who, whether a person
+// did it, and what the logs say about client and location.
+interface TrackingPayload {
+    contact_email?: string;
+    original_url?: string;
+    link_label?: string;
+    machine?: boolean;
+    // When the tracking service saw it; the envelope timestamp is the publish time.
+    occurred_at?: string;
+    timestamp?: string;
+    client?: string;
+    client_type?: string;
+    device_hidden?: boolean;
+    device_type?: string;
+    os?: string;
+    browser?: string;
+    country_code?: string;
+    city?: string;
+}
+
+// The edge's time when it is carried and parses; receipt time otherwise.
+function occurredAt(p: TrackingPayload): Date {
+    const raw = p.occurred_at || p.timestamp;
+    const d = raw ? new Date(raw) : null;
+    return d && !Number.isNaN(d.getTime()) ? d : new Date();
+}
+
+// " (iPhone · Apple Mail app, Berlin DE)" or "" when the logs say nothing.
+function whereFrom(p: TrackingPayload, kind: EngagementKind): string {
+    const bits = [originSummary(p, kind), [p.city, p.country_code].filter(Boolean).join(' ')].filter(Boolean);
+    return bits.length ? ` (${bits.join(', ')})` : '';
 }
 
 // Hook return type
@@ -93,10 +132,16 @@ export function useCampaignChannel(campaignId: string): CampaignChannelState {
         const name = normalizeEvent(raw._event ?? raw.event_type ?? raw.type);
 
         switch (name) {
+            // A send's outcome arrives as EMAIL_SENT (org-scoped, so the whole
+            // team sees it), not as a TASK_PROGRESS with status completed. It
+            // has to land here too, or the "Sending…" card opened by the
+            // active event stays up until the page is reloaded.
+            case 'EMAIL_SENT':
             case 'TASK_PROGRESS': {
                 const data = payload as unknown as TaskProgressPayload;
-                setTaskProgress(data);
-                if (data.status === 'completed') {
+                const status = name === 'EMAIL_SENT' ? 'completed' : data.status;
+                setTaskProgress({ ...data, status });
+                if (status === 'completed') {
                     addActivity({
                         id: nextId('sent'),
                         type: 'sent',
@@ -105,7 +150,7 @@ export function useCampaignChannel(campaignId: string): CampaignChannelState {
                         message: `Email sent to ${data.contact_email}`,
                         timestamp: new Date(data.timestamp || Date.now()),
                     });
-                } else if (data.status === 'failed') {
+                } else if (status === 'failed') {
                     addActivity({
                         id: nextId('failed'),
                         type: 'failed',
@@ -118,26 +163,30 @@ export function useCampaignChannel(campaignId: string): CampaignChannelState {
                 break;
             }
             case 'EMAIL_OPENED': {
-                const data = payload as { contact_email?: string };
+                const data = payload as TrackingPayload;
                 addActivity({
                     id: nextId('open'),
                     type: 'opened',
                     contactEmail: data.contact_email || 'Unknown',
-                    message: `Opened by ${data.contact_email || 'Unknown'}`,
-                    timestamp: new Date(),
+                    message: `${data.machine ? 'Auto-opened' : 'Opened'} by ${data.contact_email || 'Unknown'}${whereFrom(data, 'open')}`,
+                    timestamp: occurredAt(data),
                 });
                 break;
             }
             case 'EMAIL_CLICKED': {
-                const data = payload as { contact_email?: string; original_url?: string };
+                const data = payload as TrackingPayload;
+                const who = `${data.contact_email || 'Unknown'}${whereFrom(data, 'click')}`;
+                const target = data.link_label || data.original_url;
                 addActivity({
                     id: nextId('click'),
                     type: 'clicked',
                     contactEmail: data.contact_email || 'Unknown',
-                    message: data.original_url
-                        ? `Click from ${data.contact_email || 'Unknown'} → ${data.original_url}`
-                        : `Click from ${data.contact_email || 'Unknown'}`,
-                    timestamp: new Date(),
+                    message: data.machine
+                        ? `Automated click on ${target ?? 'a link'} for ${who} (not counted)`
+                        : target
+                          ? `Click from ${who} → ${target}`
+                          : `Click from ${who}`,
+                    timestamp: occurredAt(data),
                 });
                 break;
             }

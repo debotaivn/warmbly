@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/tmplfuncs"
 	"github.com/warmbly/warmbly/internal/repository"
 )
 
@@ -20,6 +21,9 @@ import (
 // problem. accessTokenFor already flips the connection to reauth_required, so
 // the dispatcher must not overwrite that status when it sees this error.
 var errReauthRequired = errors.New("reauth required")
+
+// ErrActionProviderMismatch means the action does not run on the connection's provider.
+var ErrActionProviderMismatch = errors.New("this action does not run on the selected integration")
 
 // Dispatch fans a platform event out to every matching event subscription.
 // Targets are resolved synchronously (cheap, indexed) but the provider calls
@@ -38,6 +42,14 @@ func (s *service) Dispatch(ctx context.Context, orgID uuid.UUID, eventType model
 	autos, err := s.repo.ListEnabledAutomationsForEvent(ctx, orgID, string(eventType))
 	if err != nil {
 		log.Warn().Err(err).Str("event", string(eventType)).Msg("integration dispatch: failed to load automations")
+	}
+	// An event raised by an automation's own action (a contact it created, a
+	// deal it opened) carries its depth. Past the chain cap it still reaches
+	// customer webhooks and legacy subscriptions, but runs no more flows, so
+	// "on new contact, create a contact" cannot loop.
+	if depth := int(toFloat(data[automationDepthKey])); depth >= maxAutomationChainDepth && len(autos) > 0 {
+		log.Warn().Str("event", string(eventType)).Int("depth", depth).Msg("integration dispatch: automation chain depth limit reached; not running automations")
+		autos = nil
 	}
 	if len(targets) == 0 && len(autos) == 0 {
 		return
@@ -102,6 +114,10 @@ func (s *service) runAction(ctx context.Context, target repository.DispatchTarge
 // upserts so behaviour follows the user's configuration instead of a fixed shape.
 func (s *service) execAction(ctx context.Context, target repository.DispatchTarget, data map[string]any) error {
 	sub := target.Subscription
+	// A connection's credentials only ever reach its own provider.
+	if !models.ProviderSupportsAction(target.Secrets.Conn.Provider, sub.Action) {
+		return ErrActionProviderMismatch
+	}
 	secretCfg, err := s.openConfig(ctx, &target.Secrets)
 	if err != nil {
 		return fmt.Errorf("decrypt config: %w", err)
@@ -149,10 +165,18 @@ func (s *service) execAction(ctx context.Context, target repository.DispatchTarg
 		url = rendered
 		// Automation tools (Zapier/Make/n8n) get the full structured + signed
 		// payload; the signing secret is the connection's (empty => unsigned).
-		secret := configString(target.Secrets.Conn.ConfigCapabilities, "signing_secret")
+		secret := s.signingSecretFor(ctx, &target.Secrets, secretCfg)
 		return automationDeliver(ctx, url, secret, sub.EventType, buildAutomationPayload(sub, data, msg))
 
+	case models.IntegrationActionClaySendRow:
+		return s.clayDeliver(ctx, sub, secretCfg, data, msg)
+
 	case models.IntegrationActionHubSpotUpsert:
+		// While HubSpot is the workspace CRM, every send, reply and contact
+		// syncs on its own; this action would only add duplicate notes.
+		if s.crmMode != nil && s.crmMode(ctx, target.Secrets.Conn.OrganizationID) == models.CRMProviderHubSpot {
+			return nil
+		}
 		token, terr := s.accessTokenFor(ctx, &target.Secrets)
 		if terr != nil {
 			return errReauthRequired
@@ -161,21 +185,37 @@ func (s *service) execAction(ctx context.Context, target repository.DispatchTarg
 		return hubspotUpsertContact(ctx, token, contactEmail(data), props, msg.plainText())
 
 	case models.IntegrationActionPipedriveUpsert:
+		// In Pipedrive mode people are created and kept current by the sync.
+		if s.crmMode != nil && s.crmMode(ctx, target.Secrets.Conn.OrganizationID) == models.CRMProviderPipedrive {
+			return nil
+		}
 		token, terr := s.accessTokenFor(ctx, &target.Secrets)
 		if terr != nil {
 			return errReauthRequired
 		}
 		props := s.crmProps(ctx, sub, models.IntegrationPipedrive, data, autoCfg)
-		return pipedriveUpsertPerson(ctx, token, contactEmail(data), props)
+		return pipedriveUpsertPerson(ctx, pipedriveBase(&target.Secrets.Conn), token, contactEmail(data), props)
 
 	case models.IntegrationActionSalesforceUpsert:
-		token, terr := s.accessTokenFor(ctx, &target.Secrets)
-		if terr != nil {
-			return errReauthRequired
+		// Salesforce writes go through the native sync only.
+		if s.salesforce == nil {
+			return errors.New("salesforce sync is not available on this process")
 		}
-		instanceURL := configString(target.Secrets.Conn.DisplayFields, "instance_url")
-		props := s.crmProps(ctx, sub, models.IntegrationSalesforce, data, autoCfg)
-		return salesforceUpsertContact(ctx, token, instanceURL, contactEmail(data), props)
+		ev := map[string]any{}
+		for k, v := range data {
+			ev[k] = v
+		}
+		// An automation's own field map overrides the connection's rules.
+		if len(autoCfg.FieldMap) > 0 {
+			ev["_salesforce_fields"] = projectFields(autoCfg.FieldMap, eventSource(data))
+		}
+		if err := s.salesforce.UpsertFromEvent(ctx, sub.OrganizationID, sub.ConnectionID, ev); err != nil {
+			if errors.Is(err, ErrPushReauth) {
+				return errReauthRequired
+			}
+			return err
+		}
+		return nil
 
 	case models.IntegrationActionCloseUpsert:
 		apiKey := stringFromMap(secretCfg, "api_key", "api_token")
@@ -259,7 +299,10 @@ func renderEventMessage(sub models.IntegrationEventSubscription, data map[string
 	switch eventType {
 	case models.WebhookEventCampaignReplyReceived:
 		m.Title = "📨 New reply"
-		if intent := stringFromMap(data, "intent"); intent != "" {
+		// The inbox-tagging labels, when present, are what the inbox shows.
+		if labels, _ := tmplfuncs.ListStrings(data["ai_labels"]); len(labels) > 0 {
+			m.Title = "📨 New reply (" + strings.Join(labels, ", ") + ")"
+		} else if intent := stringFromMap(data, "intent"); intent != "" {
 			m.Title = "📨 New reply (" + intent + ")"
 		}
 	case models.WebhookEventCampaignEmailBounced, models.WebhookEventDeliverabilityBounce:
@@ -290,6 +333,11 @@ func renderEventMessage(sub models.IntegrationEventSubscription, data map[string
 		m.Title = "✅ Campaign completed"
 	case models.WebhookEventContactCreated:
 		m.Title = "🧑 Contact created"
+	case models.WebhookEventFormSubmitted:
+		m.Title = "📝 Form submitted"
+		if n := stringFromMap(data, "form_name"); n != "" {
+			m.Title = "📝 Form submitted: " + n
+		}
 	case models.WebhookEventContactUpdated:
 		m.Title = "✏️ Contact updated"
 	case models.WebhookEventCRMDealCreated:

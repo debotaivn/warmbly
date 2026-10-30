@@ -1,14 +1,18 @@
 package jobs
 
 import (
-	"github.com/getsentry/sentry-go"
+	"errors"
+
 	"github.com/google/uuid"
+	"github.com/warmbly/warmbly/internal/observability/errs"
 )
 
 func CaptureError(userID, emailID uuid.UUID, err error) {
-	sentry.WithScope(func(scope *sentry.Scope) {
-		scope.SetTag("user_id", userID.String())
-		scope.SetTag("email_id", emailID.String())
-		sentry.CaptureException(err)
-	})
+	if errors.Is(err, ErrSyncArrivalPending) {
+		return
+	}
+	errs.CaptureException(err,
+		errs.Tag("user_id", userID.String()),
+		errs.Tag("email_id", emailID.String()),
+	)
 }

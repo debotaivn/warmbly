@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { queryOptions, useQuery } from "@tanstack/react-query";
 import getAuthConfig from "../../client/auth/getAuthConfig";
 import type AuthConfig from "../../models/auth/AuthConfig";
 
@@ -25,21 +25,30 @@ export const AUTH_CONFIG_FALLBACK: AuthConfig = {
     passkeys: false,
     providers: [],
     self_hosted: true,
+    // The app-password walkthrough works on every deployment; Google sign-in
+    // for a new Gmail mailbox is only offered on a confirmed yes.
+    gmail_oauth_connect: false,
     // Unconfirmed billing keeps the subscription-based gates in place rather
     // than presenting an unreachable backend as an unlocked one.
     billing_enabled: true,
     setup_required: false,
     docs_url: "https://docs.warmbly.com/development/accounts-and-access/",
+    // An unreachable backend cannot tell us whose instance this is, and the
+    // fallback fails self-host-safe everywhere else, so it claims no branding
+    // either: no website, no terms, no privacy link.
+    brand: { name: "Warmbly" },
 };
 
+export const authConfigQuery = queryOptions({
+    queryKey: ["auth", "config"],
+    queryFn: getAuthConfig,
+    staleTime: Infinity,
+    gcTime: Infinity,
+    retry: 1,
+});
+
 export default function useAuthConfig() {
-    const query = useQuery({
-        queryKey: ["auth", "config"],
-        queryFn: getAuthConfig,
-        staleTime: Infinity,
-        gcTime: Infinity,
-        retry: 1,
-    });
+    const query = useQuery(authConfigQuery);
 
     return {
         ...query,

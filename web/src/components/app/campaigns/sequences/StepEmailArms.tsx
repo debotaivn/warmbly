@@ -9,7 +9,7 @@
 
 import React from "react";
 import { Loader2Icon, Trash2Icon, TrophyIcon, PauseIcon, PlayIcon, SplitIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import type Sequence from "@/lib/api/models/app/campaigns/sequences/Sequence";
 import type ABVariant from "@/lib/api/models/app/campaigns/ABVariant";
 import type { ABVariantStats } from "@/lib/api/models/app/campaigns/ABVariant";
@@ -18,6 +18,8 @@ import EmailContentEditor from "./EmailContentEditor";
 import { htmlToPlain } from "./emailPreview";
 import SequenceView from "./SequenceView";
 import StepSplitAllocator, { type SplitArm } from "./StepSplitAllocator";
+import { openerArmSubjects, type ArmSubject } from "./threading";
+import type { EarlierEmail } from "./emailAIPrompt";
 import {
     useCampaignABVariants,
     useCampaignABAnalysis,
@@ -41,12 +43,25 @@ export default function StepEmailArms({
     campaignId,
     sequence,
     index,
+    conversationSubject = null,
+    conversationOpener = null,
+    earlierEmails,
 }: {
     campaignId: string;
     sequence: Sequence;
     index: number;
+    // The subject of the conversation this step replies on; see SequenceView.
+    conversationSubject?: string | null;
+    // The step that opened that conversation, whose A/B variants can carry
+    // other subjects a contact is replied to under.
+    conversationOpener?: Sequence | null;
+    earlierEmails?: EarlierEmail[];
 }) {
     const { data: all } = useCampaignABVariants(campaignId);
+    const conversationArms = React.useMemo(
+        () => openerArmSubjects(conversationOpener, all ?? []),
+        [conversationOpener, all],
+    );
     const stepRows = (all ?? []).filter((v) => v.step_id === sequence.id);
     const controlRow = stepRows.find((v) => v.is_control) ?? null;
     const variants = stepRows.filter((v) => !v.is_control);
@@ -194,6 +209,9 @@ export default function StepEmailArms({
                     campaignId={campaignId}
                     sequence={sequence}
                     index={index}
+                    conversationSubject={conversationSubject}
+                    conversationArms={conversationArms}
+                    earlierEmails={earlierEmails}
                     headerExtra={
                         variants.length === 0 ? (
                             <button
@@ -222,6 +240,9 @@ export default function StepEmailArms({
                     sharePct={selectedVariant.is_active ? shareOf(selectedVariant.weight) : 0}
                     onTogglePause={(active) => togglePause(selectedVariant.id, active)}
                     onDelete={() => deleteArm(selectedVariant.id)}
+                    inheritedSubject={sequence.thread_reply ? conversationSubject || null : null}
+                    inheritedArms={conversationArms}
+                    earlierEmails={earlierEmails}
                 />
             )}
         </div>
@@ -236,6 +257,9 @@ function VariantEditor({
     sharePct,
     onTogglePause,
     onDelete,
+    inheritedSubject,
+    inheritedArms,
+    earlierEmails,
 }: {
     campaignId: string;
     variant: ABVariant;
@@ -244,6 +268,12 @@ function VariantEditor({
     sharePct: number;
     onTogglePause: (active: boolean) => void;
     onDelete: () => void;
+    // Set when the step replies in the contact's thread: the subject belongs
+    // to the conversation, so no arm can carry one of its own and the send
+    // path ignores the column. Null when the step writes its own subject.
+    inheritedSubject?: string | null;
+    inheritedArms?: ArmSubject[];
+    earlierEmails?: EarlierEmail[];
 }) {
     const update = useUpdateABVariant(campaignId);
 
@@ -251,12 +281,14 @@ function VariantEditor({
     const [subject, setSubject] = React.useState(variant.subject);
     const [bodyHtml, setBodyHtml] = React.useState(variant.body_html);
 
+    // A refetch revives updated_at into a new Date; compare the instant, not the object.
+    const updatedAt = variant.updated_at ? new Date(variant.updated_at).getTime() : 0;
     React.useEffect(() => {
         setName(variant.name);
         setSubject(variant.subject);
         setBodyHtml(variant.body_html);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [variant.id, variant.updated_at]);
+    }, [variant.id, updatedAt]);
 
     const dirty = name !== variant.name || subject !== variant.subject || bodyHtml !== variant.body_html;
 
@@ -328,10 +360,22 @@ function VariantEditor({
             <EmailContentEditor
                 subject={subject}
                 onSubjectChange={setSubject}
+                subjectLocked={
+                    inheritedSubject
+                        ? {
+                              subject: inheritedSubject,
+                              note: "This step replies in the contact's thread, so every arm carries the conversation's subject and varies the body only.",
+                              alternates: inheritedArms,
+                          }
+                        : undefined
+                }
                 bodyHtml={bodyHtml}
                 onBodyChange={(html) => setBodyHtml(html)}
                 subjectPlaceholder="Leave blank to reuse the step's subject"
                 bodyPlaceholder="Leave blank to reuse the step's body"
+                campaignId={campaignId}
+                stepId={variant.step_id ?? undefined}
+                earlierEmails={earlierEmails}
             />
         </div>
     );

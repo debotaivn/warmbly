@@ -1,4 +1,4 @@
-// warmblyctl is the CLI for a Warmbly instance. It has two halves with two
+// warmblyctl is the CLI for a Warmbly instance. It has three distinct
 // trust models, and the split is deliberate:
 //
 // The operator commands (status, setup-link, user, org) talk to the database
@@ -14,6 +14,8 @@
 // agents and scripts can operate the product itself: everything they can do is
 // bounded by the key's scopes. The CLI must never SERVE HTTP; being a client
 // of the already-gated public API adds no new surface.
+// Remote admin commands use separately approved MFA sessions, never API keys
+// or local database authority, and require an explicitly selected backend.
 //
 //	docker compose -p warmbly exec backend warmblyctl status
 //	WARMBLY_API_KEY=wmbly_... warmblyctl campaign list
@@ -44,6 +46,11 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
+		var remoteErr *remoteError
+		if errors.As(err, &remoteErr) {
+			_ = writeRemoteJSON(os.Stderr, remoteErr)
+			os.Exit(remoteErr.Exit)
+		}
 		// A failing check has already printed itself; repeating it as an error
 		// line would bury the findings under the tool's own noise.
 		if errors.Is(err, errChecksFailed) {
@@ -56,6 +63,8 @@ func main() {
 
 func dispatch(ctx context.Context, args []string) error {
 	switch args[0] {
+	case "login", "logout", "whoami", "admin":
+		return runRemote(ctx, args[0], args[1:])
 	case "help", "-h", "--help":
 		usage(os.Stdout)
 		return nil
@@ -69,8 +78,18 @@ func dispatch(ctx context.Context, args []string) error {
 		return runUser(ctx, args[1:])
 	case "org":
 		return runOrg(ctx, args[1:])
+	case "backup":
+		return runBackup(ctx, args[1:])
+	case "restore":
+		return runRestore(ctx, args[1:])
 	case "api":
 		return runAPI(ctx, args[1:])
+	case "fleet":
+		return runFleet(ctx, args[1:])
+	case "inbox-tag":
+		return runInboxTag(ctx, args[1:])
+	case "keys":
+		return runKeys(ctx, args[1:])
 	}
 	if _, ok := apiFamilies[args[0]]; ok {
 		return runAPIResource(ctx, args[0], args[1:])
@@ -96,12 +115,29 @@ var commands = []command{
 	{"user list", "List accounts; --admin answers whether any platform admin survives", composeExec + "user list --admin"},
 	{"user reset-password", "Print a one-time reset link, or set the password from stdin", composeExec + "user reset-password --email you@example.com"},
 	{"user grant-admin", "Give an account a platform admin role", composeExec + "user grant-admin --email you@example.com --role super"},
+	{"user login-code-exempt", "Excuse one account from the emailed login code, for a reviewer who cannot read this instance's mail", composeExec + "user login-code-exempt --email reviewer@example.com --reason 'Google OAuth verification' --by you@example.com"},
 	{"user revoke-admin", "Take platform admin away from an account", composeExec + "user revoke-admin --email old@example.com"},
 	{"user disable-2fa", "Clear an account's TOTP enrollment after a lost authenticator", composeExec + "user disable-2fa --email you@example.com"},
 	{"hash-password", "Print an argon2 hash for WARMBLY_BOOTSTRAP_PASSWORD_HASH", "printf '%s' 'your-password' | docker compose -p warmbly exec -T backend warmblyctl hash-password"},
+	{"backup", "Write the whole instance (database, blobs, keys) to one restorable bundle", composeExec + "backup --out /data/blobs/warmbly-backup.tar.gz"},
+	{"restore", "Restore a bundle onto this instance, replacing everything on it", composeExec + "restore --file /data/blobs/warmbly-backup.tar.gz"},
+	{"keys status", "Count stored secrets by the key that opens them, and show open grace windows", composeExec + "keys status"},
+	{"keys reseal", "Rewrite secrets a read key opens under the primary key; a dry run without --apply", composeExec + "keys reseal --apply"},
+	{"keys generate", "Print fresh values for the instance-wide keys and tokens", composeExec + "keys generate CREDENTIALS_ENCRYPTION_KEY"},
+	{"inbox-tag backfill", "Classify mail that arrived before automatic tagging was switched on", composeExec + "inbox-tag backfill --org you@example.com --days 30 --dry-run"},
+	{"inbox-tag follow-ups", "Recompute who owes whom a reply from stored mail and classifications", composeExec + "inbox-tag follow-ups --org you@example.com"},
 	{"org list", "List the workspaces on this instance with their id, owner, and size", composeExec + "org list"},
 	{"org export", "Write a whole workspace to a portable archive file", composeExec + "org export --org you@example.com --out /tmp/workspace.warmbly.zip"},
 	{"org import", "Apply an archive to a workspace on this instance", composeExec + "org import --org you@example.com --file /tmp/workspace.warmbly.zip"},
+	{"fleet join-token", "Issue the token a machine needs to join the fleet. Shown once", composeExec + "fleet join-token"},
+	{"fleet list", "Every worker and consumer: role, version, liveness and usage", composeExec + "fleet list"},
+	{"fleet version", "Show or set the version every node should be running", composeExec + "fleet version v1.4.2"},
+	{"fleet channel", "Follow stable or dev releases, or hold the fleet where it is", composeExec + "fleet channel stable"},
+	{"fleet pin", "Hold one node at a version, to canary or to hold it back", composeExec + "fleet pin <node-id> v1.4.1"},
+	{"fleet remove", "Forget a node. Its mailboxes re-place themselves", composeExec + "fleet remove <node-id>"},
+	{"fleet rollout start", "Move the fleet to a tag in stages: one canary, then waves", composeExec + "fleet rollout start v1.4.2 --bake 30m"},
+	{"fleet rollout status", "Show a staged rollout's stage, admitted nodes and halt reason", composeExec + "fleet rollout status"},
+	{"fleet env-status", "Whether every live node has applied the current rendered env", composeExec + "fleet env-status"},
 }
 
 func usage(w *os.File) {
@@ -124,6 +160,19 @@ Operator commands (run where PRIMARY_DB is set, normally the backend container):
 		fmt.Fprintf(w, "  %-20s %s\n", f, apiFamilies[f])
 	}
 	fmt.Fprintf(w, "  %-20s %s\n", "api", "Raw passthrough: any method, any /v1 path")
+	fmt.Fprint(w, `
+Remote administrator commands (explicit --url URL or --server NAME; no API key):
+  login                Device approval on your administrator website; never a password in argv
+  logout               Revoke this profile's session and remove its local credentials
+  whoami               Redacted signed-in identity and live administrator permissions
+  admin                Read-only operational helpers; admin --help lists families
+  admin catalog        Offline bounded route inventory including permissions and write gates
+  admin api            Catalog-only JSON requests; writes require --write and exact --confirm
+
+  warmblyctl login --url https://api.example.com --server work-laptop
+  warmblyctl admin fleet nodes --server work-laptop
+  warmblyctl admin logs --node-id <uuid> --server work-laptop
+`)
 
 	fmt.Fprint(w, "\nExamples:\n")
 	for _, c := range commands {
@@ -146,17 +195,28 @@ Environment:
   WARMBLY_API_URL  API base URL for the API commands. Defaults to this instance's
                    API_PUBLIC_URL, then the hosted service.
 
+  backup and restore read the same crypto settings as org export/import, plus
+  BLOB_FS_ROOT for the blob tree. Run them inside the backend container, which
+  is also where pg_dump and psql live.
+
   org export and org import additionally read the instance's crypto settings,
   because a workspace's sealed values have to be opened on the way out and
   re-sealed on the way in: KMS_PROVIDER (with KMS_LOCAL_MASTER_KEY or the AWS
   settings) and CREDENTIALS_ENCRYPTION_KEY. Run them inside the backend
   container, where those are already set.
 
+  keys status and keys reseal read CREDENTIALS_ENCRYPTION_KEY with
+  CREDENTIALS_ENCRYPTION_READ_KEYS, and TWOFA_SECRET with TWOFA_READ_SECRETS,
+  exactly as the backend does. keys generate needs nothing.
+
 Exit status:
   status exits non-zero when a check is at error severity, so it works as a
   post-deploy gate. Use status --quiet from cron: it prints the checks alone,
   and nothing at all when none fire. status --json always exits 0, because it
   doubles as a liveness probe; read .summary.error there instead.
+  keys status and keys reseal exit non-zero when a stored value opens under no
+  configured key, which is the signal not to retire one. keys status
+  --require-primary also fails while a value still needs a read key.
 
 Run `+"`warmblyctl <command> --help`"+` for one command's flags.
 `)

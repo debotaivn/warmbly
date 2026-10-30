@@ -10,6 +10,7 @@ import (
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/infrastructure/pubsub"
 	"github.com/warmbly/warmbly/internal/models"
+	"github.com/warmbly/warmbly/internal/pkg/typesafe"
 	"github.com/warmbly/warmbly/internal/repository"
 	"github.com/warmbly/warmbly/internal/scheduler"
 )
@@ -22,6 +23,10 @@ type ContactService interface {
 	// CampaignLeadCounts returns per-status lead totals for one campaign.
 	CampaignLeadCounts(ctx context.Context, orgID, campaignID string) (*models.CampaignLeadCounts, *errx.Error)
 	BulkUpdate(ctx context.Context, userID string, orgID uuid.UUID, data *models.BulkEditContactsData) ([]models.Contact, *errx.Error)
+	// ResolveSelection turns a bulk action's selection into the contact ids it
+	// applies to: an explicit list as given, or everything matching the search
+	// the dashboard's "select all matching" sends, minus its exclusions.
+	ResolveSelection(ctx context.Context, orgID uuid.UUID, sel models.ContactSelection) ([]string, *errx.Error)
 	Update(ctx context.Context, userID, contactID string, orgID uuid.UUID, data *models.UpdateContact) (*models.Contact, *errx.Error)
 	BulkDelete(ctx context.Context, userID string, orgID uuid.UUID, contactIDs []string) *errx.Error
 	Delete(ctx context.Context, userID string, orgID uuid.UUID, contactID string) *errx.Error
@@ -33,18 +38,39 @@ type ContactService interface {
 
 	// ImportPreview parses an uploaded CSV/XLSX file and reports back
 	// the columns + first N rows + suggested mapping — no DB writes.
-	ImportPreview(ctx context.Context, file io.Reader, filename string) (*models.ContactImportPreview, *errx.Error)
+	ImportPreview(ctx context.Context, orgID uuid.UUID, file io.Reader, filename string) (*models.ContactImportPreview, *errx.Error)
+
+	// SuggestImportMapping suggests a column mapping for any importer's
+	// preview, and reports which columns the TypeSafe judgment placed.
+	SuggestImportMapping(ctx context.Context, orgID uuid.UUID, headers []string, sample [][]string) ([]models.ContactImportColumnMapping, []int)
 
 	// ValidateImportMapping reports whether a column mapping is usable:
 	// exactly the checks ImportCommit runs before it touches a row. Callers
 	// that persist a mapping for later (the Google Sheets sync sources) use
 	// it so a bad mapping is caught when it is saved, not on the next sync.
 	ValidateImportMapping(mapping []models.ContactImportColumnMapping) *errx.Error
+	// ValidateSegmentTargets reports whether every id names a segment in the
+	// organization, so a saved source is refused when it is written rather
+	// than on its next run.
+	ValidateSegmentTargets(ctx context.Context, orgID uuid.UUID, ids []string) *errx.Error
 
 	// ImportCommit re-parses the uploaded file with the chosen mapping
 	// and performs the upsert / skip / dedup work. Returns per-row
 	// result counts plus a list of rows that failed (with reasons).
 	ImportCommit(ctx context.Context, userID string, orgID uuid.UUID, file io.Reader, filename string, opts *models.ContactImportCommit) (*models.ContactImportResult, *errx.Error)
+
+	// ValidateImportOptions runs every check an import makes before it reads a
+	// row, so a background import is refused when it is started.
+	ValidateImportOptions(ctx context.Context, userID string, orgID uuid.UUID, opts *models.ContactImportCommit) *errx.Error
+	// BuildImportPreview describes already-parsed rows for the column mapper.
+	BuildImportPreview(ctx context.Context, orgID uuid.UUID, filename, format string, rows [][]string) (*models.ContactImportPreview, *errx.Error)
+	// AnalyzeImport reports what an import of rows would do under a mapping,
+	// without writing anything.
+	AnalyzeImport(ctx context.Context, userID string, orgID uuid.UUID, rows []ImportRow, mapping []models.ContactImportColumnMapping) (*models.ContactImportAnalysis, *errx.Error)
+	// RunImport applies an import to rows chunk by chunk, settling each chunk
+	// with sink (nil to only collect the result). prior are contacts an
+	// earlier run of the same import touched, so they still join its segments.
+	RunImport(ctx context.Context, userID string, orgID uuid.UUID, rows []ImportRow, opts *models.ContactImportCommit, sink ImportSink, prior []uuid.UUID) (*models.ContactImportResult, *errx.Error)
 
 	// ListCustomFieldKeys returns the org's distinct contact custom-field keys,
 	// frequency-ranked then alphabetical, capped at 200. Powers the dashboard
@@ -61,13 +87,16 @@ type ContactService interface {
 	// non-error outcome used by the unibox CRM panel.
 	GetByEmail(ctx context.Context, orgID *uuid.UUID, email string) (*models.Contact, *errx.Error)
 
+	// LookupSender matches the address first, then the thread's campaign send.
+	LookupSender(ctx context.Context, orgID *uuid.UUID, email string, thread models.ContactLookupThread) (*models.ContactLookup, *errx.Error)
+
 	// ListSentEmails enumerates every send (or attempted send) we made
 	// to the contact, newest first.
-	ListSentEmails(ctx context.Context, userID, contactID uuid.UUID, limit int, beforeSentAt *time.Time, beforeTaskID *uuid.UUID) (*models.ContactSentEmailsResult, *errx.Error)
+	ListSentEmails(ctx context.Context, orgID, contactID uuid.UUID, limit int, beforeSentAt *time.Time, beforeTaskID *uuid.UUID) (*models.ContactSentEmailsResult, *errx.Error)
 
 	// ListTimeline returns a merged, reverse-chronological feed of all
 	// engagement + CRM events for the contact.
-	ListTimeline(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, contactID uuid.UUID, limit int, before *time.Time) (*models.ContactTimelineResult, *errx.Error)
+	ListTimeline(ctx context.Context, orgID, contactID uuid.UUID, limit int, cursor *models.ContactTimelineKey) (*models.ContactTimelineResult, *errx.Error)
 
 	// SetCampaignWaker wires the campaign service so attaching a lead to a
 	// running campaign wakes that campaign's parked send chain. Optional: with
@@ -109,6 +138,17 @@ type SegmentAware interface {
 	WireSegments(linker SegmentLinker, syncer SegmentCampaignSyncer)
 }
 
+// WebhookDispatcher delivers contact.created to customer webhooks and
+// automations. Satisfied structurally by webhook.Service.
+type WebhookDispatcher interface {
+	Dispatch(ctx context.Context, orgID uuid.UUID, eventType models.WebhookEventType, data any) (uuid.UUID, error)
+}
+
+// WebhookAware is the optional capability the caller uses to attach it.
+type WebhookAware interface {
+	WireWebhooks(w WebhookDispatcher)
+}
+
 type contactService struct {
 	contactRepository  repository.ContactRepository
 	subRepo            repository.SubscriptionRepository
@@ -123,6 +163,11 @@ type contactService struct {
 	orgRisk orgrisk.Service
 	// explainer builds the verification "why" for the contact drawer.
 	explainer VerificationExplainer
+	// webhooks fans contact.created out; nil-safe (no events).
+	webhooks WebhookDispatcher
+	// columnJudge places import columns no header matched; nil leaves the
+	// suggestion deterministic.
+	columnJudge typesafe.Asker
 }
 
 // VerificationAware is implemented by the contact service so main can hand
@@ -141,6 +186,17 @@ func (s *contactService) WireVerification(e VerificationExplainer) { s.explainer
 
 // WireOrgRisk attaches the organization risk posture.
 func (s *contactService) WireOrgRisk(r orgrisk.Service) { s.orgRisk = r }
+
+// WireWebhooks attaches the event dispatcher behind contact.created.
+func (s *contactService) WireWebhooks(w WebhookDispatcher) { s.webhooks = w }
+
+// WireColumnJudge attaches the TypeSafe asker behind import column inference.
+func (s *contactService) WireColumnJudge(a typesafe.Asker) { s.columnJudge = a }
+
+// ColumnJudgeAware is the optional capability the caller uses to attach it.
+type ColumnJudgeAware interface {
+	WireColumnJudge(a typesafe.Asker)
+}
 
 // OrgRiskAware is the optional capability the caller uses to attach it.
 type OrgRiskAware interface {
@@ -166,11 +222,11 @@ func NewService(
 	}
 }
 
-func (s *contactService) publishContactsReload(ctx context.Context, userID string, operationID string) {
+func (s *contactService) publishContactsReload(ctx context.Context, userID string, operationID string, orgID uuid.UUID) {
 	if s.streamingPublisher == nil {
 		return
 	}
-	s.streamingPublisher.PublishContactsReload(ctx, userID, operationID)
+	s.streamingPublisher.PublishContactsReload(ctx, userID, operationID, orgID)
 }
 
 func (s *contactService) SetCampaignWaker(w CampaignWaker) { s.campaignWaker = w }

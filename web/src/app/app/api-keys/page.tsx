@@ -20,6 +20,8 @@
 import { NoAccess } from "@/components/layout/NoAccess";
 import { usePermission } from "@/hooks/usePermission";
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseSearchSchema } from "@/lib/browse-other-lists";
 import {
     ActivityIcon,
     AlertCircleIcon,
@@ -32,7 +34,7 @@ import {
     SearchIcon,
     XIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 
 import {
     EmptyBlock,
@@ -48,9 +50,11 @@ import useAPIKeys from "@/lib/api/hooks/app/api-keys/useAPIKeys";
 import useAPIKeyUsageSummary from "@/lib/api/hooks/app/api-keys/useAPIKeyUsageSummary";
 import useAPIKeyAnalytics from "@/lib/api/hooks/app/api-keys/useAPIKeyAnalytics";
 import type APIKey from "@/lib/api/models/app/apikeys/APIKey";
+import { keyCanAuthenticate, keyStatus } from "@/lib/api/models/app/apikeys/APIKey";
 import CreateKeyModal from "./_components/CreateKeyModal";
 import KeyDetailDrawer from "./_components/KeyDetailDrawer";
 import { StackedBars } from "./_components/Sparkline";
+import useBrand from "@/hooks/useBrand";
 
 export default function APIKeysPage() {
     const canManage = usePermission("MANAGE_API_KEYS");
@@ -60,7 +64,7 @@ export default function APIKeysPage() {
 
     const [createOpen, setCreateOpen] = React.useState(false);
     const [selected, setSelected] = React.useState<APIKey | null>(null);
-    const [search, setSearch] = React.useState("");
+    const [search, setSearch] = useBrowseState("api-keys.list.search", "", browseSearchSchema);
 
     const all = keys.data?.data ?? [];
     const filtered = search.trim()
@@ -203,7 +207,10 @@ export default function APIKeysPage() {
 }
 
 function KeyRow({ apiKey, onClick }: { apiKey: APIKey; onClick: () => void }) {
-    const status = apiKey.status;
+    // A key past its expires_at still reads "active" in the column, so the row
+    // asks the model rather than the field.
+    const status = keyStatus(apiKey);
+    const live = keyCanAuthenticate(apiKey);
     return (
         <button
             type="button"
@@ -211,9 +218,7 @@ function KeyRow({ apiKey, onClick }: { apiKey: APIKey; onClick: () => void }) {
             className="w-full h-12 px-5 flex items-center gap-3 text-left hover:bg-slate-50/80 transition-colors group"
         >
             <KeyIcon
-                className={`w-3.5 h-3.5 shrink-0 ${
-                    status === "active" ? "text-slate-500" : "text-slate-300"
-                }`}
+                className={`w-3.5 h-3.5 shrink-0 ${live ? "text-slate-500" : "text-slate-300"}`}
             />
             <div className="flex flex-col min-w-0 max-w-[40%]">
                 <span className="text-[12.5px] text-slate-900 font-medium truncate">{apiKey.name}</span>
@@ -256,7 +261,10 @@ function StatusPill({ status }: { status: APIKey["status"] }) {
 }
 
 function CodeSnippet({ prefix }: { prefix: string }) {
-    const snippet = `curl https://api.warmbly.com/v1/campaigns \\
+    // This instance's own API base, not the hosted one: a self-hoster copying
+    // the example was being handed a curl aimed at somebody else's server.
+    const { apiURL } = useBrand();
+    const snippet = `curl ${apiURL}/v1/campaigns \\
   -H "Authorization: Bearer ${prefix}…" \\
   -H "Content-Type: application/json"`;
     const [copied, setCopied] = React.useState(false);
@@ -271,7 +279,7 @@ function CodeSnippet({ prefix }: { prefix: string }) {
         );
     }
     return (
-        <div className="rounded-md border border-slate-200 bg-slate-950 overflow-hidden">
+        <div className="rounded-md border border-slate-200 dark:border-slate-800 bg-slate-950 overflow-hidden">
             <div className="h-8 px-3 flex items-center gap-2 border-b border-slate-800/60">
                 <div className="size-1.5 rounded-full bg-red-400/70" />
                 <div className="size-1.5 rounded-full bg-amber-400/70" />
@@ -326,7 +334,7 @@ function Legend({ color, label }: { color: string; label: string }) {
     );
 }
 
-function fmtRelative(iso: string): string {
+function fmtRelative(iso: string | Date): string {
     try {
         const d = new Date(iso);
         const diff = Date.now() - d.getTime();
@@ -344,7 +352,7 @@ function fmtRelative(iso: string): string {
     }
 }
 
-function fmtFull(iso: string): string {
+function fmtFull(iso: string | Date): string {
     try {
         return new Date(iso).toLocaleString("en-US", {
             month: "short",

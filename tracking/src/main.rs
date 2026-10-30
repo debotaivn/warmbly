@@ -1,4 +1,5 @@
 mod abuse;
+mod asndb;
 mod aws;
 mod config;
 mod events;
@@ -9,10 +10,15 @@ mod kafka;
 mod links;
 mod nats;
 mod observability;
+mod posthog;
 mod producer;
+mod redirects;
+mod scanners;
+mod unsubscribe;
+mod unsubscribe_i18n;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, MatchedPath},
     routing::{get, post},
     Router,
 };
@@ -26,9 +32,22 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
-use crate::handlers::{health, track_click, track_open, track_page_hit, tracking_js, AppState};
+use crate::handlers::{
+    health, not_found, redirect_first, track_click, track_open, track_page_hit, tracking_js,
+    unsubscribe_page, unsubscribe_submit, unsubscribe_undo, AppState,
+};
 use crate::observability::report_error;
 use crate::producer::Producer;
+
+/// No response here is ever content-sniffed. HSTS is left to the proxy: this
+/// service also answers on customers' own tracking and redirect domains.
+async fn nosniff(mut res: axum::response::Response) -> axum::response::Response {
+    res.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    res
+}
 
 /// Connects the event-bus producer, retrying transient failures.
 ///
@@ -55,6 +74,7 @@ async fn connect_producer(config: &Config) -> Producer {
             Err(e) => {
                 if attempt >= MAX_ATTEMPTS {
                     report_error("Failed to create tracking event producer", e.as_ref());
+                    observability::flush();
                     std::process::exit(1);
                 }
                 warn!(
@@ -70,6 +90,13 @@ async fn connect_producer(config: &Config) -> Producer {
 
 #[tokio::main]
 async fn main() {
+    // Before any TLS connection. rustls 0.23 cannot choose between aws-lc-rs
+    // and ring when both are in the tree, and panics at the first handshake:
+    // a tls:// bus or a rediss:// cache takes the whole service down at
+    // startup, which plaintext local development never reveals.
+    // Ignored rather than unwrapped: a second install is not a failure.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
@@ -84,17 +111,30 @@ async fn main() {
         Ok(c) => c,
         Err(e) => {
             report_error("Failed to load config", e.as_ref());
+            observability::flush();
             std::process::exit(1);
         }
     };
-    observability::init(&config.env);
+    // Held until main returns so queued events are flushed on shutdown.
+    let _reporting = observability::init(observability::Settings {
+        env: &config.env,
+        release: &config.release,
+        sentry_dsn: &config.sentry_dsn,
+        posthog_key: &config.posthog_key,
+        posthog_host: &config.posthog_host,
+    });
     info!("Starting tracking service on {}", config.addr());
 
     // Event-bus producer (NATS by default; Kafka when EVENTBUS_PROVIDER=kafka
     // and the `kafka` feature is compiled in).
     let producer = connect_producer(&config).await;
 
-    let state = AppState::new(producer, &config);
+    // The scanner ASN database: a mounted file, or a download held in memory.
+    // Resolved here because it may go to the network, and never fatal: without
+    // it the catalogue's asn: entries match nothing and everything else works.
+    let asn_db = asndb::AsnDb::resolve(&config.scanner_asn_db, &config.scanner_asn_db_url).await;
+
+    let state = AppState::new(producer, &config, asn_db);
 
     // Build router
     let app = Router::new()
@@ -108,13 +148,43 @@ async fn main() {
             "/p",
             post(track_page_hit).layer(DefaultBodyLimit::max(hits::MAX_BODY_BYTES)),
         )
+        // Recipient opt-out. A workspace's verified tracking domain is the
+        // host its campaign mail carries, so the unsubscribe address in that
+        // mail resolves here; the backend owns the pages behind it.
+        .route(
+            "/unsubscribe/:token",
+            get(unsubscribe_page)
+                .post(unsubscribe_submit)
+                .layer(DefaultBodyLimit::max(unsubscribe::MAX_BODY_BYTES)),
+        )
+        .route(
+            "/unsubscribe/:token/resubscribe",
+            post(unsubscribe_undo).layer(DefaultBodyLimit::max(unsubscribe::MAX_BODY_BYTES)),
+        )
+        .fallback(not_found)
+        // A sending domain pointed here for its redirect answers only with it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            redirect_first,
+        ))
+        .layer(axum::middleware::map_response(nosniff))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
-        .layer(TraceLayer::new_for_http())
+        // Spans name the route, never the URI: unsubscribe and click paths carry tokens.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
+                let route = req
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .map(MatchedPath::as_str)
+                    .unwrap_or("unmatched");
+                tracing::info_span!("request", method = %req.method(), route)
+            }),
+        )
         .with_state(state);
 
     // Start server
@@ -122,6 +192,7 @@ async fn main() {
         Ok(a) => a,
         Err(e) => {
             observability::report_issue("Invalid tracking listen address", &e.to_string());
+            observability::flush();
             std::process::exit(1);
         }
     };
@@ -131,6 +202,7 @@ async fn main() {
         Ok(l) => l,
         Err(e) => {
             observability::report_issue("Failed to bind tracking listener", &e.to_string());
+            observability::flush();
             std::process::exit(1);
         }
     };
@@ -144,6 +216,7 @@ async fn main() {
     .await
     {
         observability::report_issue("Tracking server terminated unexpectedly", &e.to_string());
+        observability::flush();
         std::process::exit(1);
     }
 }

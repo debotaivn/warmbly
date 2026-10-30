@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/warmbly/warmbly/internal/app/copyjudge"
 	"github.com/warmbly/warmbly/internal/infrastructure/db"
 	"github.com/warmbly/warmbly/internal/models"
 )
@@ -55,21 +56,41 @@ type AdvisorMailbox struct {
 	// ColdSent7d / ColdSent1d count completed campaign sends. Bounces and
 	// complaints are 30-day windows, matching the documented complaint sample
 	// floor.
-	ColdSent7d     int
-	ColdSent1d     int
-	ColdSent30d    int
-	Bounces30d     int
-	Complaints30d  int
-	WarmupSent7d   int
-	WarmupSpam7d   int
-	WarmupRecv7d   int
-	PoolHealth     string
-	PoolSpamScore  int
-	PoolBlocked    bool
-	UnresolvedErrs int
+	ColdSent7d    int
+	ColdSent1d    int
+	ColdSent30d   int
+	Bounces30d    int
+	Complaints30d int
+	WarmupSent7d  int
+	WarmupRecv7d  int
+	// WarmupPlacement is the week's verified warmup deliveries, split the way
+	// the pool judges them.
+	WarmupPlacement  models.WarmupPlacementEvidence
+	PoolHealth       string
+	PoolHealthScore  float64
+	PoolHealthReason string
+	PoolBlocked      bool
+	UnresolvedErrs   int
 	// InActiveCampaign is true when at least one running campaign can send
 	// through this mailbox (tag match or explicit sender).
 	InActiveCampaign bool
+	// SendLifecycle is active, resting or reserve (held by its owner).
+	SendLifecycle string
+	// The pool's warmup mail handed off to this mailbox over seven days, how
+	// much its sync verified, and how many sender workspaces lost mail to it.
+	WarmupDelivered7d int
+	WarmupArrived7d   int
+	WarmupLostBy7d    int
+}
+
+// WarmupUnreachable reports a mailbox the pool has stopped drawing as a recipient.
+func (m AdvisorMailbox) WarmupUnreachable() bool {
+	return models.WarmupRecipientUnreachable(m.WarmupDelivered7d, m.WarmupArrived7d, m.WarmupLostBy7d)
+}
+
+// SendingCold is true when campaigns can actually pick this mailbox right now.
+func (m AdvisorMailbox) SendingCold() bool {
+	return m.InActiveCampaign && m.Status == "active" && (m.SendLifecycle == "" || m.SendLifecycle == string(models.SendLifecycleActive))
 }
 
 // AdvisorCampaign is one campaign's configuration plus its window performance.
@@ -108,7 +129,11 @@ type AdvisorCampaign struct {
 	// what this campaign can send, since the per-mailbox cap always wins.
 	SenderCount    int
 	SenderCapacity int
-	StepCount      int
+	// PickedSenders and SenderTags are how the campaign selects its pool: the
+	// enabled campaign_senders rows and its tags. Both zero means "all".
+	PickedSenders int
+	SenderTags    int
+	StepCount     int
 	// EmailStepCount excludes wait/action nodes.
 	EmailStepCount int
 	VariantCount   int
@@ -194,6 +219,13 @@ type AdvisorSnapshot struct {
 	// their mail has already stopped going out or is only about to.
 	DomainAuthEnforced bool
 	DomainAuthGrace    time.Duration
+	// CopyJudgments holds the TypeSafe verdict for each email step's copy,
+	// keyed by step id. Filled by the service when a judge is configured;
+	// a step with no entry is simply not judged, and no copy detector that
+	// reads a verdict fires on it.
+	CopyJudgments map[uuid.UUID]copyjudge.Verdict
+	// Failed holds each section that did not load this run, with its error.
+	Failed map[AdvisorSection]error
 }
 
 // AdvisorRepository persists findings and loads the evaluation snapshot.
@@ -207,8 +239,9 @@ type AdvisorRepository interface {
 	// dismissed one stays dismissed until it resolves first.
 	UpsertFinding(ctx context.Context, f *models.AdvisorFinding) (*models.AdvisorFinding, bool, error)
 	// ResolveMissing closes every open/snoozed/applied finding for the org whose
-	// fingerprint is not in keep, returning how many it closed.
-	ResolveMissing(ctx context.Context, orgID uuid.UUID, keep []string) (int, error)
+	// fingerprint is not in keep and whose detector is not in keepDetectors,
+	// returning how many it closed.
+	ResolveMissing(ctx context.Context, orgID uuid.UUID, keep, keepDetectors []string) (int, error)
 	// ExpireSnoozes flips snoozed findings whose window has passed back to open.
 	ExpireSnoozes(ctx context.Context) (int, error)
 
@@ -248,7 +281,7 @@ type AdvisorFindingFilter struct {
 	Category   models.AdvisorCategory
 	EntityType string
 	EntityID   *uuid.UUID
-	// Statuses defaults to open + snoozed when empty.
+	// Statuses defaults to open + applied when empty.
 	Statuses []models.AdvisorStatus
 	Limit    int
 }
@@ -408,18 +441,38 @@ func evidenceHashOf(f *models.AdvisorFinding) string {
 	return f.EvidenceHash()
 }
 
-func (r *advisorRepository) ResolveMissing(ctx context.Context, orgID uuid.UUID, keep []string) (int, error) {
+func (r *advisorRepository) ResolveMissing(ctx context.Context, orgID uuid.UUID, keep, keepDetectors []string) (int, error) {
+	// A nil slice binds as NULL, and NOT (x = ANY(NULL)) would match no row.
+	if keepDetectors == nil {
+		keepDetectors = []string{}
+	}
 	query := `
 		UPDATE advisor_findings
 		SET status = 'resolved', resolved_at = NOW()
 		WHERE organization_id = $1
 		  AND status IN ('open', 'snoozed', 'applied', 'dismissed')
-		  AND NOT (fingerprint = ANY($2))`
-	tag, err := r.db.Exec(ctx, query, orgID, keep)
+		  AND NOT (fingerprint = ANY($2))
+		  AND NOT (detector_key = ANY($3))`
+	tag, err := r.db.Exec(ctx, query, orgID, keep, keepDetectors)
 	if err != nil {
 		return 0, err
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// ResolveAdvisorFindingsFor closes the findings about deleted entities (as
+// subject or parent), inside the delete's transaction so no stale advice outlives the row.
+func ResolveAdvisorFindingsFor(ctx context.Context, tx activityWriter, orgID any, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE advisor_findings
+		SET status = 'resolved', resolved_at = NOW()
+		WHERE organization_id = $1
+		  AND (entity_id = ANY($2) OR parent_id = ANY($2))
+		  AND status IN ('open', 'snoozed', 'applied', 'dismissed')`, orgID, ids)
+	return err
 }
 
 func (r *advisorRepository) ExpireSnoozes(ctx context.Context) (int, error) {
@@ -673,20 +726,19 @@ func (r *advisorRepository) LastRunAt(ctx context.Context, orgID uuid.UUID) (*ti
 }
 
 func (r *advisorRepository) ListOrgsDue(ctx context.Context, staleness time.Duration, limit int) ([]uuid.UUID, error) {
-	// Only orgs with something to advise on: at least one connected mailbox.
-	// A brand-new org with nothing set up has no useful advice to receive and
-	// should not cost an evaluation pass.
+	// Only orgs with something to advise on: a connected mailbox, or open
+	// advice that a pass would have to close (the last mailbox just went).
 	query := `
 		SELECT o.id
 		FROM organizations o
-		JOIN LATERAL (
-			SELECT 1 FROM email_accounts ea WHERE ea.organization_id = o.id LIMIT 1
-		) has_mailbox ON true
 		LEFT JOIN LATERAL (
 			SELECT MAX(started_at) AS last_run FROM advisor_runs ar WHERE ar.organization_id = o.id
 		) r ON true
 		LEFT JOIN advisor_settings s ON s.organization_id = o.id
 		WHERE COALESCE(s.enabled, true)
+		  AND (EXISTS (SELECT 1 FROM email_accounts ea WHERE ea.organization_id = o.id)
+		       OR EXISTS (SELECT 1 FROM advisor_findings af
+		                  WHERE af.organization_id = o.id AND af.status IN ('open', 'snoozed')))
 		  AND (r.last_run IS NULL OR r.last_run < NOW() - make_interval(secs => $1))
 		ORDER BY r.last_run ASC NULLS FIRST
 		LIMIT $2`
