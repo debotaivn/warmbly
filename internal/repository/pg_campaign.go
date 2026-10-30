@@ -1443,7 +1443,7 @@ func (r *campaignRepository) ValidateCampaignReady(ctx context.Context, campaign
 
 	// Sender pool (unified): valid if it has any enabled explicit sender OR any
 	// email tag OR — when neither is selected ("all") — at least one active
-	// mailbox for the owner to fall back to.
+	// mailbox in the campaign's organization to fall back to.
 	var senderCount int
 	if err := r.DB.QueryRow(ctx, `SELECT COUNT(*) FROM campaign_senders WHERE campaign_id = $1 AND enabled`, campaignID).Scan(&senderCount); err != nil {
 		return err
@@ -1455,10 +1455,18 @@ func (r *campaignRepository) ValidateCampaignReady(ctx context.Context, campaign
 	if senderCount > 0 || tagCount > 0 {
 		return nil
 	}
+	// Never silently widen an explicitly selected (now empty) sender pool.
+	var strategy string
+	if err := r.DB.QueryRow(ctx, `SELECT sender_strategy FROM campaigns WHERE id = $1`, campaignID).Scan(&strategy); err != nil {
+		return err
+	}
+	if strategy == CampaignSenderStrategyExplicit {
+		return errx.New(errx.BadRequest, "this campaign selected specific sending accounts but none are active")
+	}
 	var activeMailboxes int
 	if err := r.DB.QueryRow(ctx, `
 		SELECT COUNT(*) FROM email_accounts
-		WHERE user_id = (SELECT user_id FROM campaigns WHERE id = $1) AND status = 'active'
+		WHERE organization_id = (SELECT organization_id FROM campaigns WHERE id = $1) AND status = 'active'
 	`, campaignID).Scan(&activeMailboxes); err != nil {
 		return err
 	}
