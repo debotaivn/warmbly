@@ -112,18 +112,22 @@ func TestResolveCampaignSenderPoolExplicitStillUnionsItsTags(t *testing.T) {
 }
 
 func TestResolveCampaignSenderPoolDeduplicatesExplicitAndTags(t *testing.T) {
-    selected := models.Email{ID: uuid.New()}
-    extra := models.Email{ID: uuid.New()}
-    src := &stubCampaignSenderSource{
-        explicit: []CampaignSenderAccount{{Account: selected}},
-        tagged: []models.Email{selected, extra},
-    }
-    campaign := testSenderPoolCampaign("tags")
-    campaign.EmailTags = []string{"team"}
-    pool, err := ResolveCampaignSenderPool(context.Background(), src, campaign)
-    if err != nil { t.Fatal(err) }
-    if len(pool.Accounts) != 2 || pool.Accounts[0].ID != selected.ID || pool.Accounts[1].ID != extra.ID {
-        t.Fatalf("got %v; want explicit sender followed by one unique tagged sender", pool.Accounts)
-    }
-    if src.allCalls != 0 { t.Fatal("mixed selection must not expand to all mailboxes") }
+	selected := models.Email{ID: uuid.New()}
+	extra := models.Email{ID: uuid.New()}
+	src := &stubCampaignSenderSource{
+		explicit: []CampaignSenderAccount{{Account: selected}},
+		tagged:   []models.Email{selected, extra},
+	}
+	campaign := testSenderPoolCampaign("tags")
+	campaign.EmailTags = []string{"team"}
+	pool, err := ResolveCampaignSenderPool(context.Background(), src, campaign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.Accounts) != 2 || pool.Accounts[0].ID != selected.ID || pool.Accounts[1].ID != extra.ID {
+		t.Fatalf("got %v; want explicit sender followed by one unique tagged sender", pool.Accounts)
+	}
+	if src.allCalls != 0 {
+		t.Fatal("mixed selection must not expand to all mailboxes")
+	}
 }

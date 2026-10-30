@@ -4,10 +4,10 @@ import (
 	"math"
 	"math/rand"
 	"sort"
-	"github.com/rs/zerolog/log"
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/app/behavior"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/repository"
