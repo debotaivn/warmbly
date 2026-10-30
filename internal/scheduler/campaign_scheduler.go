@@ -709,7 +709,7 @@ func (s *schedulerService) placeCampaignSend(ctx context.Context, campaign *mode
 // paths so a campaign reschedules instead of completing or busy-looping.
 func (s *schedulerService) deferToNextDay(campaign *models.Campaign) time.Time {
 	tz := loadLocation(campaign.Timezone)
-	t := nextScheduleSlot(time.Now().Add(24*time.Hour), effectiveWindows(campaign), tz)
+	t := nextScheduleSlot(time.Now().In(tz).AddDate(0, 0, 1), effectiveWindows(campaign), tz)
 	// Add a small jitter so deferred tasks don't all wake at the same instant.
 	return t.Add(time.Minute * time.Duration(randomJitter(0, 30)))
 }
