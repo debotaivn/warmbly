@@ -24,6 +24,8 @@ import type Campaign from "@/lib/api/models/app/campaigns/Campaign";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 import useCampaign from "@/lib/api/hooks/app/campaigns/useCampaign";
+import { useQuery } from "@tanstack/react-query";
+import getSequences from "@/lib/api/client/app/campaigns/sequences/getSequences";
 import usePreflight from "@/lib/api/hooks/app/campaigns/usePreflight";
 import { preflightFailures } from "@/lib/api/models/app/campaigns/Preflight";
 
@@ -102,6 +104,13 @@ export default function LaunchCampaignDialog({
     // settings. Falls back to the passed campaign until it resolves.
     const full = useCampaign(campaign?.id ?? "");
     const c = full.data ?? campaign;
+    // Steps are stored on their own endpoint, not the base campaign record.
+    const steps = useQuery({
+        queryKey: ["campaigns", campaign?.id ?? "", "sequences"],
+        queryFn: () => getSequences(campaign?.id ?? ""),
+        enabled: !!campaign,
+    });
+    const stepCount = steps.data?.length;
 
     // The platform's own pre-send checks, run fresh each time the dialog opens.
     // Advisory: a failure is shown, never used to disable Launch, because the
@@ -242,11 +251,11 @@ export default function LaunchCampaignDialog({
                                             icon={<ListChecksIcon className="w-4 h-4" />}
                                             label="Steps"
                                             value={
-                                                full.isLoading && !c.sequences
-                                                    ? "…"
-                                                    : c.sequences
-                                                        ? `${c.sequences.length} step${c.sequences.length === 1 ? "" : "s"}`
-                                                        : "0 steps"
+                                                steps.isError
+                                                    ? "Unavailable"
+                                                    : stepCount === undefined
+                                                        ? "…"
+                                                        : `${stepCount} step${stepCount === 1 ? "" : "s"}`
                                             }
                                         />
                                     </div>

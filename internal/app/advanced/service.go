@@ -1551,15 +1551,16 @@ func (s *service) RunPreflight(ctx context.Context, organizationID, campaignID u
 	}
 
 	if settings.Preflight.CheckTrackingDomain && (campaign.OpenTracking || campaign.LinkTracking) {
-		scope := repository.NewAccountScope(campaign.OrganizationID)
-		accounts, err := s.emailRepo.GetByTags(ctx, scope, campaign.EmailTags)
+		// Preflight must inspect the same direct, tagged, or all-active mailboxes as sending.
+		pool, err := repository.ResolveCampaignSenderPool(ctx, s.emailRepo, campaign)
+		accounts := pool.Accounts
 		if err != nil || len(accounts) == 0 {
 			checks = append(checks, models.PreflightCheckResult{
 				Key:         "tracking_domain",
 				Passed:      false,
 				Severity:    "error",
-				Message:     "No sender accounts available for tracking validation.",
-				Remediation: "Attach sender accounts to campaign tags.",
+				Message:     "No active sender mailbox is available to this campaign, so tracking cannot be validated.",
+				Remediation: "Connect an active mailbox, or select a mailbox or tag belonging to this workspace.",
 			})
 			recommendations = append(recommendations, "Attach at least one sender account with tracking domain.")
 		} else {

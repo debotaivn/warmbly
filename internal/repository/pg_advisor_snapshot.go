@@ -116,11 +116,16 @@ func (r *advisorRepository) loadMailboxes(ctx context.Context, orgID uuid.UUID) 
 			WHERE c.organization_id = ea.organization_id
 			  AND c.status = 'active'
 			  AND (
-			    EXISTS (SELECT 1 FROM campaign_senders cs WHERE cs.campaign_id = c.id AND cs.email_account_id = ea.id)
+			    EXISTS (SELECT 1 FROM campaign_senders cs WHERE cs.campaign_id = c.id AND cs.email_account_id = ea.id AND cs.enabled)
 			    OR EXISTS (
 			      SELECT 1 FROM campaign_email_tags cet
 			      JOIN email_tags et ON et.tag_id = cet.tag_id
 			      WHERE cet.campaign_id = c.id AND et.email_id = ea.id
+			    )
+			    OR (
+			      COALESCE(c.sender_strategy, 'tags') <> 'explicit'
+			      AND NOT EXISTS (SELECT 1 FROM campaign_senders cs2 WHERE cs2.campaign_id = c.id AND cs2.enabled)
+			      AND NOT EXISTS (SELECT 1 FROM campaign_email_tags cet2 WHERE cet2.campaign_id = c.id)
 			    )
 			  )
 			LIMIT 1
@@ -185,11 +190,16 @@ func (r *advisorRepository) loadCampaigns(ctx context.Context, orgID uuid.UUID) 
 			WHERE ea.organization_id = c.organization_id
 			  AND ea.status = 'active'
 			  AND (
-			    EXISTS (SELECT 1 FROM campaign_senders cs WHERE cs.campaign_id = c.id AND cs.email_account_id = ea.id)
+			    EXISTS (SELECT 1 FROM campaign_senders cs WHERE cs.campaign_id = c.id AND cs.email_account_id = ea.id AND cs.enabled)
 			    OR EXISTS (
 			      SELECT 1 FROM campaign_email_tags cet
 			      JOIN email_tags et ON et.tag_id = cet.tag_id
 			      WHERE cet.campaign_id = c.id AND et.email_id = ea.id
+			    )
+			    OR (
+			      COALESCE(c.sender_strategy, 'tags') <> 'explicit'
+			      AND NOT EXISTS (SELECT 1 FROM campaign_senders cs2 WHERE cs2.campaign_id = c.id AND cs2.enabled)
+			      AND NOT EXISTS (SELECT 1 FROM campaign_email_tags cet2 WHERE cet2.campaign_id = c.id)
 			    )
 			  )
 		) snd ON true
